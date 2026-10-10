@@ -8,6 +8,7 @@ import { mkdtemp, readFile, readdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { resolve, join } from "node:path";
 import { parse } from "smol-toml";
+import { verifyReminderQueue } from "./reminder-queue.mjs";
 const root = resolve(new URL("../..", import.meta.url).pathname);
 const server = join(root, "dist/server");
 const config = parse(await readFile(join(root, "wrangler.generated.toml"), "utf8"));
@@ -22,7 +23,7 @@ const sign = sub => new SignJWT({ email: "synthetic@example.invalid" }).setProte
 const mock = new MockAgent(); mock.disableNetConnect();
 mock.get(issuer).intercept({ path: "/cdn-cgi/access/certs", method: "GET" }).reply(200, { keys: [jwk] }).persist();
 const paths = (await readdir(server, { recursive: true, withFileTypes: true })).filter(entry => entry.isFile() && /\.(?:js|mjs)$/.test(entry.name)).map(entry => join(entry.parentPath, entry.name));
-const worker = new Miniflare({
+const options = {
   name: "standalone-access-acceptance", modulesRoot: server,
   modules: [join(server, "index.js"), ...paths.filter(path => path !== join(server, "index.js"))].map(path => ({ type: "ESModule", path })),
   compatibilityDate: config.compatibility_date, compatibilityFlags: config.compatibility_flags,
@@ -30,7 +31,8 @@ const worker = new Miniflare({
   d1Databases: { DB: "synthetic-reminders-access" }, d1Persist: directory,
   assets: { directory: join(root, "dist/client"), routerConfig: { has_user_worker: true, invoke_user_worker_ahead_of_assets: true } },
   outboundService: request => mockFetch(request.url, { method: request.method, headers: Object.fromEntries(request.headers), body: request.body, duplex: "half", redirect: "manual", signal: request.signal, dispatcher: mock }), log: new Log(LogLevel.ERROR),
-});
+};
+const worker = new Miniflare(options);
 try {
   const db = await worker.getD1Database("DB");
   await db.prepare(await readFile(join(root, "schema.sql"), "utf8")).run();
@@ -55,5 +57,6 @@ try {
   assert.equal(mcp.status, 200); const response = await mcp.json();
   assert.equal(response.result.structuredContent.writeEnabled, false);
   assert.equal(response.result.structuredContent.state, "DISCONNECTED");
+  await verifyReminderQueue(options, signed);
   console.log(JSON.stringify({ result: "passed", runtime: "local-workerd", standaloneBundle: true, checks: ["verified-access-identity", "forged-header-denial", "static-asset-auth", "owner-isolation", "dashboard-and-MCP-routing"] }));
 } finally { await worker.dispose(); await rm(directory, { recursive: true, force: true }); await mock.close(); }

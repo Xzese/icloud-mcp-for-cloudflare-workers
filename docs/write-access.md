@@ -34,15 +34,85 @@ completion timestamp. Reopening sets `Completed=0` and clears that timestamp. De
 `Deleted=1` through a normal version-checked update; it does not hard-delete the CloudKit record.
 No restore tool is provided. These tools preserve title, notes, dates and other omitted fields.
 
-State changes refuse recurring, alarmed and nested reminders. Each action sends exactly one
-version-checked record update, matching pyicloud's basic write approach. It does not enumerate
-or update children, detect parent reminders, or implement subtask cascades. Parent/subtask workflows
-are unsupported; use Apple's app for them. Completing or deleting a parent through this interface
-must not be assumed to perform the same child workflow as Apple's app. Moving lists,
-subtask editing, list management, attachments, alarms, recurrence and tags are outside this interface. Date/time-zone/all-day changes on reminders
-with alarms or recurrence are refused because those features require linked-record updates.
+State changes refuse recurring, alarmed and nested reminders, and parents whose children are
+observed in a bounded complete list inspection (including completed children).
+Each action sends exactly one version-checked record update; it never cascades.
+An incomplete/errorful or over-budget child inspection blocks the action. This check is **not**
+proof of commit-time protection against a newly added, unreferenced child. Bulk deletion uses the
+same per-item checks and additionally rescans after commit to report any remaining subtasks. Use Apple's app for completing, reopening or deleting parents and their subtasks.
+Moving lists, list management, attachments, creating/replacing alarms, changing recurrence rules
+and tags are outside this interface. Supported timed absolute-alarm date/time-zone changes use
+the linked update below. Other linked date recipes are not inferred.
 Unchanged linked fields remain untouched. Editing title or notes replaces that text document
 with plain text, including its formatting; an omitted document remains intact.
+
+## Timed recurring and absolute-alarm date updates
+
+`update_reminder` can change the due date or time zone of an **open timed root** with one
+absolute date alarm and at most one existing recurrence rule. This is permanent ready-account
+functionality on both deployment targets, not an opt-in flag. `capabilities.linkedScheduling`
+reports connection availability; `prepare_reminder_update` reports whether the exact reminder
+graph supports this recipe.
+
+The server resolves and validates the current Reminder, Alarm, AlarmTrigger and optional
+RecurrenceRule. One atomic group changes the Reminder's date/time-zone and modification
+tokens, the Alarm's due-date nonce and the Trigger's base64 JSON Gregorian components.
+Existing IDs and references stay unchanged. Any recurrence is protected by an exact-version
+`Deleted=0` guard; its complete fields stay unchanged while its version advances.
+Every known participant uses its inspected tag. Completed history is neither modified nor
+redirected to the active occurrence.
+
+Supply a whole-second ISO instant with an explicit offset and a valid IANA time zone.
+The trigger components represent that instant in the selected zone. A **zone-only** edit keeps
+the instant and changes the displayed local time; to retain the local clock, supply the matching
+new instant as `dueDate` too. The format cannot distinguish repeated fall-back local times, so
+those are explicitly refused. Dates must remain in Gregorian years 1-9999.
+Clearing a linked date/zone, timed/all-day conversion, start dates, multiple/location/relative
+alarms, nested schedules and unknown trigger/calendar fields need separate recipes.
+No recurrence interval, end date or anchor is changed or inferred.
+
+Controlled native API acceptance moved a weekly reminder from 10 January 2027 at 09:00
+Europe/London to 11 July 2027 at 09:00 BST, then restored its original date. Both writes,
+full dependency readback and stale-tag refusal passed; linked IDs, recurrence fields,
+completed-history version/state and the retained session deadline were preserved.
+Apple-app rendering and actual alarm firing were not visually verified. See
+[the recipe evidence](linked-record-protocol.md#permanent-in-place-absolute-date-updates).
+
+## Subtask relationships
+
+The separate `create_subtask` and `set_reminder_parent` tools are permanent connected-account
+capabilities on both deployment targets and in the local runtime. They require the authenticated
+owner and a ready, unexpired Apple session, not a feature flag or additional approval setting.
+`connection_status.capabilities.subtasks` reports session availability.
+
+`create_subtask` accepts the normal creation fields plus
+`parentReminder: { "reminderId": "<root-id>", "recordChangeTag": "<current-root-tag>" }`.
+It creates an **open, undated** child in the same list; due dates, time zones and all-day
+creation are refused. Keep the same UUID key and complete request for reconciliation.
+Replay checks the child's exact ID, content, state, list and parent and submits no write,
+even if its parent tag has since advanced.
+
+`set_reminder_parent` accepts `listId`, `reminderId`, the child's current `recordChangeTag`
+and `parentReminder`. Supply a root ID/tag to attach or reparent the reminder, or `null` to
+return it to the list's top level. The server resolves the previous parent from the exact
+versioned child. Both roots and the child must be open, undated, non-recurring and unalarmed.
+Self-parenting, cross-list moves, nested parents, moving reminders with children and deeper
+nesting are refused. A bounded complete child inspection includes completed descendants;
+errors, incomplete pagination and exhausted budgets block dispatch.
+
+CloudKit's `parent` and `List` remain the owning list, **not** the subtask root.
+The child relationship uses `ParentReminder` with an exact `REFERENCE`/`VALIDATE` value,
+or an explicit null on detach. Only that field, `LastModifiedDate` and their resolution
+tokens change; omitted content and unknown fields stay intact. Creation or movement shares
+one atomic group with exact-version, same-value `Deleted=0` guards for affected parents.
+These guards intentionally advance parent tags; reread before a different operation.
+Any stale known participant rejects the group, without forced writes or automatic retries.
+Incomplete/changed confirmations remain `WRITE_OUTCOME_UNKNOWN`.
+
+These tools do not extend simple bulk creation: parent inputs in bulk manifests are rejected.
+They do not enable parent/child completion, deletion, schedule edits or descendant cascades.
+A list scan and known-record guards do not establish general unreferenced-child race safety,
+so bulk deletion reports post-commit subtasks rather than claiming prevention.
 
 ## MCP examples
 
@@ -106,8 +176,29 @@ Timeouts, redirects, server errors, malformed confirmations and a lost session f
 submission are uncertain outcomes. Writes do not follow redirects. Disconnect prevents a
 pending preparation from submitting once its lease is lost, but cannot undo an Apple operation
 already in flight. A successful mutation invalidates unfinished all-open read continuations.
-Neither reads nor writes extend the absolute local session deadline. No new tables, mutation
-receipt cache or additional Cloudflare resources are introduced.
+Neither reads nor writes extend the absolute local session deadline. Single-request mutations
+do not cache reminder contents or receipts. The separate bulk-job ledger stores encrypted
+authorized manifests, dispatch intent and results; it does not change Apple session envelopes.
+
+### Prepared updates and bulk jobs
+
+`prepare_reminder_update` provides a read-only exact-version preview. Supported single-record
+and in-place linked-date
+updates receive a ten-minute owner/account/generation/request/graph-bound token, accepted as
+optional `preparationToken` by `update_reminder`. Changed requests or stale graphs are rejected
+before dispatch. Linked-date previews include all modified/guarded versions and complete
+atomic record/byte counts. No recurrence anchor, relative-alarm or wall-clock reinterpretation
+policy is inferred; `policy` accepts only omission or an empty object.
+The API preview is `POST /api/reminder-updates/prepare`.
+See [linked protocol evidence and scope](linked-record-protocol.md).
+
+The eight `*_reminder_job*` lifecycle tools stage, preview, start, read, cancel, resume and
+continue encrypted durable manifests. Simple bulk creation is a normal ready-account capability
+once the job schema is installed, without a rollout flag;
+simple bulk deletion is permanent with a read-only preview preflight and per-item single-delete checks.
+Both deployment targets honestly advertise request-driven execution, not background progress.
+Recovered dispatch intent is never automatically replayed; desired state observed without a
+receipt stays unknown. See [job contracts, limits and migration](reminder-jobs.md).
 
 ### MCP contracts and idempotency
 
@@ -118,7 +209,7 @@ Application failures use `isError: true` and a sanitized error object with the s
 the success output schema does not describe error results.
 
 All mutation tools declare `readOnlyHint: false`, `idempotentHint: true` and `openWorldHint: true`.
-Creation declares `destructiveHint: false`; editing and state changes declare it true because
+Creation (including subtask creation) declares `destructiveHint: false`; editing, reparenting and state changes declare it true because
 they can overwrite or remove existing state. Read tools declare `readOnlyHint: true` and
 `destructiveHint: false`; idempotency hints have no meaning for read-only tools.
 
@@ -191,6 +282,13 @@ clearing the timestamp on reopening and the deletion marker; complete open-list 
 the completed and deleted item was absent. Stale-version deletion was rejected. These checks used
 the isolated local Worker and Apple API responses; Apple's app was not visually inspected.
 These results do not independently audit the codec or establish every linked-record workflow.
+
+On 10 October 2026, the current build repeated the dedicated-list single-item create/replay,
+edit, stale-tag refusal, completion, reopening and soft-delete acceptance successfully through
+the retained authenticated local session. A separate four-item bulk-create and prepared
+simple date/time-zone update run also passed and cleaned up its exact synthetic IDs.
+See [the live bulk acceptance record](reminder-jobs.md). These are Apple API read-back checks,
+not visual Apple-app verification or evidence for linked scheduling transitions.
 
 Validate a dedicated test reminder before using write access on personal items. Disconnect Apple
 or stop the local Worker when account access is no longer needed. Keep credentials and verification codes

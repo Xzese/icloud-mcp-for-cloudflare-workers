@@ -61,6 +61,28 @@ an operator's live Access policy, Managed OAuth/ChatGPT connection or Apple acco
 Every deployment must complete those acceptance checks with its own authorized owner. Publishing
 source does not make the operator's live Site, D1 database or encrypted Apple session public.
 
-The first public release uses `schema.sql` as its current database definition. It contains only
-the application session table. Historical prototype tables, migration journals and ORM tooling
-are not part of the source. Sites' SQL initialization package is generated from this same file.
+Fresh installations use `schema.sql`, containing the session table and additive job ledger.
+Existing deployments apply `migrations/0001_reminder_jobs.sql` without changing session rows,
+generation, credentials or retention evidence. Sites' SQL initialization package is generated
+from the same fresh-install definition; verify additive application to its existing D1.
+Do not reset or recreate databases during upgrades.
+
+Release request-driven simple bulk creation independently of linked scheduling and deletion.
+Simple bulk creation is permanent once the additive schema and compatible readers are installed;
+no feature flag is required. Both targets default to request-driven
+execution; the standalone Queue adapter additionally requires exact private producer/consumer
+bindings, its dedicated outbox schedule and deployment verification. Sites must not set Queue mode.
+The verified in-place timed absolute-alarm date recipe is permanent ready-account functionality,
+including active recurring occurrences; verify its shared API/MCP contracts on the target build.
+Simple bulk deletion is permanent with per-item single-delete checks and post-commit subtask reports.
+Other linked transitions still need separate evidence;
+the loopback-only capture workflow supplies sanitized before/after diagnostics, not automatic
+protocol approval. Preserve ledger, receipts and
+session state during rollback. See [jobs](reminder-jobs.md) and
+[protocol evidence and scope](linked-record-protocol.md).
+
+Subtask relationships are permanent ready-account capabilities within the documented same-list,
+open/undated, one-level scope. They do not enable bulk subtask creation, linked scheduling
+or cascading lifecycle actions. The local connector acceptance established create,
+reparent and detach behavior, not general new-child race protection. Preserve the existing
+session during rollout and verify the two tool contracts on the actual deployment.

@@ -1,5 +1,6 @@
 import { readFile, writeFile } from "node:fs/promises";
 import { parse, stringify } from "smol-toml";
+import { reminderQueueConfig } from "./reminder-queue-config.mjs";
 const checking = process.argv.includes("--check");
 const built = JSON.parse(await readFile("dist/server/wrangler.json", "utf8"));
 if (!built.main || !built.compatibility_flags?.includes("nodejs_compat")) throw new Error("Build the standalone Worker first.");
@@ -20,6 +21,8 @@ const output = { ...built, ...configured, main: "dist/server/index.js", assets: 
 if (!configured.vars) delete output.vars;
 // Retired catalogue schedules must not survive generated configurations.
 delete output.triggers;
+delete output.queues;
+Object.assign(output, reminderQueueConfig(configured));
 delete output.services;
 delete output.r2_buckets;
 await writeFile("wrangler.generated.toml", stringify(output) + "\n", { mode: 0o600 });

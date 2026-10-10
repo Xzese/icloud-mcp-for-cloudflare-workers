@@ -1,0 +1,50 @@
+{
+  "source": "authorized-synthetic-connector-apple-api-observation",
+  "observedAt": "2026-10-10",
+  "description": "Projection of the reserved weekly active-occurrence move and restoration. No real identifiers, tags, replica IDs, documents or account/session material.",
+  "appleAppDisplayVerified": false,
+  "alarmDeliveryVerified": false,
+  "recurringCompletionVerified": false,
+  "recipe": "in-place-absolute-date",
+  "linkedRecordIdentitiesUnchanged": true,
+  "linkedReferencesUnchanged": true,
+  "recurrenceFieldsUnchanged": true,
+  "completedHistoryVersionAndNormalizedStateUnchanged": true,
+  "sessionGenerationAndDeadlineUnchanged": true,
+  "originalDateRestored": true,
+  "staleInputOutcome": "CONFLICT",
+  "operationCount": 4,
+  "moveChangedFields": {
+    "Reminder": ["DueDate", "LastModifiedDate", "ResolutionTokenMap"],
+    "Alarm": ["DueDateResolutionTokenAsNonce"],
+    "AlarmTrigger": ["DateComponentsData"],
+    "RecurrenceRule": []
+  },
+  "before": {
+    "dueDate": "2027-01-10T09:00:00.000Z",
+    "dueDateToken": { "counter": 5, "modificationTime": 813344131.140887 },
+    "nonce": 500813344131.14087,
+    "components": {
+      "era": 1, "year": 2027, "month": 1, "day": 10, "hour": 9, "minute": 0, "second": 0,
+      "timeZone": { "identifier": "Europe/London" }
+    }
+  },
+  "moved": {
+    "dueDate": "2027-07-11T08:00:00.000Z",
+    "dueDateToken": { "counter": 1, "modificationTime": 813356232.625 },
+    "nonce": 100813356232.625,
+    "components": {
+      "era": 1, "year": 2027, "month": 7, "day": 11, "hour": 9, "minute": 0, "second": 0,
+      "timeZone": { "identifier": "Europe/London" }
+    }
+  },
+  "restored": {
+    "dueDate": "2027-01-10T09:00:00.000Z",
+    "dueDateToken": { "counter": 1, "modificationTime": 813356235.312 },
+    "nonce": 100813356235.312,
+    "components": {
+      "era": 1, "year": 2027, "month": 1, "day": 10, "hour": 9, "minute": 0, "second": 0,
+      "timeZone": { "identifier": "Europe/London" }
+    }
+  }
+}

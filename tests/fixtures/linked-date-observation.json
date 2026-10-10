@@ -1,0 +1,142 @@
+{
+  "source": "authorized-synthetic-apple-app-observation",
+  "observedAt": "2026-10-10",
+  "writableRecipeApproved": false,
+  "appleAppConfirmedByOperator": true,
+  "description": "Open weekly recurring timed reminder moved from 29 August to 10 October 2026 at 09:00 Europe/London. Identities and opaque values are anonymized equality aliases; these projected records are not complete raw Apple records.",
+  "before": {
+    "schemaVersion": 1,
+    "caseId": "00000000-0000-4000-8000-000000000001",
+    "generation": 1,
+    "source": "live-apple-api",
+    "capturedAt": 1791650061071,
+    "explicitlyReferencedRecordsResolved": true,
+    "records": [
+      {
+        "recordName": "Reminder/SYNTHETIC",
+        "recordType": "Reminder",
+        "recordChangeTag": "root-before",
+        "fields": {
+          "DueDate": { "type": "TIMESTAMP", "value": 1787990400000 },
+          "TimeZone": { "type": "STRING", "value": "Europe/London" },
+          "AllDay": { "type": "INT64", "value": 0 },
+          "Completed": { "type": "INT64", "value": 0 },
+          "AlarmIDs": { "type": "STRING_LIST", "value": ["old-alarm-alias"] },
+          "RecurrenceRuleIDs": { "type": "STRING_LIST", "value": ["recurrence-alias"] },
+          "TitleDocument": { "type": "ENCRYPTED_BYTES", "value": "unchanged-title-alias" },
+          "NotesDocument": { "type": "ENCRYPTED_BYTES", "value": "unchanged-notes-alias" },
+          "LastModifiedDate": { "type": "TIMESTAMP", "value": "modified-before-alias" },
+          "ResolutionTokenMap": { "type": "STRING", "value": "tokens-before-alias" }
+        }
+      },
+      {
+        "recordName": "RecurrenceRule/SYNTHETIC",
+        "recordType": "RecurrenceRule",
+        "recordChangeTag": "recurrence-unchanged",
+        "fields": {
+          "Frequency": { "type": "INT64", "value": 1 },
+          "Interval": { "type": "INT64", "value": 1 },
+          "OccurrenceCount": { "type": "INT64", "value": 0 },
+          "FirstDayOfTheWeek": { "type": "INT64", "value": 0 }
+        }
+      },
+      {
+        "recordName": "Alarm/OLD",
+        "recordType": "Alarm",
+        "recordChangeTag": "old-alarm-version",
+        "fields": {
+          "TriggerID": { "type": "STRING", "value": "old-trigger-alias" },
+          "DueDateResolutionTokenAsNonce": { "type": "DOUBLE", "value": "old-nonce-alias" }
+        }
+      },
+      {
+        "recordName": "AlarmTrigger/OLD",
+        "recordType": "AlarmTrigger",
+        "recordChangeTag": "old-trigger-version",
+        "fields": {
+          "DateComponentsData": { "type": "BYTES", "value": "old-components-alias" },
+          "Type": { "type": "STRING", "value": "Date" }
+        }
+      }
+    ],
+    "edges": [
+      { "from": "Reminder/SYNTHETIC", "field": "AlarmIDs", "to": "Alarm/OLD" },
+      { "from": "Reminder/SYNTHETIC", "field": "RecurrenceRuleIDs", "to": "RecurrenceRule/SYNTHETIC" },
+      { "from": "Alarm/OLD", "field": "TriggerID", "to": "AlarmTrigger/OLD" }
+    ]
+  },
+  "after": {
+    "schemaVersion": 1,
+    "caseId": "00000000-0000-4000-8000-000000000001",
+    "generation": 1,
+    "source": "live-apple-api",
+    "capturedAt": 1791650548669,
+    "explicitlyReferencedRecordsResolved": true,
+    "records": [
+      {
+        "recordName": "Reminder/SYNTHETIC",
+        "recordType": "Reminder",
+        "recordChangeTag": "root-after",
+        "fields": {
+          "DueDate": { "type": "TIMESTAMP", "value": 1791619200000 },
+          "TimeZone": { "type": "STRING", "value": "Europe/London" },
+          "AllDay": { "type": "INT64", "value": 0 },
+          "Completed": { "type": "INT64", "value": 0 },
+          "AlarmIDs": { "type": "STRING_LIST", "value": ["new-alarm-alias"] },
+          "RecurrenceRuleIDs": { "type": "STRING_LIST", "value": ["recurrence-alias"] },
+          "TitleDocument": { "type": "ENCRYPTED_BYTES", "value": "unchanged-title-alias" },
+          "NotesDocument": { "type": "ENCRYPTED_BYTES", "value": "unchanged-notes-alias" },
+          "LastModifiedDate": { "type": "TIMESTAMP", "value": "modified-after-alias" },
+          "ResolutionTokenMap": { "type": "STRING", "value": "tokens-after-alias" }
+        }
+      },
+      {
+        "recordName": "RecurrenceRule/SYNTHETIC",
+        "recordType": "RecurrenceRule",
+        "recordChangeTag": "recurrence-unchanged",
+        "fields": {
+          "Frequency": { "type": "INT64", "value": 1 },
+          "Interval": { "type": "INT64", "value": 1 },
+          "OccurrenceCount": { "type": "INT64", "value": 0 },
+          "FirstDayOfTheWeek": { "type": "INT64", "value": 0 }
+        }
+      },
+      {
+        "recordName": "Alarm/NEW",
+        "recordType": "Alarm",
+        "recordChangeTag": "new-alarm-version",
+        "fields": {
+          "TriggerID": { "type": "STRING", "value": "new-trigger-alias" },
+          "DueDateResolutionTokenAsNonce": { "type": "DOUBLE", "value": "new-nonce-alias" }
+        }
+      },
+      {
+        "recordName": "AlarmTrigger/NEW",
+        "recordType": "AlarmTrigger",
+        "recordChangeTag": "new-trigger-version",
+        "fields": {
+          "DateComponentsData": { "type": "BYTES", "value": "new-components-alias" },
+          "Type": { "type": "STRING", "value": "Date" }
+        }
+      }
+    ],
+    "edges": [
+      { "from": "Reminder/SYNTHETIC", "field": "AlarmIDs", "to": "Alarm/NEW" },
+      { "from": "Reminder/SYNTHETIC", "field": "RecurrenceRuleIDs", "to": "RecurrenceRule/SYNTHETIC" },
+      { "from": "Alarm/NEW", "field": "TriggerID", "to": "AlarmTrigger/NEW" }
+    ]
+  },
+  "additionalAfterObservation": {
+    "triggerEncoding": "base64-encoded-UTF8-JSON",
+    "triggerType": "Date",
+    "dateComponents": { "year": 2026, "month": 10, "day": 10, "hour": 9, "minute": 0, "second": 0 },
+    "timeZoneShape": "object",
+    "dueDateResolutionCounter": 3,
+    "nonceEqualsTokenModificationTime": false,
+    "nonceEqualsCounter": false,
+    "nonceEqualsDueDateUnixSeconds": false,
+    "nonceEqualsDueDateAppleSeconds": false,
+    "oldAlarmRetirementProven": false,
+    "commitTimeDependencyProtectionProven": false
+  }
+}

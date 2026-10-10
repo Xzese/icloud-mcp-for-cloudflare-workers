@@ -52,6 +52,16 @@ export function summarizeAppleResponse(url, status, body) {
     }
     result.queryContinuationPresent = typeof body.continuationMarker === "string";
     result.errors = records.filter(r => typeof r?.serverErrorCode === "string").length;
+    if (result.errors) {
+      const known = new Set(["CONFLICT", "SERVER_RECORD_CHANGED", "ALREADY_EXISTS", "BATCH_REQUEST_FAILED", "ATOMIC_ERROR",
+        "BATCH_ERROR", "NOT_EXECUTED", "BAD_REQUEST", "INVALID_ARGUMENTS", "VALIDATION_ERROR", "UNKNOWN_ITEM", "NOT_FOUND",
+        "THROTTLED", "REQUEST_RATE_LIMITED", "AUTHENTICATION_REQUIRED", "ACCESS_DENIED"]);
+      result.recordErrorCodes = {};
+      for (const record of records) if (typeof record?.serverErrorCode === "string") {
+        const code = known.has(record.serverErrorCode) ? record.serverErrorCode : "other";
+        result.recordErrorCodes[code] = (result.recordErrorCodes[code] ?? 0) + 1;
+      }
+    }
     result.responseError = typeof body.serverErrorCode === "string";
     if (result.responseError) {
       result.responseErrorCode = /^[A-Z_]{1,64}$/.test(body.serverErrorCode) ? body.serverErrorCode : "other";

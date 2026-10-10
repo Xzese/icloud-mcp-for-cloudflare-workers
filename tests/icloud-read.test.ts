@@ -111,6 +111,25 @@ test("Reminders zone discovery and list query use the pinned private CloudKit re
   });
 });
 
+test("compound subtask pages deduplicate only canonical-JSON-equivalent records and reject conflicting copies", async () => {
+  const parent = { ...reminderRecord("Parent"), recordChangeTag: "parent-1" };
+  const child = { ...reminderRecord("Child"), recordName: "Reminder/CHILD", recordChangeTag: "child-1",
+    fields: { ...reminderRecord("Child").fields, ParentReminder: { type: "REFERENCE", value: { recordName: parent.recordName, action: "VALIDATE" } } } };
+  const { api } = clientWith([{ body: { records: [parent, child, structuredClone(parent), structuredClone(child)] } }]);
+  const page = await api.queryRemindersPage({ listId: "List/LIST-A", includeCompleted: true });
+  assert.equal(page.records.length, 2);
+  assert.equal(normalizeReminder(page.records[1] as Extract<(typeof page.records)[number], { recordType: string }>, "__defaultOwner__").parentReminderId, parent.recordName);
+  for (const conflicting of [
+    { ...child, recordChangeTag: "different" },
+    { ...child, fields: { ...child.fields, CustomFutureField: { type: "STRING", value: "different" } } },
+    { ...child, deleted: true },
+    { ...child, zoneID: { zoneName: "Reminders", ownerRecordName: "foreign" } },
+  ]) {
+    const { api } = clientWith([{ body: { records: [parent, child, conflicting] } }]);
+    await assert.rejects(api.queryRemindersPage({ listId: "List/LIST-A", includeCompleted: true }), AppError);
+  }
+});
+
 test("shared diagnostics bind exact lookups to authenticated shared-zone discovery without replacing the private owner", async () => {
   const sharedZone = { zoneName: "Reminders", zoneType: "REGULAR_CUSTOM_ZONE", ownerRecordName: "_shared-owner" };
   const discovery = { zones: [{ zoneID: sharedZone }] };

@@ -164,7 +164,7 @@ function existingResolutionMap(current: CloudKitRecord): Record<string, unknown>
   return map;
 }
 
-function updateResolutionTokenMap(current: CloudKitRecord, fieldNames: readonly string[], nowMs: number): string {
+export function updateResolutionTokenMap(current: CloudKitRecord, fieldNames: readonly string[], nowMs: number): string {
   const map = existingResolutionMap(current);
   const modificationTime = nowMs / 1000 - APPLE_EPOCH_SECONDS;
   for (const fieldName of fieldNames) map[fieldName] = newResolutionToken(modificationTime);
@@ -175,7 +175,7 @@ function updateResolutionTokenMap(current: CloudKitRecord, fieldNames: readonly 
   return encoded;
 }
 
-function assertOwnedReminder(record: CloudKitRecord, expectedOwner: string): void {
+export function assertOwnedReminder(record: CloudKitRecord, expectedOwner: string): void {
   const recordOwner = record.zoneID?.ownerRecordName;
   if (recordOwner !== undefined && recordOwner !== DEFAULT_OWNER && recordOwner !== expectedOwner) {
     throw new AppError("FORBIDDEN", "The reminder belongs to a different CloudKit owner.", 403);
@@ -245,7 +245,7 @@ function sameDate(left: string | null, right: string | null): boolean {
   return appleTimestamp(left) === appleTimestamp(right);
 }
 
-export function buildUpdateReminder(input: UpdateReminderInputData, current: CloudKitRecord, expectedOwner: string, nowMs = Date.now()): CloudKitWriteRecord {
+export function buildReminderFieldUpdate(input: UpdateReminderInputData, current: CloudKitRecord, expectedOwner: string, nowMs = Date.now()): CloudKitWriteRecord {
   const parsed = UpdateReminderInput.parse(input);
   validateNow(nowMs);
   const changes = parsed.changes;
@@ -270,9 +270,6 @@ export function buildUpdateReminder(input: UpdateReminderInputData, current: Clo
   const dateChanged = !sameDate(reminder.dueDate, nextDue);
   const zoneChanged = (reminder.timeZone ?? null) !== nextZone;
   const allDayChanged = (reminder.allDay ?? false) !== nextAllDay;
-  if ((dateChanged || zoneChanged || allDayChanged) && ((reminder.recurrenceRuleIds?.length ?? 0) > 0 || (reminder.alarmIds?.length ?? 0) > 0)) {
-    throw new AppError("UNSUPPORTED_FEATURE", "Due date, time zone, and all-day updates are unavailable for recurring or alarmed reminders.");
-  }
 
   const fields: CloudKitWriteRecord["fields"] = {};
   const tokenFields: string[] = [];
@@ -292,6 +289,16 @@ export function buildUpdateReminder(input: UpdateReminderInputData, current: Clo
   tokenFields.push("lastModifiedDate");
   fields.ResolutionTokenMap = { type: "STRING", value: updateResolutionTokenMap(current, tokenFields, nowMs) };
   return { recordName: parsed.reminderId, recordType: "Reminder", recordChangeTag: parsed.recordChangeTag, fields };
+}
+
+export function buildUpdateReminder(input: UpdateReminderInputData, current: CloudKitRecord, expectedOwner: string, nowMs = Date.now()): CloudKitWriteRecord {
+  const write = buildReminderFieldUpdate(input, current, expectedOwner, nowMs);
+  const reminder = normalizeReminder(current, expectedOwner);
+  if (["DueDate", "TimeZone", "AllDay"].some(key => Object.hasOwn(write.fields, key)) &&
+    ((reminder.recurrenceRuleIds?.length ?? 0) > 0 || (reminder.alarmIds?.length ?? 0) > 0)) {
+    throw new AppError("UNSUPPORTED_FEATURE", "Linked date updates require a complete, versioned alarm/trigger plan, not a single-record write.");
+  }
+  return write;
 }
 
 export function buildLifecycleReminder(action: ReminderLifecycleAction, input: ReminderTargetInputData, current: CloudKitRecord, expectedOwner: string, nowMs = Date.now()): CloudKitWriteRecord {
@@ -318,7 +325,7 @@ export function buildLifecycleReminder(action: ReminderLifecycleAction, input: R
   return { recordName: parsed.reminderId, recordType: "Reminder", recordChangeTag: parsed.recordChangeTag, fields };
 }
 
-export function matchesCreatedReminder(input: CreateReminderInputData, current: CloudKitRecord, expectedOwner: string): boolean {
+export function matchesCreatedReminder(input: CreateReminderInputData, current: CloudKitRecord, expectedOwner: string, expectedParentId: string | null = null): boolean {
   const parsed = CreateReminderInput.parse(input);
   try {
     assertOwnedReminder(current, expectedOwner);
@@ -327,6 +334,7 @@ export function matchesCreatedReminder(input: CreateReminderInputData, current: 
     return reminder.listId === parsed.listId
       && reminder.completed === false
       && reminder.deleted === false
+      && reminder.parentReminderId === expectedParentId
       && reminder.title === parsed.title
       && (reminder.notes ?? "") === parsed.notes
       && reminder.priority === parsed.priority

@@ -78,7 +78,7 @@ export const AllOpenOutput = z.object({
   writesEnabled: z.boolean(),
 }).strict();
 
-export function MutationOutput(action: "create" | "update" | "complete" | "reopen" | "delete") {
+export function MutationOutput(action: "create" | "update" | "complete" | "reopen" | "delete" | "create_subtask" | "set_parent") {
   const result = z.object({
     generation: counter,
     operation: z.literal(action),
@@ -86,7 +86,7 @@ export function MutationOutput(action: "create" | "update" | "complete" | "reope
     record: ReminderOutput,
     writesEnabled: z.literal(true),
   }).strict();
-  return action === "create" ? result.extend({ idempotencyKey: z.string().uuid() }).strict() : result;
+  return action === "create" || action === "create_subtask" ? result.extend({ idempotencyKey: z.string().uuid() }).strict() : result;
 }
 
 export const ConnectionStatusOutput = z.object({
@@ -119,7 +119,18 @@ export const ConnectionStatusOutput = z.object({
     liveRead: z.boolean(), controlledRead: z.boolean(), listReminders: z.boolean(),
     allOpenReminders: z.boolean(), search: z.literal(false), create: z.boolean(),
     update: z.boolean(), complete: z.boolean(), reopen: z.boolean(), delete: z.boolean(),
+    prepareUpdate: z.boolean(), linkedScheduling: z.boolean(), reminderJobs: z.boolean(),
+    bulkCreate: z.boolean(), bulkDelete: z.boolean(), autonomousJobs: z.boolean(),
+    jobExecutionMode: z.enum(["request-driven", "queue"]),
+    subtasks: z.boolean(),
   }).strict(),
   mcpTools: z.array(z.string()),
   message: z.string(),
+}).strict();
+
+const schedule = z.object({ dueDate: text, timeZone: text, allDay: flag }).strict();
+export const PrepareUpdateOutput = z.object({
+  generation: counter, supported: z.boolean(), classification: z.enum(["single-record", "linked-date", "unverified-linked-schedule"]),
+  before: schedule, after: schedule.nullable(), linkedFeatures: z.object({ alarms: counter, recurrenceRules: counter, graphComplete: z.boolean() }).strict(),
+  unsupportedReason: text, preparationToken: z.string().nullable(), expiresAt: nullableTime, operationCount: counter, message: z.string(),
 }).strict();

@@ -80,6 +80,12 @@ try {
   assert.equal(rejected.relationshipFieldTypes["AttachmentIDs:UNKNOWN_LIST:empty-array"], 1);
   assert.equal(rejected.relationshipFieldTypes["AlarmIDs:STRING_LIST:array"], 1);
   assert.ok(!JSON.stringify(rejected).includes(privateValue));
+  const atomicErrors = summarizeAppleResponse(new URL("https://p12-ckdatabasews.icloud.com/database/1/com.apple.reminders/production/private/records/modify"), 200, {
+    records: [{ recordName: privateValue, serverErrorCode: "CONFLICT", reason: privateValue },
+      { recordName: privateValue, serverErrorCode: "ATOMIC_ERROR" }, { recordName: privateValue, serverErrorCode: privateValue }],
+  });
+  assert.deepEqual(atomicErrors.recordErrorCodes, { CONFLICT: 1, ATOMIC_ERROR: 1, other: 1 });
+  assert.ok(!JSON.stringify(atomicErrors).includes(privateValue));
   const failed = summarizeAppleFailure(new URL("https://p12-ckdatabasews.icloud.com/database/1/com.apple.reminders/production/private/records/query?dsid=" + privateValue), { stage: "body", status: 200, bytesRead: 1_048_577, elapsedMs: 300, timeout: false, aborted: false, error: { code: "LOCAL_RESPONSE_BYTE_BUDGET", message: privateValue, cause: privateValue } });
   assert.equal(failed.failure, "response-byte-budget");
   assert.equal(failed.bytesRead, 1_048_577);

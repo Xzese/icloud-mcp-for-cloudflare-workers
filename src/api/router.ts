@@ -6,6 +6,7 @@ import { appleAuthSocket } from "../auth/socket.ts";
 import { AppleConnectionService, ControlledRead, ResumeRequest } from "../auth/service.ts";
 import { appleGates, requireAppleEnabled } from "../auth/gates.ts";
 import { credentialDocument, credentialScript } from "../auth/credential-page.ts";
+import { ReminderJobService } from "../jobs/service.ts";
 
 const json = (data: unknown, status = 200) => Response.json(data, { status, headers: { "cache-control": "private, no-store", "x-content-type-options": "nosniff" } });
 export async function applicationRoute(request: Request, env: RuntimeEnv, credentialJS?: string): Promise<Response | null> {
@@ -35,9 +36,31 @@ export async function applicationRoute(request: Request, env: RuntimeEnv, creden
     if (request.method === "GET") {
       if (path === "/api/auth/config") return json(appleGates(env));
       if (path === "/api/connection") return json(await new AppleConnectionService(env, owner).status());
+      const job = /^\/api\/reminder-jobs\/([a-f0-9-]{36})$/i.exec(path);
+      if (job) {
+        const query = new URL(request.url).searchParams;
+        if ([...query.keys()].some(key => key !== "offset" && key !== "limit") || query.getAll("offset").length > 1 || query.getAll("limit").length > 1) throw new AppError("VALIDATION_ERROR", "Use only offset and limit for job status.", 400);
+        return json(await new ReminderJobService(env, owner).get({ jobId: job[1], offset: query.has("offset") ? Number(query.get("offset")) : 0, limit: query.has("limit") ? Number(query.get("limit")) : 50 }));
+      }
     }
     if (request.method === "POST") {
       requireSameOrigin(request, env);
+      const jobRoute = /^\/api\/reminder-jobs(?:\/([a-f0-9-]{36})\/(append|preview|start|cancel|resume|continue))?$/i.exec(path);
+      if (jobRoute || path === "/api/reminder-updates/prepare" || path === "/api/reminder-evidence/capture" || path === "/api/reminder-evidence/atomic-protection") {
+        const bytes = await limitedBytes(new Response(request.body, { headers: request.headers }), 65_536);
+        let value: unknown;
+        try { value = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes)); }
+        catch { throw new AppError("VALIDATION_ERROR", "Provide a valid reminder-job or update-preparation request.", 400); }
+        if (!value || typeof value !== "object" || Array.isArray(value)) throw new AppError("VALIDATION_ERROR", "A JSON object is required.", 400);
+        if (path === "/api/reminder-evidence/capture") return json(await new AppleConnectionService(env, owner).captureEvidence(value));
+        if (path === "/api/reminder-evidence/atomic-protection") return json(await new AppleConnectionService(env, owner).verifyAtomicEvidence(value));
+        if (path === "/api/reminder-updates/prepare") return json(await new AppleConnectionService(env, owner).prepareUpdate(value));
+        const jobs = new ReminderJobService(env, owner);
+        const action = jobRoute![2]?.toLowerCase() as "append" | "preview" | "start" | "cancel" | "resume" | "continue" | undefined;
+        if (!action) return json(await jobs.create(value));
+        if (Object.hasOwn(value, "jobId")) throw new AppError("VALIDATION_ERROR", "The job ID belongs in the route, not in the body.", 400);
+        return json(await jobs[action]({ ...value, jobId: jobRoute![1] }));
+      }
       if (path === "/api/auth/disconnect") return json(await new AppleConnectionService(env, owner).disconnect());
       if (path.startsWith("/api/auth/") || path === "/api/apple/read") {
         requireAppleEnabled(env);

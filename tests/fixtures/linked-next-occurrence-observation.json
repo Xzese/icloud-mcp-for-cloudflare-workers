@@ -1,0 +1,117 @@
+{
+  "source": "authorized-synthetic-apple-app-observation",
+  "observedAt": "2026-10-10",
+  "appleAppConfirmedByOperator": true,
+  "writableRecipeApproved": false,
+  "description": "Operator moved only the known open original from 17 October 2026 to 10 January 2027 at 09:00 Europe/London. These are anonymized projections of stable active graphs, not complete raw Apple records or a write recipe.",
+  "before": {
+    "schemaVersion": 1,
+    "caseId": "00000000-0000-4000-8000-000000000001",
+    "generation": 1,
+    "source": "live-apple-api",
+    "capturedAt": 1791651274000,
+    "rootRecordName": "Reminder/ACTIVE",
+    "explicitlyReferencedRecordsResolved": true,
+    "records": [
+      {
+        "recordName": "Reminder/ACTIVE",
+        "recordType": "Reminder",
+        "recordChangeTag": "active-before",
+        "fields": {
+          "DueDate": { "type": "TIMESTAMP", "value": 1792224000000 },
+          "TimeZone": { "type": "STRING", "value": "Europe/London" },
+          "AllDay": { "type": "INT64", "value": 0 },
+          "Completed": { "type": "INT64", "value": 0 },
+          "AlarmIDs": { "type": "STRING_LIST", "value": ["old-alarm"] },
+          "RecurrenceRuleIDs": { "type": "STRING_LIST", "value": ["rule"] },
+          "TitleDocument": { "type": "ENCRYPTED_BYTES", "value": "same-title" },
+          "NotesDocument": { "type": "ENCRYPTED_BYTES", "value": "same-notes" },
+          "LastModifiedDate": { "type": "TIMESTAMP", "value": "modified-before" },
+          "ResolutionTokenMap": { "type": "STRING", "value": "tokens-before" }
+        }
+      },
+      {
+        "recordName": "RecurrenceRule/RULE",
+        "recordType": "RecurrenceRule",
+        "recordChangeTag": "same-rule-version",
+        "fields": {
+          "Frequency": { "type": "INT64", "value": 1 },
+          "Interval": { "type": "INT64", "value": 1 },
+          "OccurrenceCount": { "type": "INT64", "value": 0 },
+          "FirstDayOfTheWeek": { "type": "INT64", "value": 0 }
+        }
+      },
+      { "recordName": "Alarm/OLD", "recordType": "Alarm", "recordChangeTag": "old-alarm-version", "fields": {} },
+      { "recordName": "AlarmTrigger/OLD", "recordType": "AlarmTrigger", "recordChangeTag": "old-trigger-version", "fields": {} }
+    ],
+    "edges": [
+      { "from": "Reminder/ACTIVE", "field": "AlarmIDs", "to": "Alarm/OLD" },
+      { "from": "Reminder/ACTIVE", "field": "RecurrenceRuleIDs", "to": "RecurrenceRule/RULE" },
+      { "from": "Alarm/OLD", "field": "TriggerID", "to": "AlarmTrigger/OLD" }
+    ]
+  },
+  "after": {
+    "schemaVersion": 1,
+    "caseId": "00000000-0000-4000-8000-000000000001",
+    "generation": 1,
+    "source": "live-apple-api",
+    "capturedAt": 1791651354836,
+    "rootRecordName": "Reminder/ACTIVE",
+    "explicitlyReferencedRecordsResolved": true,
+    "records": [
+      {
+        "recordName": "Reminder/ACTIVE",
+        "recordType": "Reminder",
+        "recordChangeTag": "active-after",
+        "fields": {
+          "DueDate": { "type": "TIMESTAMP", "value": 1799571600000 },
+          "TimeZone": { "type": "STRING", "value": "Europe/London" },
+          "AllDay": { "type": "INT64", "value": 0 },
+          "Completed": { "type": "INT64", "value": 0 },
+          "AlarmIDs": { "type": "STRING_LIST", "value": ["new-alarm"] },
+          "RecurrenceRuleIDs": { "type": "STRING_LIST", "value": ["rule"] },
+          "TitleDocument": { "type": "ENCRYPTED_BYTES", "value": "same-title" },
+          "NotesDocument": { "type": "ENCRYPTED_BYTES", "value": "same-notes" },
+          "LastModifiedDate": { "type": "TIMESTAMP", "value": "modified-after" },
+          "ResolutionTokenMap": { "type": "STRING", "value": "tokens-after" }
+        }
+      },
+      {
+        "recordName": "RecurrenceRule/RULE",
+        "recordType": "RecurrenceRule",
+        "recordChangeTag": "same-rule-version",
+        "fields": {
+          "Frequency": { "type": "INT64", "value": 1 },
+          "Interval": { "type": "INT64", "value": 1 },
+          "OccurrenceCount": { "type": "INT64", "value": 0 },
+          "FirstDayOfTheWeek": { "type": "INT64", "value": 0 }
+        }
+      },
+      { "recordName": "Alarm/NEW", "recordType": "Alarm", "recordChangeTag": "new-alarm-version", "fields": {} },
+      { "recordName": "AlarmTrigger/NEW", "recordType": "AlarmTrigger", "recordChangeTag": "new-trigger-version", "fields": {} }
+    ],
+    "edges": [
+      { "from": "Reminder/ACTIVE", "field": "AlarmIDs", "to": "Alarm/NEW" },
+      { "from": "Reminder/ACTIVE", "field": "RecurrenceRuleIDs", "to": "RecurrenceRule/RULE" },
+      { "from": "Alarm/NEW", "field": "TriggerID", "to": "AlarmTrigger/NEW" }
+    ]
+  },
+  "historicalObservation": {
+    "exactNormalizedStateAndVersionUnchanged": true,
+    "dueDate": "2026-10-10T08:00:00.000Z",
+    "completedDate": "2026-10-10T16:50:55.361Z",
+    "completed": true,
+    "completeStableGraphCaptured": false
+  },
+  "additionalAfterObservation": {
+    "dateComponents": { "year": 2027, "month": 1, "day": 10, "hour": 9, "minute": 0, "second": 0, "era": 1, "timeZone": { "identifier": "Europe/London" } },
+    "candidateNonceRelation": "counter * 100000000000 + modificationTime",
+    "observedNonceMatches": [
+      { "role": "active-original", "counter": 5, "equalityMatched": true },
+      { "role": "completed-history", "counter": 1, "equalityMatched": true }
+    ],
+    "generalNonceConstructionProven": false,
+    "oldAlarmRetirementProven": false,
+    "commitTimeDependencyProtectionProven": false
+  }
+}

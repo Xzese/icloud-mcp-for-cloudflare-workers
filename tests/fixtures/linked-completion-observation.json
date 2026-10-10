@@ -1,0 +1,44 @@
+{
+  "source": "authorized-synthetic-apple-app-observation",
+  "observedAt": "2026-10-10",
+  "writableRecipeApproved": false,
+  "description": "Operator completed the weekly synthetic reminder due 10 October 2026 at 09:00 Europe/London. A complete list read and repeated exact normalized reads found the original ID still open at the next weekly date and a different ID containing completed history. Identities are invented equality aliases.",
+  "before": {
+    "id": "Reminder/00000000-0000-4000-8000-000000000001",
+    "completed": false,
+    "dueDate": "2026-10-10T08:00:00.000Z",
+    "timeZone": "Europe/London",
+    "allDay": false,
+    "recurrenceCount": 1,
+    "alarmCount": 1
+  },
+  "active": {
+    "id": "Reminder/00000000-0000-4000-8000-000000000001",
+    "completed": false,
+    "completedDate": null,
+    "dueDate": "2026-10-17T08:00:00.000Z",
+    "timeZone": "Europe/London",
+    "allDay": false,
+    "recurrenceCount": 1,
+    "alarmCount": 1,
+    "exactNormalizedRereadMatched": true,
+    "diagnosticGraphRecords": 4
+  },
+  "history": {
+    "id": "Reminder/00000000-0000-4000-8000-000000000002",
+    "completed": true,
+    "completedDate": "2026-10-10T16:50:55.361Z",
+    "dueDate": "2026-10-10T08:00:00.000Z",
+    "timeZone": "Europe/London",
+    "allDay": false,
+    "recurrenceCount": 0,
+    "alarmCount": 1,
+    "exactNormalizedRereadMatched": true,
+    "completeStableGraphCaptured": false,
+    "captureBlocker": "UrgentPresentationAlarmsAsData differed during an exact graph reread despite an unchanged Reminder version. The unknown field was not ignored."
+  },
+  "controlledPaginationComplete": true,
+  "serverWritesDuringObservation": false,
+  "automaticSuccessorTargetingProven": false,
+  "generalRecurringCompletionRecipeProven": false
+}

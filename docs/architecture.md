@@ -17,7 +17,7 @@ excluded from public source. Framework-generated Wrangler JSON stays inside `dis
 
 D1 holds encrypted Apple-session envelopes in `apple_session_state`. Envelope associated data
 binds owner/account/generation/schema. Versioned leases fence concurrent setup, consent, reads, writes
-and disconnect. `schema.sql` defines the sole application table for a new deployment. Local setup
+and disconnect. `schema.sql` defines the session and additive job tables for a new deployment. Local setup
 and tests execute it directly using native D1. Standalone operators initialize D1 with Wrangler's
 `d1 execute --file schema.sql`. The Sites build copies it into the platform's SQL initialization
 layout at `dist/.openai/drizzle/0000_schema.sql`; this is a generated build artifact, not a separate
@@ -83,14 +83,57 @@ transport and session lease. They require the bound authenticated owner and a re
 Apple session, with no separate write-approval flag. Exact lookups verify the current list and reminder before dispatch.
 Creates derive the Apple record ID from the caller's UUID idempotency key, while updates send
 only changed fields with an exact server change tag. Resolution tokens for untouched fields
-are retained. Reminder content and mutation receipts are not cached in D1, and no new database
-table or resource is required. The protocol rejects force-update, replacement and hard deletion; soft deletion uses a tagged update.
+are retained. Single-request reminder content and mutation receipts are not cached in D1. Bulk jobs separately
+persist encrypted approved input, dispatch intent and item receipts under job-specific AAD;
+their additive migration never changes session rows. The protocol rejects force-update,
+replacement and hard deletion; single-request soft deletion uses a tagged update.
 
 Writes are never automatically retried or redirected. An uncertain upstream response or a lost
 session fence after submission returns `WRITE_OUTCOME_UNKNOWN`; local fencing cannot undo an
 Apple request already in flight. Read current state before another edit, or reconcile creation
 using the same UUID. Successful mutations invalidate an unfinished all-open continuation so it
 cannot silently skip a newly created item in a previously scanned list. See `write-access.md`.
+
+`src/jobs/` uses a durable owner/account/generation-bound ledger, immutable sealed manifests,
+CAS account/job leases and bounded authenticated continuation by default on **both** targets.
+The standalone entrypoint additionally supports an opt-in Queue consumer and one-minute durable
+outbox pump; Sites does not expose these handlers. Opaque message hints never establish owner
+authority and are acknowledged only after durable progress/next delivery. Status does not execute
+work. Queue mode requires verified private bindings. Simple bulk creation is a permanent
+ready-account capability once the job schema is installed;
+simple bulk deletion reuses the single-delete checks per item, with a read-only preview preflight and post-commit subtask report.
+Recovered dispatch intent is read-only reconciled and stays unknown without a valid receipt.
+The new [job documentation](reminder-jobs.md) defines lifecycle, limits, retention and migration.
+
+Read-only update preparation fingerprints bounded allowlisted linked records and binds a
+short-lived token to the exact request. The atomic executor preserves the Reminder mutation
+allowlist and can protect unchanged Alarm, AlarmTrigger and RecurrenceRule records with exact
+version-checked reassertions of their observed `Deleted=0` marker. Guards share the atomic
+request and all bounds, and their complete confirmed fields must match the inspected records.
+Controlled native stale-version experiments proved rejection without partial commits for those
+three types. The bounded scheduling graph also follows the observed Alarm `TriggerID` UUID
+to its exact AlarmTrigger. Structural completeness is separate from recipe support.
+`src/reminders/linked-date.ts` validates timed absolute-date backlinks, components and nonce
+consistency. Its narrow executor updates the existing Alarm nonce and Trigger components in
+the same group as the Reminder, guarding optional unchanged recurrence. Every confirmed
+dependency preserves the complete field set except its planned date field. The ordinary
+atomic mutation interface remains Reminder-only; there is no arbitrary linked-record editor.
+Native recurring-date move/restore acceptance passed without replacing linked IDs.
+This permanent ready-account recipe does not establish unreferenced-child protection,
+date clearing, all-day conversion or other alarm/calendar semantics. See
+[Apple evidence and exact scope](linked-record-protocol.md).
+
+`src/reminders/subtasks.ts` adds permanent one-level same-list relationship builders and
+bounded child inspection. The API and MCP share `create_subtask` and `set_parent` mutations,
+with `create_subtask`/`set_reminder_parent` MCP tools and a session-dependent `subtasks` capability.
+No rollout flags control subtask relationships or simple bulk creation.
+Creation keeps CloudKit ownership under the List and writes `ParentReminder` independently.
+Movement changes only that reference and its modification tokens. Affected Reminder parents
+are protected by exact-version marker guards in the same atomic group. Guard confirmations
+must preserve their complete fields. The simple bulk-create schema is unchanged.
+Observed parents are refused by lifecycle actions; bounded inspections do not establish
+general protection against unreferenced new-child races; bulk deletion therefore rescans after commit
+and reports remaining subtasks instead of claiming prevention.
 
 The provenance directory preserves upstream references and licenses. Checked-in synthetic fixtures
 exercise the pinned protocol reference, not a live Apple account. See SECURITY.md for invariants

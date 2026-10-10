@@ -37,10 +37,14 @@ const config = JSON.parse(await readFile(path.join(root, 'dist/server/wrangler.j
 if (!config.d1_databases?.some(x => x.binding === 'DB') || !config.compatibility_flags?.includes('nodejs_compat')) throw new Error('Required runtime contract is missing.');
 const hosting = JSON.parse(await readFile(path.join(root, '.openai/hosting.json'), 'utf8'));
 if (hosting.d1 !== 'DB' || !hosting.capabilities?.includes('mcp')) throw new Error('Required Sites capabilities are missing.');
+const schema = await readFile(path.join(root, 'schema.sql'), 'utf8');
+const migration = await readFile(path.join(root, 'migrations/0001_reminder_jobs.sql'), 'utf8');
+if (!schema.includes(migration.slice(migration.indexOf('CREATE TABLE')).trim())) throw new Error('Fresh-install and additive job schemas differ.');
+if (await readFile(path.join(root, 'dist/.openai/drizzle/0000_schema.sql'), 'utf8') !== schema) throw new Error('Packaged job schema differs from canonical source.');
 await mkdir(path.join(root, 'docs'), { recursive: true });
 await writeFile(path.join(root, 'docs/artifact-manifest.json'), JSON.stringify({
   kind: 'local-production-build', compatibilityDate: config.compatibility_date,
   entrypoint: 'dist/server/index.js', sitesCapabilities: hosting.capabilities,
-  appleConnectionImplemented: true, liveAppleValidated: false, liveFlagsConfiguredByBuild: false, schemaVersion: 3, loginPolicy: 'device-only-v2', supportedLoginAssuranceVersions: [2, 3], retentionPolicy: 'absolute-30d-v1', maxLocalSessionLifetimeMs: 2_592_000_000, checks: ['local-key-exclusion', 'public-asset-boundary', 'binding-contract'], files: entries,
+  appleConnectionImplemented: true, liveAppleValidated: false, liveFlagsConfiguredByBuild: false, schemaVersion: 4, jobExecutionMode: 'request-driven', linkedSchedulingEnabled: false, bulkDeletionEnabled: false, loginPolicy: 'device-only-v2', supportedLoginAssuranceVersions: [2, 3], retentionPolicy: 'absolute-30d-v1', maxLocalSessionLifetimeMs: 2_592_000_000, checks: ['local-key-exclusion', 'public-asset-boundary', 'binding-contract', 'additive-job-schema-parity'], files: entries,
 }, null, 2) + '\n');
 console.log(JSON.stringify({ result: 'passed', files: entries.length, bytes: entries.reduce((sum, x) => sum + x.bytes, 0), manifest: 'docs/artifact-manifest.json', deployed: false }));
