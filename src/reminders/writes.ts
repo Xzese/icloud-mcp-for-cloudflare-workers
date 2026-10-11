@@ -1,6 +1,7 @@
 import { z } from "zod";
 import { AppError, requireValue } from "../errors.ts";
 import { normalizeReminder, type CloudKitRecord } from "../icloud/cloudkit.ts";
+import { RecurrenceChanges } from "./recurrence.ts";
 import { LocationAlarmChange } from "./location-alarm.ts";
 import { EarlyReminder } from "./early-reminder.ts";
 import { encodeDocument } from "./crdt.ts";
@@ -79,9 +80,9 @@ export const ReminderChanges = z.object({
   dueDate: nullableDueDate,
   timeZone: nullableTimeZone,
   allDay,
-  locationAlarm: LocationAlarmChange.describe("Switch an existing reviewed location alarm between arriving and leaving; preserve its place and radius."),
+  locationAlarm: LocationAlarmChange.nullable().describe("Create one location alarm with full place, proximity and radius; edit supplied existing metadata; null removes the location alarm."),
   earlyReminder: EarlyReminder.nullable().describe("Edit the offset of an existing one-alert minute/hour-based early reminder, preserving its private metadata. Null removes an existing early reminder."),
-  recurrence: z.object({ frequency: z.enum(["daily", "weekly", "monthly", "yearly"]), interval: z.union([z.literal(1), z.literal(2)]) }).strict().describe("Edit an existing simple daily, weekly, monthly or yearly recurrence. Interval 2 is supported only for weekly recurrence."),
+  recurrence: RecurrenceChanges.describe("Edit an existing known recurrence: frequency/interval, weekly ISO weekdays, monthly dates or ordinal weekday, yearly months, and an explicit end instant. Omitted compatible patterns and endDate stay unchanged."),
 }).partial().strict();
 
 export const CreateReminderInput = z.object({

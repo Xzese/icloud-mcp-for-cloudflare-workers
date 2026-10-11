@@ -3,7 +3,7 @@
 Baseline: `f4da3d8ef41b5bc16415a75abc0043d16e3fcba2`. No subsequent baseline changes
 were present when this implementation started. The operator's controlled Apple-app edits
 and API observations below preceded the connector's successful in-place date move/restore.
-No automated Mac interaction was performed.
+Later expanded recipes below were checked through controlled Mac interaction on synthetic Test reminders.
 
 **The in-place timed absolute-date recipe is permanent ready-account functionality.**
 Neither the general CloudKit atomic contract nor pyicloud's generic update implementation
@@ -17,9 +17,9 @@ captures and not an acceptance oracle.
 | Timed recurring active-occurrence date/time-zone change | Supported with one current absolute date alarm, preserving recurrence and linked IDs. |
 | Timed absolute date alarm, with optional recurrence | Supported in-place Reminder/Alarm/AlarmTrigger atomic recipe below. |
 | Linked date clearing or timed/all-day conversion | Supported for the known date pair with explicit calendar-date/instant inputs; no location or early reminder during conversion. |
-| Existing location alarm | One known location pair can be preserved during a date move or have its arriving/leaving proximity edited. Creation/removal/radius edits remain blocked. |
+| Location alarm | One known pair can be created from a resolved place, edited, preserved during a date move or soft retired. |
 | Existing early reminder | One minutes/hours offset can be edited or removed; missing account metadata prevents creation. |
-| Existing simple recurrence | Daily/weekly/monthly/yearly interval 1, or weekly interval 2; custom/end/anchor/creation edits remain blocked. |
+| Existing known recurrence | Daily/weekly/monthly/yearly intervals, weekly weekdays, monthly dates or ordinal weekday, yearly months and explicit end instant. Anchor/creation edits remain blocked. |
 | Unknown recurrence or scheduling field | Blocked. |
 | Completed historical occurrence | Cannot be rescheduled, reopened implicitly or redirected to a successor. |
 | Parent/subtask scheduling | Independent parent dates; child dates guard the exact open root parent in the same list. No cascade or deeper nesting. |
@@ -401,9 +401,9 @@ response: the former refuses the entire group, the latter returns uncertainty wi
 Structural graph completeness and recipe approval remain distinct. No rollout flag controls
 this support; capability reporting reflects session availability, not support for every graph.
 
-The expanded recipes below cover bounded clearing, conversion, existing early/location
-alarms, simple recurrence edits and one-level child scheduling. Start dates, unknown/multiple
-alarms of the same type, custom recurrence and lifecycle advancement remain refused.
+The expanded recipes below cover bounded clearing, conversion, existing early reminders,
+location alarms, known custom recurrence edits and one-level child scheduling. Start dates,
+unknown/multiple alarms of the same type and lifecycle advancement remain refused.
 Simple bulk deletion is permanent; it reports post-commit subtasks rather than preventing them.
 
 ## Native transition captures and expanded scheduling acceptance
@@ -428,7 +428,7 @@ retirement only, never hard deletion of a Reminder or arbitrary caller-selected 
 The expanded recipes and explicit input examples are documented in
 [write access](write-access.md#additional-scheduling-recipes). Private captures remain ignored;
 checked-in fixtures use invented identities and account metadata. Actual notification delivery,
-custom recurrence anchors/end dates, location creation/removal and early-reminder creation
+recurrence creation/anchors and early-reminder creation
 without independently established account metadata remain outside the verified scope.
 
 Final controlled connector checks confirmed and visually inspected recurring-date clearing,
@@ -441,3 +441,44 @@ absolute retained-session deadline were unchanged throughout. A reverse-conversi
 with omitted record zone triggered uncertainty and was reconciled read-only; confirmation
 validation now uses the authenticated owner for its expanded references rather than relying
 on optional record-level zone metadata. No uncertain mutation was replayed.
+
+## Custom recurrence and location expansion
+
+Further native captures established weekly weekday arrays, monthly day-of-month arrays,
+one monthly ordinal weekday, yearly month arrays and an optional `EndDate` timestamp.
+Weekday entries use Apple's Sunday=1 numbering and `weekNumber=0` for weekly patterns;
+monthly ordinals use 1 through 5 or -1 for last. The public API translates ISO weekdays.
+Pattern arrays are bounded base64 UTF-8 JSON, not recurrence strings. Unknown calendar,
+count, import or pattern combinations fail closed. The interval ceiling of 999 is an API
+inspection bound, not a measured Apple UI maximum.
+
+Connector writes were confirmed and visibly checked in Apple Reminders for every four weeks
+on Tuesday/Friday with a 1 September 2027 end date, every two months on the 17th/31st with
+the end removed, every two months on the last Tuesday, and every two years in January/July.
+Changing pattern removed incompatible fields and preserved the existing five-minute early
+reminder. End inputs are explicit instants: no midnight or inclusive calendar-day behavior
+is inferred from the native date picker. Omission preserves an existing end instant even
+when frequency changes; callers must pass `null` to remove it.
+
+Native location removal unlinked the root and set both dependent records to `Deleted=1`;
+only the Alarm's Reminder backreference disappeared. The Trigger retained its Alarm
+reference and place metadata. Recreating a location through the selected station suggestion
+minted fresh Alarm, Trigger and Location identifiers. This soft-retirement recipe is distinct
+from the date pair's trigger-first hard retirement.
+
+Creation and place edits carry `isEncrypted=true` on the captured ReferenceFrameString,
+Title, Address, Latitude and Longitude fields. Native captures and
+[Apple's encrypted-field documentation](https://developer.apple.com/documentation/cloudkit/encrypting-user-data)
+establish this typed payload flag. An unflagged creation returned a mixed atomic rejection;
+read-only reconciliation confirmed the root tag and date pair were unchanged. A fresh request
+with the corrected flags created a leaving station alarm, visibly checked at a 400-metre radius.
+No uncertain request was replayed.
+
+A subsequent connector edit changed the resolved station place, proximity to arriving and
+radius to 600 metres; Apple Reminders displayed all three changes while the date stayed intact.
+The new pair's identifiers were preserved during editing. Connector removal also kept the
+absolute date pair and visibly disabled Location.
+
+Early payloads captured on two synthetic roots shared an account identifier, but no
+authenticated account field has been established as its source. Creation without an existing
+payload remains refused; native account identifiers are never guessed from zone owners or DSIDs.

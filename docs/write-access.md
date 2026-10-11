@@ -41,8 +41,8 @@ An incomplete/errorful or over-budget child inspection blocks the action. This c
 proof of commit-time protection against a newly added, unreferenced child. Bulk deletion uses the
 same per-item checks and additionally rescans after commit to report any remaining subtasks. Use Apple's app for completing, reopening or deleting parents and their subtasks.
 Moving lists, list management, attachments and tags are outside this interface. The bounded
-scheduling recipes below can create or retire a date-alarm pair and edit existing simple
-recurrence, early-reminder offsets and location proximity. Arbitrary alarm/rule edits are refused.
+scheduling recipes below can create or retire a date-alarm pair, edit existing known recurrence
+and early-reminder offsets, and create, edit or remove one location pair. Arbitrary alarm/rule edits are refused.
 Unchanged linked fields remain untouched. Editing title or notes replaces that text document
 with plain text, including its formatting; an omitted document remains intact.
 
@@ -69,7 +69,7 @@ the instant and changes the displayed local time; to retain the local clock, sup
 new instant as `dueDate` too. The format cannot distinguish repeated fall-back local times, so
 those are explicitly refused. Dates must remain in Gregorian years 1-9999.
 Start dates, multiple alarms of the same type, unknown trigger/calendar fields, recurrence
-creation/end dates/anchors and deeper nesting remain unsupported. The additional recipes below
+creation/anchors and deeper nesting remain unsupported. The additional recipes below
 require explicit inputs and do not infer calendar-date or wall-clock intent.
 
 Controlled native API acceptance moved a weekly reminder from 10 January 2027 at 09:00
@@ -87,23 +87,32 @@ confirmation checks. Existing resolution tokens retain their replica ID and incr
 counter; new fields receive a new token. A counter overflow is refused. Unchanged participants
 receive marker-only version guards, and uncertain outcomes are never replayed automatically.
 
-- `changes.dueDate: null` clears a known date schedule and its simple recurrence. The root
+- `changes.dueDate: null` clears a known date schedule and its known recurrence. The root
   unlinks both; the recurrence is retired with `Deleted=1` and no Reminder backreference.
   The exact date trigger is deleted before its alarm, in the same atomic batch.
 - Timed to all-day conversion requires `allDay: true` and the requested calendar date as an
   explicit midnight-UTC `dueDate`; omit `timeZone`. It removes the stored zone and date alarm.
   Reverse conversion requires `allDay: false`, an explicit instant and an IANA `timeZone`,
-  and creates a validated date-alarm pair while preserving an existing simple recurrence.
-- `changes.recurrence` edits an existing simple rule using `frequency` (`daily`, `weekly`,
-  `monthly`, `yearly`) and `interval` (1, or 2 for weekly). End dates, custom rules and creation
-  remain refused.
+  and creates a validated date-alarm pair while preserving an existing known recurrence.
+- `changes.recurrence` edits an existing rule using `frequency` (`daily`, `weekly`,
+  `monthly`, `yearly`) and integer `interval` from 1 through 999. Weekly `weekdays` use ISO
+  numbers 1 (Monday) through 7 (Sunday). Monthly patterns use `monthDays` (1 through 31)
+  or `ordinalWeekday: { weekday, ordinal }`, where ordinal is 1 through 5 or -1 for last.
+  Yearly `months` use 1 through 12. Incompatible patterns are refused; changing frequency
+  removes the old incompatible pattern. Omitted compatible patterns remain unchanged;
+  `null` removes a supplied pattern. `endDate` is an ISO instant with an explicit offset;
+  omission preserves it and `null` removes it. Creation, occurrence counts, imported rules,
+  unknown fields and recurrence anchor changes remain refused.
 - `changes.earlyReminder` edits one existing offset using positive `count` and `unit`
   (`minutes` or `hours`); `null` removes it. Its account metadata is preserved. Creation is
   refused when that metadata is absent, as are date clearing/conversion with an early reminder.
-- `changes.locationAlarm: { proximity: "arriving" | "leaving" }` edits one existing location
-  alarm while preserving its place, coordinates, radius and identity. A date move can preserve
-  that complete location pair alongside the absolute date pair. Location creation/removal,
-  radius edits, and clearing/conversion with a location alarm remain refused.
+- `changes.locationAlarm` creates or edits one location alarm. Creation requires `proximity`
+  (`arriving` or `leaving`), `radiusMeters`, and `place: { title, address, latitude, longitude }`.
+  The place must already be resolved to coordinates; this API does not search or geocode text.
+  Existing alarms accept partial edits and preserve their identities. `null` removes the pair
+  using native soft retirement and keeps the absolute date alarm. A date move can preserve
+  that complete location pair alongside the absolute date pair. Clearing/conversion with an
+  existing location alarm remains refused.
 - Parent dates do not cascade to children. A child's date update guards the exact same-list,
   open root parent; unavailable, foreign, completed or nested parents are refused.
 

@@ -7,11 +7,12 @@ import { CloudKitRemindersClient, type CloudKitLookupResult, type CloudKitRecord
 import { AppleHTTP } from "../src/transport/apple-http.ts";
 import { CookieJar } from "../src/transport/cookie-jar.ts";
 import { canonicalJSON } from "../src/lib/canonical.ts";
-import { buildCreateReminder, CreateReminderInput } from "../src/reminders/writes.ts";
+import { buildCreateReminder, CreateReminderInput, UpdateReminderInput } from "../src/reminders/writes.ts";
 import { loadSchedulingGraph } from "../src/reminders/linked-records.ts";
 import { planReminderUpdate } from "../src/reminders/mutation-plan.ts";
 import { dateComponents, decodeDateComponents, dueDateNonce } from "../src/reminders/linked-date.ts";
 
+import { RecurrenceChanges, readRecurrence } from "../src/reminders/recurrence.ts";
 import { verifySchedulingWrite } from "../src/reminders/scheduling-plan.ts";
 
 const owner = "synthetic-owner", listId = "List/LINKED-DATE", now = 1_800_000_000_000;
@@ -38,7 +39,7 @@ function records(): CloudKitRecord[] {
     } },
     { recordName: ruleId, recordType: "RecurrenceRule", recordChangeTag: "rule-before", zoneID, raw: {}, fields: {
       Reminder: reference(root.recordName), Frequency: { type: "INT64", value: 1 }, Interval: { type: "INT64", value: 1 },
-      OccurrenceCount: { type: "INT64", value: 0 }, FirstDayOfTheWeek: { type: "INT64", value: 0 }, Deleted: { type: "INT64", value: 0 },
+      Imported: { type: "INT64", value: 0 }, OccurrenceCount: { type: "INT64", value: 0 }, FirstDayOfTheWeek: { type: "INT64", value: 0 }, Deleted: { type: "INT64", value: 0 },
     } },
   ];
 }
@@ -169,7 +170,10 @@ test("bounded trigger traversal refuses missing, shared, foreign or mismatched t
 
 test("atomic linked executor rejects any stale participant and preserves all fields on success", async () => {
   for (const racedId of [null, records()[0].recordName, alarmId, triggerId, ruleId]) {
-    const values = records(), graph = await loadSchedulingGraph(values[0], owner, lookup(values));
+    const values = records();
+    values[3].fields.DaysOfTheWeek = { type: "BYTES", value: b64(utf8(JSON.stringify([{ dayOfTheWeek: 2, weekNumber: 0 }, { dayOfTheWeek: 4, weekNumber: 0 }]))) };
+    values[3].fields.Interval = { type: "INT64", value: 3 };
+    const graph = await loadSchedulingGraph(values[0], owner, lookup(values));
     const plan = planReminderUpdate(graph, request(values[0]), owner, now + 1000);
     assert.ok(plan.supported);
     const store = new Map(values.map(record => [record.recordName, structuredClone(record)]));
@@ -349,9 +353,9 @@ function withLocation(): CloudKitRecord[] {
     DueDateResolutionTokenAsNonce: { type: "DOUBLE", value: 0 }, Reminder: { type: "REFERENCE", value: { recordName: root.recordName, action: "VALIDATE", zoneID } },
     Imported: { type: "INT64", value: 0 }, Deleted: { type: "INT64", value: 0 },
   } }, { recordName: locationTrigger, recordType: "AlarmTrigger", recordChangeTag: "location-trigger-before", zoneID, raw: {}, fields: {
-    ReferenceFrameString: { type: "STRING", value: "1" }, Radius: { type: "DOUBLE", value: 250 }, Type: { type: "STRING", value: "Location" },
-    Proximity: { type: "INT64", value: 1 }, Address: { type: "STRING", value: "Synthetic address" }, Title: { type: "STRING", value: "Synthetic station" },
-    Latitude: { type: "DOUBLE", value: 51.5 }, Longitude: { type: "DOUBLE", value: -0.1 }, LocationUID: { type: "STRING", value: "00000000-0000-4000-8000-000000000008" },
+    ReferenceFrameString: { type: "STRING", value: "1", isEncrypted: true }, Radius: { type: "DOUBLE", value: 250 }, Type: { type: "STRING", value: "Location" },
+    Proximity: { type: "INT64", value: 1 }, Address: { type: "STRING", value: "Synthetic address", isEncrypted: true }, Title: { type: "STRING", value: "Synthetic station", isEncrypted: true },
+    Latitude: { type: "DOUBLE", value: 51.5, isEncrypted: true }, Longitude: { type: "DOUBLE", value: -0.1, isEncrypted: true }, LocationUID: { type: "STRING", value: "00000000-0000-4000-8000-000000000008" },
     Alarm: { type: "REFERENCE", value: { recordName: locationAlarm, action: "VALIDATE", zoneID } }, Imported: { type: "INT64", value: 0 }, Deleted: { type: "INT64", value: 0 },
   } });
   return values;
@@ -364,18 +368,111 @@ test("date moves and location proximity edits protect the complete mixed graph w
   assert.ok(move.supported); assert.equal(move.operationCount, 6);
   assert.deepEqual(move.dependencies.map(record => record.recordName), [alarmId, triggerId]);
   assert.ok(move.guards.some(record => record.recordName === values[4].recordName)); assert.ok(move.guards.some(record => record.recordName === values[5].recordName));
-  assert.deepEqual(move.after.locationAlarm, { proximity: "arriving" });
+  assert.equal(move.after.locationAlarm?.proximity, "arriving");
+  assert.equal(move.after.locationAlarm?.radiusMeters, 250);
   const edit = planReminderUpdate(graph, { ...request(values[0]), changes: { dueDate: "2027-07-11T09:00:00+01:00", locationAlarm: { proximity: "leaving" } } }, owner, now + 1000);
   assert.ok(edit.supported); assert.equal(edit.operationCount, 6);
   const dependency = edit.dependencies.find(record => record.recordName === values[5].recordName)!;
   assert.deepEqual(dependency.fields, { Proximity: { type: "INT64", value: 2 } }); assert.equal(dependency.recordChangeTag, "location-trigger-before");
-  assert.deepEqual(edit.before.locationAlarm, { proximity: "arriving" }); assert.deepEqual(edit.after.locationAlarm, { proximity: "leaving" });
+  assert.equal(edit.before.locationAlarm?.proximity, "arriving"); assert.equal(edit.after.locationAlarm?.proximity, "leaving");
+  assert.deepEqual(edit.before.locationAlarm?.place, edit.after.locationAlarm?.place);
   verifySchedulingWrite(dependency, values[5], { ...values[5], recordChangeTag: "location-trigger-after", fields: { ...values[5].fields, ...dependency.fields } });
   assert.deepEqual(values, before);
   assert.equal(planReminderUpdate(graph, { ...request(values[0]), changes: { dueDate: null } }, owner, now).supported, false);
   assert.equal(planReminderUpdate(graph, { ...request(values[0]), changes: { allDay: true, dueDate: "2027-07-11T00:00:00Z" } }, owner, now).supported, false);
   values[5].fields.UnobservedLocationData = { type: "BYTES", value: "AA==" };
   assert.equal(planReminderUpdate(await loadSchedulingGraph(values[0], owner, lookup(values)), request(values[0]), owner, now).supported, false);
+});
+
+test("location create, radius/place edit and soft removal preserve a mixed date graph and reject stale atomic versions", async () => {
+  const place = { title: "Synthetic station", address: "Synthetic address", latitude: 51.5, longitude: -0.1 };
+  const initial = records(), store = new Map(initial.map(record => [record.recordName, structuredClone(record)]));
+  let calls = 0;
+  const client = new CloudKitRemindersClient(new AppleHTTP(new CookieJar(), async (_, init) => {
+    calls++; const body = JSON.parse(String(init?.body));
+    assert.equal(body.atomic, true);
+    assert.ok(body.operations.every((op: { record: Record<string, unknown> }) => !("locationRetirement" in op.record)));
+    for (const op of body.operations) for (const [key, field] of Object.entries(op.record.fields) as [string, { isEncrypted?: boolean }][]) if (["ReferenceFrameString", "Address", "Title", "Latitude", "Longitude"].includes(key)) assert.equal(field.isEncrypted, true);
+    const stale = body.operations.find((op: { operationType: string; record: CloudKitRecord }) => op.operationType !== "create" && op.record.recordChangeTag !== store.get(op.record.recordName)?.recordChangeTag);
+    if (stale) return Response.json({ records: body.operations.map((op: { record: CloudKitRecord }) => ({ recordName: op.record.recordName, serverErrorCode: op === stale ? "CONFLICT" : "ATOMIC_ERROR" })) });
+    return Response.json({ records: body.operations.map((op: { operationType: string; record: CloudKitRecord }) => {
+      assert.notEqual(op.operationType, "delete");
+      const before = store.get(op.record.recordName);
+      const fields = { ...before?.fields, ...op.record.fields };
+      for (const [key, field] of Object.entries(fields)) {
+        const wrapper = field as { type: string; value: unknown };
+        if (wrapper.value === null) delete fields[key];
+        else if (op.operationType === "create" && wrapper.type === "REFERENCE") fields[key] = { ...wrapper, value: { ...(wrapper.value as object), zoneID } };
+      }
+      const after = { ...op.record, recordChangeTag: `${before?.recordChangeTag ?? "new"}-next`, fields, zoneID, raw: {} };
+      store.set(after.recordName, after);
+      // Native create responses omit their top-level zone and expand reference zones.
+      return { ...after, zoneID: undefined };
+    }).reverse() });
+  }), { dsid: "123", clientId: "synthetic", clientBuildNumber: "synthetic", clientMasteringNumber: "synthetic",
+    cloudKitURL: "https://p01-ckdatabasews.icloud.com/database/1/com.apple.reminders/production/private", remindersZoneOwner: owner });
+  const planCurrent = async (changes: Parameters<typeof planReminderUpdate>[1]["changes"]) => {
+    const current = [...store.values()].filter(record => (record.fields.Deleted as { value: number }).value === 0);
+    const root = current.find(record => record.recordType === "Reminder")!;
+    return planReminderUpdate(await loadSchedulingGraph(root, owner, lookup(current)), { ...request(root), changes }, owner, now + calls * 1000);
+  };
+  const create = await planCurrent({ dueDate: "2027-07-11T09:00:00+01:00", locationAlarm: { proximity: "arriving", radiusMeters: 250, place } });
+  assert.ok(create.supported); assert.equal(create.operationCount, 6); assert.equal(create.after.locationAlarm?.radiusMeters, 250);
+  const newAlarm = create.dependencies.find(record => record.operationType === "create" && record.recordType === "Alarm")!;
+  const newTrigger = create.dependencies.find(record => record.operationType === "create" && record.recordType === "AlarmTrigger")!;
+  assert.deepEqual(create.write.fields.AlarmIDs.value, [alarmId.slice(6), newAlarm.recordName.slice(6)]);
+  assert.equal(newAlarm.fields.DueDateResolutionTokenAsNonce.value, 0);
+  const locationUid = newTrigger.fields.LocationUID.value;
+  assert.notEqual(locationUid, newAlarm.recordName.slice(6));
+  const unflaggedCreate = structuredClone(create.dependencies);
+  const unflaggedTrigger = unflaggedCreate.find(record => record.recordName === newTrigger.recordName)!;
+  delete unflaggedTrigger.fields.ReferenceFrameString.isEncrypted;
+  await assert.rejects(client.modifyScheduling(create.write, unflaggedCreate, undefined, create.guards), hasCode("VALIDATION_ERROR"));
+  assert.equal(calls, 0);
+  const confirmedCreate = await client.modifyScheduling(create.write, create.dependencies, undefined, create.guards);
+  for (const dep of create.dependencies) verifySchedulingWrite(dep, initial.find(record => record.recordName === dep.recordName), confirmedCreate.find(record => record.recordName === dep.recordName)!, owner);
+  const createdConfirmation = confirmedCreate.find(record => record.recordName === newTrigger.recordName)!;
+  assert.ok("fields" in createdConfirmation);
+  const unexpectedFlags = structuredClone(createdConfirmation);
+  delete (unexpectedFlags.fields.Title as { isEncrypted?: true }).isEncrypted;
+  assert.throws(() => verifySchedulingWrite(newTrigger, undefined, unexpectedFlags, owner), hasCode("WRITE_OUTCOME_UNKNOWN"));
+  assert.deepEqual(store.get(ruleId)!.fields, initial[3].fields);
+  const changedPlace = { ...place, title: "Synthetic edited station", longitude: -0.2 };
+  const edit = await planCurrent({ locationAlarm: { proximity: "leaving", radiusMeters: 500, place: changedPlace } });
+  assert.ok(edit.supported); assert.deepEqual(edit.after.locationAlarm, { proximity: "leaving", radiusMeters: 500, place: changedPlace });
+  assert.equal(edit.dependencies.length, 1); assert.equal(edit.dependencies[0].recordName, newTrigger.recordName);
+  const unflaggedEdit = structuredClone(edit.dependencies);
+  delete unflaggedEdit[0].fields.Latitude.isEncrypted;
+  await assert.rejects(client.modifyScheduling(edit.write, unflaggedEdit, undefined, edit.guards), hasCode("VALIDATION_ERROR"));
+  assert.equal(calls, 1);
+  const beforeEdit = structuredClone(store.get(newTrigger.recordName)!);
+  const dateBeforeEdit = [structuredClone(store.get(alarmId)!), structuredClone(store.get(triggerId)!)];
+  const confirmedEdit = await client.modifyScheduling(edit.write, edit.dependencies, undefined, edit.guards);
+  verifySchedulingWrite(edit.dependencies[0], beforeEdit, confirmedEdit.find(record => record.recordName === newTrigger.recordName)!, owner);
+  assert.equal((store.get(newTrigger.recordName)!.fields.LocationUID as { value: unknown }).value, locationUid);
+  for (const record of dateBeforeEdit) assert.deepEqual(store.get(record.recordName)!.fields, record.fields);
+  const remove = await planCurrent({ locationAlarm: null });
+  assert.ok(remove.supported); assert.equal(remove.after.locationAlarm, null); assert.equal(remove.operationCount, 6);
+  assert.deepEqual(remove.write.fields.AlarmIDs.value, [alarmId.slice(6)]);
+  assert.deepEqual(remove.dependencies.map(record => record.recordName), [newAlarm.recordName, newTrigger.recordName]);
+  assert.ok(remove.dependencies.every(record => !record.operationType && record.fields.Deleted.value === 1));
+  const beforeRemove = [...store.values()].map(record => structuredClone(record));
+  const dateTag = store.get(triggerId)!.recordChangeTag!;
+  await assert.rejects(client.modifyScheduling(remove.write, remove.dependencies, async () => { store.get(triggerId)!.recordChangeTag = "raced-date"; }, remove.guards), hasCode("CONFLICT"));
+  for (const record of beforeRemove) assert.deepEqual(store.get(record.recordName)!.fields, record.fields);
+  store.get(triggerId)!.recordChangeTag = dateTag;
+  const confirmedRemove = await client.modifyScheduling(remove.write, remove.dependencies, undefined, remove.guards);
+  for (const dep of remove.dependencies) verifySchedulingWrite(dep, beforeRemove.find(record => record.recordName === dep.recordName), confirmedRemove.find(record => record.recordName === dep.recordName)!, owner);
+  assert.equal(store.get(newAlarm.recordName)!.fields.Reminder, undefined);
+  assert.deepEqual(store.get(newTrigger.recordName)!.fields.Alarm, beforeRemove.find(record => record.recordName === newTrigger.recordName)!.fields.Alarm);
+  for (const record of dateBeforeEdit) assert.deepEqual(store.get(record.recordName)!.fields, record.fields);
+  assert.equal(calls, 4);
+  await assert.rejects(client.modifyScheduling(remove.write, [remove.dependencies[0]], undefined, remove.guards), hasCode("VALIDATION_ERROR"));
+  await assert.rejects(client.modifyScheduling({ ...remove.write, fields: { ...remove.write.fields, AlarmIDs: { type: "STRING_LIST", value: [alarmId.slice(6), newAlarm.recordName.slice(6)] } } }, remove.dependencies, undefined, remove.guards), hasCode("VALIDATION_ERROR"));
+  assert.equal(calls, 4);
+  for (const locationAlarm of [{ radiusMeters: 0 }, { place: { ...place, latitude: 91 } }, { place: { ...place, extra: true } }, { radiusMeters: Infinity }, {}]) assert.equal(UpdateReminderInput.safeParse({ ...request(initial[0]), changes: { locationAlarm } }).success, false);
+  const initialGraph = await loadSchedulingGraph(initial[0], owner, lookup(initial));
+  assert.throws(() => planReminderUpdate(initialGraph, { ...request(initial[0]), changes: { locationAlarm: { radiusMeters: 250 } } }, owner, now), hasCode("VALIDATION_ERROR"));
 });
 
 test("new scheduling reference verification rejects missing or contradictory actions", () => {
@@ -441,4 +538,72 @@ test("unexpected deletion confirmation metadata remains uncertain without an aut
     cloudKitURL: "https://p01-ckdatabasews.icloud.com/database/1/com.apple.reminders/production/private", remindersZoneOwner: owner });
   await assert.rejects(client.modifyScheduling(plan.write, plan.dependencies, undefined, plan.guards), hasCode("WRITE_OUTCOME_UNKNOWN"));
   assert.equal(calls, 1);
+});
+
+
+test("custom recurrence edits through calendar conversion preserve end instants and remove incompatible patterns", async () => {
+  const values = records();
+  values[3].fields.Interval = { type: "INT64", value: 3 };
+  values[3].fields.DaysOfTheWeek = { type: "BYTES", value: b64(utf8(JSON.stringify([{ dayOfTheWeek: 2, weekNumber: 0 }, { dayOfTheWeek: 4, weekNumber: 0 }]))) };
+  values[3].fields.EndDate = { type: "TIMESTAMP", value: Date.parse("2027-09-01T09:00:00+01:00") };
+  const graph = await loadSchedulingGraph(values[0], owner, lookup(values));
+  const plan = planReminderUpdate(graph, { ...request(values[0]), changes: { allDay: true, dueDate: "2027-07-11T00:00:00Z", recurrence: { frequency: "monthly", interval: 2, monthDays: [17, 31] } } }, owner, now + 1000);
+  assert.ok(plan.supported); assert.equal(plan.operationCount, 4);
+  assert.deepEqual(plan.before.recurrence, { frequency: "weekly", interval: 3, weekdays: [1, 3], endDate: "2027-09-01T08:00:00.000Z" });
+  assert.deepEqual(plan.after.recurrence, { frequency: "monthly", interval: 2, monthDays: [17, 31], endDate: "2027-09-01T08:00:00.000Z" });
+  const ruleWrite = plan.dependencies.find(record => record.recordType === "RecurrenceRule")!;
+  assert.deepEqual(ruleWrite.fields.DaysOfTheWeek, { type: "BYTES", value: null });
+  assert.equal(ruleWrite.fields.EndDate, undefined);
+  assert.deepEqual(JSON.parse(Buffer.from(String(ruleWrite.fields.DaysOfTheMonth.value), "base64").toString()), [17, 31]);
+  let modifyCalls = 0;
+  const client = new CloudKitRemindersClient(new AppleHTTP(new CookieJar(), async (_, init) => {
+    modifyCalls++;
+    const body = JSON.parse(String(init?.body)); assert.equal(body.atomic, true); assert.equal(body.operations.length, 4);
+    const recurrence = body.operations.find((op: { record: CloudKitRecord }) => op.record.recordType === "RecurrenceRule").record;
+    assert.deepEqual(recurrence.fields.DaysOfTheWeek, { type: "BYTES", value: null });
+    return Response.json({ records: body.operations.map((op: { operationType: string; record: CloudKitRecord }) => {
+      if (op.operationType === "delete") return { recordName: op.record.recordName, deleted: true };
+      const original = values.find(record => record.recordName === op.record.recordName)!;
+      const fields = { ...original.fields, ...op.record.fields };
+      for (const [key, wrapper] of Object.entries(fields)) if (wrapper && typeof wrapper === "object" && "value" in wrapper && wrapper.value === null) delete fields[key];
+      return { ...original, fields, recordChangeTag: "custom-confirmed" };
+    }) });
+  }), { dsid: "123", clientId: "synthetic", clientBuildNumber: "synthetic", clientMasteringNumber: "synthetic",
+    cloudKitURL: "https://p01-ckdatabasews.icloud.com/database/1/com.apple.reminders/production/private", remindersZoneOwner: owner });
+  const confirmed = await client.modifyScheduling(plan.write, plan.dependencies, undefined, plan.guards);
+  for (const dependency of plan.dependencies) verifySchedulingWrite(dependency, values.find(record => record.recordName === dependency.recordName), confirmed.find(record => record.recordName === dependency.recordName)!, owner);
+  assert.equal(modifyCalls, 1);
+  const root = { ...values[0], recordChangeTag: "all-day-custom", fields: { ...values[0].fields, ...plan.write.fields } };
+  delete root.fields.TimeZone;
+  const rule = { ...values[3], recordChangeTag: "monthly-custom", fields: { ...values[3].fields, ...ruleWrite.fields } };
+  delete rule.fields.DaysOfTheWeek;
+  verifySchedulingWrite(ruleWrite, values[3], rule);
+  const allDayGraph = await loadSchedulingGraph(root, owner, lookup([root, rule]));
+  const ordinal = planReminderUpdate(allDayGraph, { listId, reminderId: root.recordName, recordChangeTag: root.recordChangeTag,
+    changes: { recurrence: { frequency: "monthly", interval: 2, ordinalWeekday: { weekday: 2, ordinal: -1 }, endDate: null } } }, owner, now + 2000);
+  assert.ok(ordinal.supported); assert.deepEqual(ordinal.after.recurrence, { frequency: "monthly", interval: 2, ordinalWeekday: { weekday: 2, ordinal: -1 }, endDate: null });
+  assert.deepEqual(ordinal.dependencies[0].fields.DaysOfTheMonth, { type: "BYTES", value: null });
+  assert.deepEqual(JSON.parse(Buffer.from(String(ordinal.dependencies[0].fields.DaysOfTheWeek.value), "base64").toString()), [{ dayOfTheWeek: 3, weekNumber: -1 }]);
+  const year = planReminderUpdate(allDayGraph, { listId, reminderId: root.recordName, recordChangeTag: root.recordChangeTag,
+    changes: { recurrence: { frequency: "yearly", interval: 2, months: [1, 7] } } }, owner, now + 2000);
+  assert.ok(year.supported); assert.deepEqual(year.after.recurrence, { frequency: "yearly", interval: 2, months: [1, 7], endDate: "2027-09-01T08:00:00.000Z" });
+  assert.deepEqual(year.dependencies[0].fields.DaysOfTheMonth, { type: "BYTES", value: null });
+});
+
+test("custom recurrence input and current-rule inspection reject incompatible, duplicated and unknown calendar patterns", async () => {
+  for (const input of [
+    { frequency: "weekly", interval: 3, weekdays: [1, 1] },
+    { frequency: "monthly", interval: 2, weekdays: [2] },
+    { frequency: "monthly", interval: 2, monthDays: [17, 31], ordinalWeekday: { weekday: 2, ordinal: -1 } },
+    { frequency: "monthly", interval: 2, monthDays: [0, 32] },
+    { frequency: "yearly", interval: 2, months: [1, 1] },
+    { frequency: "daily", interval: 1000 },
+    { frequency: "weekly", interval: 3, endDate: "2027-09-01" },
+  ]) assert.equal(RecurrenceChanges.safeParse(input).success, false);
+  const values = records();
+  values[3].fields.DaysOfTheWeek = { type: "BYTES", value: b64(utf8(JSON.stringify([{ dayOfTheWeek: 3, weekNumber: -1, calendar: "unobserved" }]))) };
+  assert.throws(() => readRecurrence(values[3]), hasCode("UNSUPPORTED_FEATURE"));
+  const graph = await loadSchedulingGraph(values[0], owner, lookup(values));
+  assert.equal(planReminderUpdate(graph, request(values[0]), owner, now + 1000).supported, false);
+  assert.equal(planReminderUpdate(graph, { ...request(values[0]), changes: { dueDate: null } }, owner, now + 1000).supported, false);
 });

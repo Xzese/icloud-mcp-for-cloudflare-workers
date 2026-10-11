@@ -1,6 +1,8 @@
 import { AppError, WriteOutcomeUnknownError, requireValue as requireInput } from "../errors.ts";
 import type { CloudKitWriteRecord } from "../reminders/writes.ts";
 import { decodeDateComponents, type LinkedDateWrite } from "../reminders/linked-date.ts";
+import { LOCATION_ENCRYPTED_FIELDS, validLocationMutation } from "../reminders/location-alarm.ts";
+import { validRecurrenceMutation } from "../reminders/recurrence.ts";
 import { earlyReminderPayload } from "../reminders/early-reminder.ts";
 import { schedulingOperation, type SchedulingWrite } from "../reminders/scheduling-plan.ts";
 import { canonicalJSON } from "../lib/canonical.ts";
@@ -614,12 +616,24 @@ export class CloudKitRemindersClient {
     for (const key of ["AlarmIDs", "RecurrenceRuleIDs"]) if (root.fields[key]) {
       const field = root.fields[key];
       requireInput(Array.isArray(field.value) && (field.type === "UNKNOWN_LIST" && field.value.length === 0 ||
-        field.type === "STRING_LIST" && field.value.length <= 1 && field.value.every(id => typeof id === "string" && /^[0-9a-f-]{36}$/i.test(id))), "Scheduling links require a bounded observed relationship shape.");
+        field.type === "STRING_LIST" && field.value.length <= (key === "AlarmIDs" ? 2 : 1) && new Set(field.value).size === field.value.length && field.value.every(id => typeof id === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id))), "Scheduling links require a bounded observed relationship shape.");
     }
     const creates = dependencies.filter(record => record.operationType === "create");
     if (creates.length) {
-      const alarm = creates.find(record => record.recordType === "Alarm"), trigger = creates.find(record => record.recordType === "AlarmTrigger");
-      requireInput(creates.length === 2 && alarm && trigger && canonicalJSON(root.fields.AlarmIDs?.value) === canonicalJSON([alarm.recordName.slice(6)]), "A new date graph requires exactly one linked alarm/trigger pair.");
+      const alarms = creates.filter(record => record.recordType === "Alarm"), triggers = creates.filter(record => record.recordType === "AlarmTrigger");
+      const rootIds = root.fields.AlarmIDs?.value;
+      requireInput(alarms.length >= 1 && alarms.length <= 2 && triggers.length === alarms.length && creates.length === alarms.length * 2 &&
+        Array.isArray(rootIds) && alarms.every(alarm => rootIds.includes(alarm.recordName.slice(6))) &&
+        rootIds.every(id => [...dependencies, ...versionGuards].some(record => record.recordType === "Alarm" && record.recordName.slice(6) === id)), "New alarm pairs require complete root links and version protection for existing alarms.");
+      requireInput(new Set(triggers.map(trigger => trigger.fields.Type?.value)).size === triggers.length, "At most one date and one location pair may be created.");
+    }
+    const locationRetired = dependencies.filter(record => record.locationRetirement);
+    if (locationRetired.length) {
+      const pair = locationRetired[0].locationRetirement!;
+      requireInput(locationRetired.length === 2 && locationRetired.every(record => canonicalJSON(record.locationRetirement) === canonicalJSON(pair)) &&
+        locationRetired.some(record => record.recordType === "Alarm" && record.recordName === pair.alarmId) &&
+        locationRetired.some(record => record.recordType === "AlarmTrigger" && record.recordName === pair.triggerId) &&
+        Array.isArray(root.fields.AlarmIDs?.value) && !root.fields.AlarmIDs.value.includes(pair.alarmId.slice(6)), "Location retirement requires the complete exact-tag pair and root unlink.");
     }
     const retired = dependencies.filter(record => record.fields.Deleted?.value === 1);
     const retiredDate = dependencies.filter(record => record.operationType === "delete");
@@ -629,33 +643,49 @@ export class CloudKitRemindersClient {
       requestedRecordName(record.recordName, [record.recordType]);
       requireInput(["Alarm", "AlarmTrigger", "RecurrenceRule"].includes(record.recordType) && record.recordName.length <= 255, "Unsupported scheduling identity.");
       const create = record.operationType === "create";
+      requireInput(!record.locationRetirement || !create && record.operationType !== "delete" && record.fields.Deleted?.value === 1, "Location retirement metadata only applies to paired soft updates.");
       requireInput(create ? record.recordChangeTag === undefined : typeof record.recordChangeTag === "string" && record.recordChangeTag.length > 0 && record.recordChangeTag.length <= 512, "Scheduling updates require exact version tags; creates must not carry one.");
       const keys = Object.keys(record.fields);
+      for (const [key, field] of Object.entries(record.fields)) {
+        const encrypted = record.recordType === "AlarmTrigger" && LOCATION_ENCRYPTED_FIELDS.includes(key as typeof LOCATION_ENCRYPTED_FIELDS[number]);
+        requireInput((encrypted ? field.isEncrypted === true : field.isEncrypted === undefined) &&
+          Object.keys(field).every(name => name === "type" || name === "value" || encrypted && name === "isEncrypted"), "Unsupported scheduling field encryption envelope.");
+      }
       if (record.operationType === "delete") {
         requireInput(["Alarm", "AlarmTrigger"].includes(record.recordType) && keys.length === 0, "Only exact-tag alarm/trigger retirement can delete records; deletion cannot carry fields.");
       } else if (!create && record.fields.Deleted) {
-        requireInput(record.recordType === "RecurrenceRule" && record.fields.Deleted.type === "INT64" && record.fields.Deleted.value === 1 && keys.every(key => key === "Deleted" || record.recordType === "RecurrenceRule" && key === "Reminder") &&
+        requireInput(record.fields.Deleted.type === "INT64" && record.fields.Deleted.value === 1 &&
+          (record.recordType === "RecurrenceRule" && !record.locationRetirement && keys.every(key => key === "Deleted" || key === "Reminder") ||
+            record.locationRetirement && (record.recordType === "Alarm" && keys.length === 2 && keys.includes("Reminder") || record.recordType === "AlarmTrigger" && keys.length === 1)) &&
           (!record.fields.Reminder || record.fields.Reminder.type === "REFERENCE" && record.fields.Reminder.value === null), "Unsupported scheduling retirement.");
       } else if (!create && record.recordType === "RecurrenceRule") {
-        requireInput(keys.length >= 1 && keys.length <= 2 && keys.every(key => key === "Frequency" && record.fields[key].type === "INT64" && [0, 1, 2, 3].includes(Number(record.fields[key].value)) || key === "Interval" && record.fields[key].type === "INT64" && [1, 2].includes(Number(record.fields[key].value))), "Unsupported recurrence mutation.");
+        requireInput(validRecurrenceMutation(record.fields), "Unsupported recurrence mutation.");
       } else if (!create && record.recordType === "Alarm") {
         requireInput(keys.length === 1 && record.fields.DueDateResolutionTokenAsNonce?.type === "DOUBLE" && typeof record.fields.DueDateResolutionTokenAsNonce.value === "number" && Number.isFinite(record.fields.DueDateResolutionTokenAsNonce.value) && Math.abs(record.fields.DueDateResolutionTokenAsNonce.value) <= Number.MAX_SAFE_INTEGER, "Unsupported alarm mutation.");
       } else if (!create && record.recordType === "AlarmTrigger") {
-        requireInput(keys.length === 1 && (record.fields.DateComponentsData?.type === "BYTES" || record.fields.Proximity?.type === "INT64" && [1, 2].includes(Number(record.fields.Proximity.value))), "Unsupported trigger mutation.");
+        requireInput(keys.length === 1 && record.fields.DateComponentsData?.type === "BYTES" || validLocationMutation(record.fields), "Unsupported trigger mutation.");
         if (record.fields.DateComponentsData) decodeDateComponents(record.fields.DateComponentsData.value);
       } else {
-        const expected = record.recordType === "Alarm" ? ["AlarmUID", "TriggerID", "DueDateResolutionTokenAsNonce", "Reminder", "Imported", "Deleted"] : ["DateComponentsData", "Type", "Alarm", "Imported", "Deleted"];
+        const location = record.recordType === "AlarmTrigger" && record.fields.Type?.value === "Location";
+        const expected = record.recordType === "Alarm" ? ["AlarmUID", "TriggerID", "DueDateResolutionTokenAsNonce", "Reminder", "Imported", "Deleted"] : location ? ["ReferenceFrameString", "Radius", "Type", "Proximity", "Address", "Alarm", "Imported", "Title", "Latitude", "Deleted", "Longitude", "LocationUID"] : ["DateComponentsData", "Type", "Alarm", "Imported", "Deleted"];
         requireInput(record.recordType !== "RecurrenceRule" && keys.length === expected.length && keys.every(key => expected.includes(key)) &&
           record.fields.Imported?.type === "INT64" && record.fields.Imported.value === 0 && record.fields.Deleted?.type === "INT64" && record.fields.Deleted.value === 0, "Unsupported scheduling creation template.");
         if (record.recordType === "Alarm") {
-          const trigger = dependencies.find(item => item.recordType === "AlarmTrigger" && item.operationType === "create");
+          const trigger = creates.find(item => item.recordType === "AlarmTrigger" && item.recordName.slice(13) === record.fields.TriggerID?.value);
           requireInput(record.fields.AlarmUID.type === "STRING" && record.fields.AlarmUID.value === record.recordName.slice(6) && record.fields.TriggerID.type === "STRING" && record.fields.TriggerID.value === trigger?.recordName.slice(13) &&
             record.fields.Reminder.type === "REFERENCE" && canonicalJSON(record.fields.Reminder.value) === canonicalJSON({ recordName: root.recordName, action: "VALIDATE" }) &&
-            record.fields.DueDateResolutionTokenAsNonce.type === "DOUBLE" && typeof record.fields.DueDateResolutionTokenAsNonce.value === "number" && Number.isFinite(record.fields.DueDateResolutionTokenAsNonce.value), "Unsupported absolute alarm creation.");
+            record.fields.DueDateResolutionTokenAsNonce.type === "DOUBLE" && typeof record.fields.DueDateResolutionTokenAsNonce.value === "number" && Number.isFinite(record.fields.DueDateResolutionTokenAsNonce.value) && (trigger?.fields.Type?.value !== "Location" || record.fields.DueDateResolutionTokenAsNonce.value === 0), "Unsupported alarm creation.");
         } else {
-          const alarm = dependencies.find(item => item.recordType === "Alarm" && item.operationType === "create");
-          requireInput(record.fields.Type.type === "STRING" && record.fields.Type.value === "Date" && record.fields.Alarm.type === "REFERENCE" && canonicalJSON(record.fields.Alarm.value) === canonicalJSON({ recordName: alarm?.recordName, action: "VALIDATE" }) && record.fields.DateComponentsData.type === "BYTES", "Unsupported date trigger creation.");
-          decodeDateComponents(record.fields.DateComponentsData.value);
+          const alarm = creates.find(item => item.recordType === "Alarm" && item.fields.TriggerID?.value === record.recordName.slice(13));
+          requireInput(alarm && record.fields.Type.type === "STRING" && record.fields.Alarm.type === "REFERENCE" && canonicalJSON(record.fields.Alarm.value) === canonicalJSON({ recordName: alarm.recordName, action: "VALIDATE" }), "Unsupported trigger creation references.");
+          if (location) {
+            requireInput(record.fields.ReferenceFrameString.type === "STRING" && record.fields.ReferenceFrameString.value === "1" &&
+              record.fields.LocationUID.type === "STRING" && typeof record.fields.LocationUID.value === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(record.fields.LocationUID.value) &&
+              validLocationMutation(Object.fromEntries(Object.entries(record.fields).filter(([key]) => ["Radius", "Proximity", "Address", "Title", "Latitude", "Longitude"].includes(key)))), "Unsupported location trigger creation.");
+          } else {
+            requireInput(record.fields.Type.value === "Date" && record.fields.DateComponentsData.type === "BYTES", "Unsupported date trigger creation.");
+            decodeDateComponents(record.fields.DateComponentsData.value);
+          }
         }
       }
     }

@@ -1,5 +1,6 @@
 import { AppError, WriteOutcomeUnknownError } from "../errors.ts";
-import { inspectLocationAlarms } from "./location-alarm.ts";
+import { readRecurrence, recurrenceEdit } from "./recurrence.ts";
+import { inspectLocationAlarms, locationFields, LocationAlarmSummary } from "./location-alarm.ts";
 import { earlyReminderPayload, editEarlyReminder } from "./early-reminder.ts";
 import { b64, utf8 } from "../crypto/bytes.ts";
 import { normalizeReminder, referenceField, type CloudKitRecord, type CloudKitRecordItem } from "../icloud/cloudkit.ts";
@@ -13,7 +14,8 @@ export interface SchedulingWrite {
   recordType: "Alarm" | "AlarmTrigger" | "RecurrenceRule";
   recordChangeTag?: string;
   operationType?: "create" | "update" | "delete";
-  fields: Record<string, { type: string; value: unknown }>;
+  locationRetirement?: { alarmId: string; triggerId: string };
+  fields: Record<string, { type: string; value: unknown; isEncrypted?: true }>;
 }
 function value(record: CloudKitRecord, key: string, type: string) {
   const field = record.fields[key];
@@ -30,13 +32,14 @@ export function schedulingPlan(graph: SchedulingGraph, write: CloudKitWriteRecor
     throw new AppError("UNSUPPORTED_FEATURE", "This schedule requires an unsupported nested, relative, multiple-alarm or start-date recipe.");
   }
   const { locations, dateGraph, locationRecords } = inspectLocationAlarms(graph, owner);
-  if (locations.length && (changes.dueDate === null || changes.allDay !== undefined)) throw new AppError("UNSUPPORTED_FEATURE", "Clearing or converting a date with a location alarm requires a different native recipe.");
+  if ((locations.length || changes.locationAlarm !== undefined && changes.locationAlarm !== null) && (changes.dueDate === null || changes.allDay !== undefined)) throw new AppError("UNSUPPORTED_FEATURE", "Clearing or converting a date with a location alarm requires a different native recipe.");
   const dateReminder = normalizeReminder(dateGraph.reminder, owner);
   const early = Object.hasOwn(graph.reminder.fields, "DueDateDeltaAlertsData") ? earlyReminderPayload(graph.reminder) : null;
   if (early && (changes.dueDate === null || changes.allDay !== undefined)) throw new AppError("UNSUPPORTED_FEATURE", "Clearing or converting a date with an early reminder requires a different native recipe.");
   const rule = graph.records.find(record => record.recordType === "RecurrenceRule");
   if (rule) {
     live(rule);
+    readRecurrence(rule);
     if (referenceField(rule, "Reminder", "Reminder", owner) !== reminder.id) throw new AppError("PROTOCOL_CHANGED", "The recurrence belongs to a different reminder.");
   }
   let dependencies: SchedulingWrite[] = [], guards: CloudKitRecord[] = [];
@@ -99,24 +102,47 @@ export function schedulingPlan(graph: SchedulingGraph, write: CloudKitWriteRecor
   } else guards = graph.records.filter(record => record.recordType !== "Reminder");
   if (locations.length && ["DueDate", "TimeZone"].some(key => Object.hasOwn(write.fields, key)) && !dateReminder.alarmIds?.length) throw new AppError("UNSUPPORTED_FEATURE", "Adding a date alarm to a location-only graph requires a different native recipe.");
   for (const record of locationRecords) if (!guards.some(guard => guard.recordName === record.recordName)) guards.push(record);
-  if (changes.locationAlarm) {
-    const location = locations[0];
-    if (!location) throw new AppError("UNSUPPORTED_FEATURE", "Location creation requires native place selection; only an existing reviewed location alarm can be edited.");
-    if (location.proximity === changes.locationAlarm.proximity) throw new AppError("VALIDATION_ERROR", "The location proximity is unchanged.", 400);
-    guards = guards.filter(record => record.recordName !== location.trigger.recordName);
-    dependencies.push({ recordName: location.trigger.recordName, recordType: "AlarmTrigger", recordChangeTag: location.trigger.recordChangeTag!, fields: { Proximity: { type: "INT64", value: changes.locationAlarm.proximity === "arriving" ? 1 : 2 } } });
+  if (changes.locationAlarm !== undefined) {
+    const location = locations[0], change = changes.locationAlarm;
+    if (change === null) {
+      if (!location) throw new AppError("VALIDATION_ERROR", "There is no location alarm to remove.", 400);
+      const alarmIds = (reminder.alarmIds ?? []).filter(id => id !== location.alarm.recordName);
+      write.fields.AlarmIDs = { type: alarmIds.length ? "STRING_LIST" : "UNKNOWN_LIST", value: alarmIds.map(id => id.slice(6)) };
+      guards = guards.filter(record => !locationRecords.some(locationRecord => locationRecord.recordName === record.recordName));
+      const locationRetirement = { alarmId: location.alarm.recordName, triggerId: location.trigger.recordName };
+      dependencies.push({ recordName: location.alarm.recordName, recordType: "Alarm", recordChangeTag: location.alarm.recordChangeTag!, locationRetirement,
+        fields: { Deleted: { type: "INT64", value: 1 }, Reminder: { type: "REFERENCE", value: null } } },
+        { recordName: location.trigger.recordName, recordType: "AlarmTrigger", recordChangeTag: location.trigger.recordChangeTag!, locationRetirement, fields: { Deleted: { type: "INT64", value: 1 } } });
+    } else if (location) {
+      const fields = locationFields(change);
+      for (const key of Object.keys(fields)) if (canonicalJSON(fields[key]) === canonicalJSON(location.trigger.fields[key])) delete fields[key];
+      if (!Object.keys(fields).length) throw new AppError("VALIDATION_ERROR", "The location alarm is unchanged.", 400);
+      // Keep a place edit complete at the transport boundary, even when one component is unchanged.
+      if (change.place) Object.assign(fields, locationFields({ place: change.place }));
+      guards = guards.filter(record => record.recordName !== location.trigger.recordName);
+      dependencies.push({ recordName: location.trigger.recordName, recordType: "AlarmTrigger", recordChangeTag: location.trigger.recordChangeTag!, fields });
+    } else {
+      const full = LocationAlarmSummary.safeParse(change);
+      if (!full.success) throw new AppError("VALIDATION_ERROR", "Location creation requires complete place, proximity and radiusMeters.", 400);
+      const alarmUID = crypto.randomUUID().toUpperCase(), triggerUID = crypto.randomUUID().toUpperCase();
+      const alarmId = `Alarm/${alarmUID}`, triggerId = `AlarmTrigger/${triggerUID}`;
+      const existingIds = (write.fields.AlarmIDs?.value ?? (reminder.alarmIds ?? []).map(id => id.slice(6))) as string[];
+      write.fields.AlarmIDs = { type: "STRING_LIST", value: [...existingIds, alarmUID] };
+      dependencies.push({ operationType: "create", recordName: alarmId, recordType: "Alarm", fields: {
+        AlarmUID: { type: "STRING", value: alarmUID }, TriggerID: { type: "STRING", value: triggerUID }, DueDateResolutionTokenAsNonce: { type: "DOUBLE", value: 0 },
+        Reminder: { type: "REFERENCE", value: { recordName: reminder.id, action: "VALIDATE" } }, Imported: { type: "INT64", value: 0 }, Deleted: { type: "INT64", value: 0 },
+      } }, { operationType: "create", recordName: triggerId, recordType: "AlarmTrigger", fields: {
+        ...locationFields(full.data), Type: { type: "STRING", value: "Location" }, ReferenceFrameString: { type: "STRING", value: "1", isEncrypted: true }, LocationUID: { type: "STRING", value: crypto.randomUUID().toUpperCase() },
+        Alarm: { type: "REFERENCE", value: { recordName: alarmId, action: "VALIDATE" } }, Imported: { type: "INT64", value: 0 }, Deleted: { type: "INT64", value: 0 },
+      } });
+    }
   }
   if (changes.recurrence) {
-    if (!rule || reminder.dueDate === null || ![0, 1, 2, 3].includes(Number(value(rule, "Frequency", "INT64"))) || ![1, 2].includes(Number(value(rule, "Interval", "INT64"))) ||
-      value(rule, "OccurrenceCount", "INT64") !== 0 || value(rule, "FirstDayOfTheWeek", "INT64") !== 0 ||
-      Object.keys(rule.fields).some(key => !["Reminder", "Frequency", "Interval", "OccurrenceCount", "FirstDayOfTheWeek", "Imported", "Deleted"].includes(key))) {
-      throw new AppError("UNSUPPORTED_FEATURE", "Only an existing simple daily, weekly, monthly or yearly rule supports this recurrence edit.");
-    }
-    const frequency = ["daily", "weekly", "monthly", "yearly"].indexOf(changes.recurrence.frequency);
-    if (frequency !== 1 && changes.recurrence.interval !== 1) throw new AppError("UNSUPPORTED_FEATURE", "Only weekly recurrence has an observed multi-period interval.");
-    if (value(rule, "Interval", "INT64") === changes.recurrence.interval && value(rule, "Frequency", "INT64") === frequency) throw new AppError("VALIDATION_ERROR", "The recurrence interval is unchanged.", 400);
+    if (!rule || reminder.dueDate === null) throw new AppError("UNSUPPORTED_FEATURE", "Recurrence creation requires a separate native recipe; target an existing dated rule.");
+    const { fields } = recurrenceEdit(rule, changes.recurrence);
+    if (!Object.keys(fields).length) throw new AppError("VALIDATION_ERROR", "The recurrence is unchanged.", 400);
     guards = guards.filter(record => record.recordName !== rule.recordName);
-    dependencies.push({ recordName: rule.recordName, recordType: "RecurrenceRule", recordChangeTag: rule.recordChangeTag!, fields: { ...(value(rule, "Frequency", "INT64") !== frequency ? { Frequency: { type: "INT64", value: frequency } } : {}), ...(value(rule, "Interval", "INT64") !== changes.recurrence.interval ? { Interval: { type: "INT64", value: changes.recurrence.interval } } : {}) } });
+    dependencies.push({ recordName: rule.recordName, recordType: "RecurrenceRule", recordChangeTag: rule.recordChangeTag!, fields });
   }
   if (changes.earlyReminder !== undefined) {
     if (reminder.dueDate === null || reminder.allDay !== false) throw new AppError("UNSUPPORTED_FEATURE", "Early reminder edits require an existing timed date.");
@@ -129,7 +155,9 @@ export function schedulingPlan(graph: SchedulingGraph, write: CloudKitWriteRecor
   }
   return { dependencies, guards };
 }
-export function schedulingOperation({ operationType, ...record }: SchedulingWrite) {
+export function schedulingOperation(write: SchedulingWrite) {
+  const { operationType, ...record } = write;
+  delete record.locationRetirement;
   return { operationType: operationType ?? "update" as const, record: operationType === "delete" ? { recordName: record.recordName, recordType: record.recordType, recordChangeTag: record.recordChangeTag } : record };
 }
 export function verifySchedulingWrite(write: SchedulingWrite, before: CloudKitRecord | undefined, confirmed: CloudKitRecordItem, expectedOwner = confirmed.zoneID?.ownerRecordName ?? "__defaultOwner__") {

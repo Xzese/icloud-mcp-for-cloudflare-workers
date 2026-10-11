@@ -119,8 +119,10 @@ the same group as the Reminder, guarding optional unchanged recurrence. Every co
 dependency preserves the complete field set except its planned date field. The ordinary
 atomic mutation interface remains Reminder-only; there is no arbitrary linked-record editor.
 Native recurring-date move/restore acceptance passed without replacing linked IDs.
-`src/reminders/scheduling-plan.ts` adds explicit clearing/conversion, simple recurrence,
-existing early/location edits and same-list parent guards. Date-alarm retirement deletes the
+`src/reminders/scheduling-plan.ts` adds explicit clearing/conversion, known custom recurrence,
+existing early edits, location creation/editing/soft retirement and same-list parent guards.
+`src/reminders/recurrence.ts` validates the captured Gregorian frequency and pattern encodings.
+Date-alarm retirement deletes the
 exact-version trigger before its alarm in the root update batch; only those two types can be
 retired this way. Existing resolution tokens retain their replica ID and advance their counter.
 These recipes do not establish unreferenced-child protection, arbitrary calendar semantics

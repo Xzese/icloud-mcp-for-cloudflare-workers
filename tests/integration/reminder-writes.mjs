@@ -818,7 +818,8 @@ export async function verifyReminderWrites(options) {
         DueDateResolutionTokenAsNonce: field("DOUBLE", dueDateNonce(root.fields.ResolutionTokenMap.value)) });
       const trigger = linkedRecord(triggerId, "AlarmTrigger", { Alarm: reference(alarmId), Type: field("STRING", "Date"),
         DateComponentsData: field("BYTES", Buffer.from(JSON.stringify(dateComponents("2030-03-04T09:15:00Z", "Europe/London"))).toString("base64")) });
-      const rule = linkedRecord(ruleId, "RecurrenceRule", { Reminder: reference(rootId), Frequency: field("INT64", 1), Interval: field("INT64", 1) });
+      const rule = linkedRecord(ruleId, "RecurrenceRule", { Reminder: reference(rootId), Frequency: field("INT64", 1), Interval: field("INT64", 1),
+        OccurrenceCount: field("INT64", 0), FirstDayOfTheWeek: field("INT64", 0), Imported: field("INT64", 0) });
       for (const record of [root, alarm, trigger, rule]) state.records.set(record.recordName, record);
       const history = reminderRecord("Reminder/LINKED-HISTORY"); history.fields.Completed = field("INT64", 1);
       state.records.set(history.recordName, history);

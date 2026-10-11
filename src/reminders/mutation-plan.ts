@@ -5,6 +5,8 @@ import { buildReminderFieldUpdate, type UpdateReminderInputData } from "./writes
 import { schedulingOperation, schedulingPlan, type SchedulingWrite } from "./scheduling-plan.ts";
 import type { CloudKitRecord } from "../icloud/cloudkit.ts";
 import type { SchedulingGraph } from "./linked-records.ts";
+import { readRecurrence } from "./recurrence.ts";
+import { locationSummary } from "./location-alarm.ts";
 import { scheduleSummary } from "./schedule-policy.ts";
 
 export function planReminderUpdate(graph: SchedulingGraph, input: UpdateReminderInputData, owner: string, now: number) {
@@ -28,12 +30,17 @@ export function planReminderUpdate(graph: SchedulingGraph, input: UpdateReminder
     };
     throw error;
   }
+  const rule = graph.records.find(record => record.recordType === "RecurrenceRule");
+  const ruleWrite = dependencies.find(record => record.recordType === "RecurrenceRule");
+  const existingLocation = graph.records.find(record => record.recordType === "AlarmTrigger" && (record.fields.Type as { value?: unknown })?.value === "Location");
+  const locationWrite = dependencies.find(record => record.recordType === "AlarmTrigger" && (record.fields.Type?.value === "Location" || record.recordName === existingLocation?.recordName));
+  const afterLocation = input.changes.locationAlarm === null ? null : locationWrite ? locationSummary({ ...existingLocation, ...locationWrite, raw: {}, fields: { ...existingLocation?.fields, ...locationWrite.fields } }) : beforeSummary.locationAlarm;
   const after = {
     dueDate: write.fields.DueDate ? write.fields.DueDate.value === null ? null : new Date(Number(write.fields.DueDate.value)).toISOString() : before.dueDate,
     timeZone: write.fields.TimeZone ? write.fields.TimeZone.value as string | null : before.timeZone,
     allDay: write.fields.AllDay ? write.fields.AllDay.value === 1 : before.allDay,
-    recurrence: input.changes.dueDate === null && dependencies.some(record => record.recordType === "RecurrenceRule") ? null : input.changes.recurrence ?? beforeSummary.recurrence,
-    locationAlarm: input.changes.locationAlarm ?? beforeSummary.locationAlarm,
+    recurrence: input.changes.dueDate === null && dependencies.some(record => record.recordType === "RecurrenceRule") ? null : rule && ruleWrite ? readRecurrence({ ...rule, fields: { ...rule.fields, ...ruleWrite.fields } }) : beforeSummary.recurrence,
+    locationAlarm: afterLocation,
     earlyReminder: input.changes.earlyReminder !== undefined ? input.changes.earlyReminder : beforeSummary.earlyReminder,
   };
   const zoneID = { zoneName: "Reminders", zoneType: "REGULAR_CUSTOM_ZONE", ...(owner !== "__defaultOwner__" ? { ownerRecordName: owner } : {}) };
