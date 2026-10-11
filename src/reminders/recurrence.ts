@@ -6,6 +6,8 @@ import type { CloudKitRecord } from "../icloud/cloudkit.ts";
 
 // This is an API inspection limit, not a claim about Apple's UI maximum.
 export const MAX_RECURRENCE_INTERVAL = 999;
+const FREQUENCY_CODES = { daily: 0, weekly: 1, monthly: 2, yearly: 3, hourly: 4 } as const;
+const FREQUENCY_NAMES = { 0: "daily", 1: "weekly", 2: "monthly", 3: "yearly", 4: "hourly" } as const;
 const weekday = z.number().int().min(1).max(7).describe("ISO weekday: Monday=1 through Sunday=7.");
 const ordinal = z.union([z.literal(-1), z.literal(1), z.literal(2), z.literal(3), z.literal(4), z.literal(5)]);
 const unique = (values: number[]) => new Set(values).size === values.length;
@@ -17,7 +19,7 @@ const endDate = z.string().max(64).datetime({ offset: true }).refine(value => {
   const date = new Date(value); return Number.isSafeInteger(date.getTime()) && date.getUTCFullYear() >= 1 && date.getUTCFullYear() <= 9999;
 }, "End date must be a valid explicit-offset instant in years 1-9999.");
 const recurrenceFields = {
-  frequency: z.enum(["daily", "weekly", "monthly", "yearly"]), interval: z.number().int().min(1).max(MAX_RECURRENCE_INTERVAL),
+  frequency: z.enum(["daily", "weekly", "monthly", "yearly", "hourly"]), interval: z.number().int().min(1).max(MAX_RECURRENCE_INTERVAL),
   weekdays: weekdays.nullable().optional(), monthDays: monthDays.nullable().optional(), ordinalWeekday: ordinalWeekday.nullable().optional(),
   months: months.nullable().optional(),
   endDate: endDate.nullable().optional().describe("Explicit-offset recurrence end instant; null removes it, omission preserves it. No implicit date-only end or anchor shift."),
@@ -58,8 +60,8 @@ export function readRecurrence(record: CloudKitRecord): RecurrenceState {
     field(record, "OccurrenceCount", "INT64") !== 0 || field(record, "FirstDayOfTheWeek", "INT64") !== 0 ||
     field(record, "Imported", "INT64") !== 0 || field(record, "Deleted", "INT64") !== 0) throw new AppError("UNSUPPORTED_FEATURE", "The recurrence uses unsupported count, calendar, import, state or pattern fields.");
   const frequency = field(record, "Frequency", "INT64"), interval = field(record, "Interval", "INT64");
-  if (typeof frequency !== "number" || ![0, 1, 2, 3].includes(frequency) || typeof interval !== "number" || !Number.isSafeInteger(interval) || interval < 1 || interval > MAX_RECURRENCE_INTERVAL) throw new AppError("UNSUPPORTED_FEATURE", "The recurrence frequency or interval is unsupported.");
-  const result: RecurrenceState = { frequency: ["daily", "weekly", "monthly", "yearly"][frequency] as RecurrenceState["frequency"], interval, endDate: null };
+  if (typeof frequency !== "number" || ![0, 1, 2, 3, 4].includes(frequency) || typeof interval !== "number" || !Number.isSafeInteger(interval) || interval < 1 || interval > MAX_RECURRENCE_INTERVAL) throw new AppError("UNSUPPORTED_FEATURE", "The recurrence frequency or interval is unsupported.");
+  const result: RecurrenceState = { frequency: FREQUENCY_NAMES[frequency as keyof typeof FREQUENCY_NAMES], interval, endDate: null };
   for (const key of RECURRENCE_PATTERN_FIELDS) if (Object.hasOwn(record.fields, key)) field(record, key, "BYTES");
   if (present(record, "MonthsOfTheYear")) {
     if (frequency !== 3 || present(record, "DaysOfTheWeek") || present(record, "DaysOfTheMonth")) throw new AppError("UNSUPPORTED_FEATURE", "Year-month patterns require yearly frequency without another day pattern.");
@@ -90,7 +92,7 @@ export function readRecurrence(record: CloudKitRecord): RecurrenceState {
 export function recurrenceEdit(record: CloudKitRecord, input: RecurrenceInput) {
   const before = readRecurrence(record), parsed = RecurrenceChanges.parse(input);
   const fields: Record<string, { type: string; value: unknown }> = {};
-  const frequency = ["daily", "weekly", "monthly", "yearly"].indexOf(parsed.frequency);
+  const frequency = FREQUENCY_CODES[parsed.frequency];
   if (parsed.frequency !== before.frequency) fields.Frequency = { type: "INT64", value: frequency };
   if (parsed.interval !== before.interval) fields.Interval = { type: "INT64", value: parsed.interval };
   const setPattern = (key: "DaysOfTheWeek" | "DaysOfTheMonth" | "MonthsOfTheYear", value: unknown) => {
@@ -123,7 +125,7 @@ export function validRecurrenceMutation(fields: Record<string, { type: string; v
   if (!keys.length || keys.length > 6) return false;
   return keys.every(key => {
     const wrapper = fields[key];
-    if (key === "Frequency") return wrapper.type === "INT64" && typeof wrapper.value === "number" && [0, 1, 2, 3].includes(wrapper.value);
+    if (key === "Frequency") return wrapper.type === "INT64" && typeof wrapper.value === "number" && [0, 1, 2, 3, 4].includes(wrapper.value);
     if (key === "Interval") return wrapper.type === "INT64" && typeof wrapper.value === "number" && Number.isSafeInteger(wrapper.value) && wrapper.value >= 1 && wrapper.value <= MAX_RECURRENCE_INTERVAL;
     if (key === "EndDate") return wrapper.type === "TIMESTAMP" && (wrapper.value === null || typeof wrapper.value === "number" && Number.isSafeInteger(wrapper.value) && Number.isFinite(new Date(wrapper.value).getTime()));
     if (key === "DaysOfTheWeek" || key === "DaysOfTheMonth" || key === "MonthsOfTheYear") {
@@ -133,4 +135,18 @@ export function validRecurrenceMutation(fields: Record<string, { type: string; v
     }
     return false;
   });
+}
+
+export function recurrenceCreation(reminderId: string, input: RecurrenceInput) {
+  const fields: Record<string, { type: string; value: unknown }> = {
+    Reminder: { type: "REFERENCE", value: { recordName: reminderId, action: "VALIDATE" } },
+    Frequency: { type: "INT64", value: 0 }, Interval: { type: "INT64", value: 1 }, OccurrenceCount: { type: "INT64", value: 0 },
+    FirstDayOfTheWeek: { type: "INT64", value: 0 }, Imported: { type: "INT64", value: 0 }, Deleted: { type: "INT64", value: 0 },
+  };
+  const base: CloudKitRecord = { recordName: "RecurrenceRule/new", recordType: "RecurrenceRule", fields, raw: {} };
+  return { ...fields, ...recurrenceEdit(base, input).fields };
+}
+export function validRecurrenceCreation(fields: Record<string, { type: string; value: unknown }>) {
+  try { readRecurrence({ recordName: "RecurrenceRule/new", recordType: "RecurrenceRule", fields, raw: {} }); return true; }
+  catch { return false; }
 }

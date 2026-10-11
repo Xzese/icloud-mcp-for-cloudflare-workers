@@ -41,7 +41,7 @@ An incomplete/errorful or over-budget child inspection blocks the action. This c
 proof of commit-time protection against a newly added, unreferenced child. Bulk deletion uses the
 same per-item checks and additionally rescans after commit to report any remaining subtasks. Use Apple's app for completing, reopening or deleting parents and their subtasks.
 Moving lists, list management, attachments and tags are outside this interface. The bounded
-scheduling recipes below can create or retire a date-alarm pair, edit existing known recurrence
+scheduling recipes below can create or retire a date-alarm pair, create, edit or remove known recurrence
 and early-reminder offsets, and create, edit or remove one location pair. Arbitrary alarm/rule edits are refused.
 Unchanged linked fields remain untouched. Editing title or notes replaces that text document
 with plain text, including its formatting; an omitted document remains intact.
@@ -69,7 +69,7 @@ the instant and changes the displayed local time; to retain the local clock, sup
 new instant as `dueDate` too. The format cannot distinguish repeated fall-back local times, so
 those are explicitly refused. Dates must remain in Gregorian years 1-9999.
 Start dates, multiple alarms of the same type, unknown trigger/calendar fields, recurrence
-creation/anchors and deeper nesting remain unsupported. The additional recipes below
+anchors and deeper nesting remain unsupported. The additional recipes below
 require explicit inputs and do not infer calendar-date or wall-clock intent.
 
 Controlled native API acceptance moved a weekly reminder from 10 January 2027 at 09:00
@@ -89,30 +89,41 @@ receive marker-only version guards, and uncertain outcomes are never replayed au
 
 - `changes.dueDate: null` clears a known date schedule and its known recurrence. The root
   unlinks both; the recurrence is retired with `Deleted=1` and no Reminder backreference.
-  The exact date trigger is deleted before its alarm, in the same atomic batch.
+  The exact date trigger is deleted before its alarm, in the same atomic batch. The early
+  reminder is removed and an existing location pair remains linked and protected.
 - Timed to all-day conversion requires `allDay: true` and the requested calendar date as an
   explicit midnight-UTC `dueDate`; omit `timeZone`. It removes the stored zone and date alarm.
   Reverse conversion requires `allDay: false`, an explicit instant and an IANA `timeZone`,
   and creates a validated date-alarm pair while preserving an existing known recurrence.
-- `changes.recurrence` edits an existing rule using `frequency` (`daily`, `weekly`,
+  Both directions preserve a known early reminder and location pair. Hourly recurrence is
+  removed when converting to all-day, matching the native app. Adding a timed date to a
+  location-only reminder also requires an explicit instant and IANA zone.
+- `changes.recurrence` creates or edits a rule using `frequency` (`hourly`, `daily`, `weekly`,
   `monthly`, `yearly`) and integer `interval` from 1 through 999. Weekly `weekdays` use ISO
   numbers 1 (Monday) through 7 (Sunday). Monthly patterns use `monthDays` (1 through 31)
   or `ordinalWeekday: { weekday, ordinal }`, where ordinal is 1 through 5 or -1 for last.
   Yearly `months` use 1 through 12. Incompatible patterns are refused; changing frequency
   removes the old incompatible pattern. Omitted compatible patterns remain unchanged;
   `null` removes a supplied pattern. `endDate` is an ISO instant with an explicit offset;
-  omission preserves it and `null` removes it. Creation, occurrence counts, imported rules,
-  unknown fields and recurrence anchor changes remain refused.
-- `changes.earlyReminder` edits one existing offset using positive `count` and `unit`
-  (`minutes` or `hours`); `null` removes it. Its account metadata is preserved. Creation is
-  refused when that metadata is absent, as are date clearing/conversion with an early reminder.
+  omission preserves it and `null` removes it. `changes.recurrence: null` removes the rule
+  through native soft retirement without clearing the date, early reminder or location.
+  Hourly recurrence requires a timed date. Occurrence counts, imported rules, unknown fields
+  and recurrence anchor changes remain refused.
+- `changes.earlyReminder` creates or edits one offset using positive `count` and `unit`
+  (`minutes`, `hours`, `days`, `weeks` or `months`); `null` removes it. Existing account metadata
+  is preserved. For creation, a bounded scan of the same selected list finds another open,
+  native early reminder. Its graph is validated and a fresh exact version establishes the account
+  identifier; the source root and its full fields are guarded atomically and bound into the preview fingerprint.
+  Only that identifier is copied; the target reminder identifier and alert identifier are fresh.
+  If no suitable witness is present, add an early reminder to a disposable item in that list
+  through Apple Reminders and prepare again. No account identifier is guessed from a DSID or owner.
 - `changes.locationAlarm` creates or edits one location alarm. Creation requires `proximity`
   (`arriving` or `leaving`), `radiusMeters`, and `place: { title, address, latitude, longitude }`.
   The place must already be resolved to coordinates; this API does not search or geocode text.
   Existing alarms accept partial edits and preserve their identities. `null` removes the pair
   using native soft retirement and keeps the absolute date alarm. A date move can preserve
-  that complete location pair alongside the absolute date pair. Clearing/conversion with an
-  existing location alarm remains refused.
+  that complete location pair alongside the absolute date pair. Date clearing and conversion
+  preserve the existing location pair; change the location separately during those transitions.
 - Parent dates do not cascade to children. A child's date update guards the exact same-list,
   open root parent; unavailable, foreign, completed or nested parents are refused.
 

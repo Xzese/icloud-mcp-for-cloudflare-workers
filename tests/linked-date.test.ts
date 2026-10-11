@@ -8,7 +8,7 @@ import { AppleHTTP } from "../src/transport/apple-http.ts";
 import { CookieJar } from "../src/transport/cookie-jar.ts";
 import { canonicalJSON } from "../src/lib/canonical.ts";
 import { buildCreateReminder, CreateReminderInput, UpdateReminderInput } from "../src/reminders/writes.ts";
-import { loadSchedulingGraph } from "../src/reminders/linked-records.ts";
+import { loadSchedulingGraph, attachEarlyReminderWitness } from "../src/reminders/linked-records.ts";
 import { planReminderUpdate } from "../src/reminders/mutation-plan.ts";
 import { dateComponents, decodeDateComponents, dueDateNonce } from "../src/reminders/linked-date.ts";
 
@@ -269,7 +269,7 @@ test("weekly interval edits preserve every unrelated participant and refuse unkn
 
 test("frequency edits and existing early offsets preserve private metadata and version-guard the full date graph", async () => {
   const values = records();
-  const privatePayload = { reminderIdentifier: values[0].recordName.slice(9), accountIdentifier: "synthetic-private-account", minimumSupportedVersion: 20230430,
+  const privatePayload = { reminderIdentifier: values[0].recordName.slice(9), accountIdentifier: "00000000-0000-4000-8000-000000000010", minimumSupportedVersion: 20230430,
     dueDateDeltaAlerts: [{ identifier: "00000000-0000-4000-8000-000000000009", creationDate: 800_000_000, dueDateDeltaUnit: 0, dueDateDeltaCount: -30, minimumSupportedAppVersion: 0 }] };
   values[0].fields.DueDateDeltaAlertsData = { type: "ENCRYPTED_BYTES", value: b64(utf8(JSON.stringify(privatePayload))) };
   const graph = await loadSchedulingGraph(values[0], owner, lookup(values));
@@ -281,13 +281,31 @@ test("frequency edits and existing early offsets preserve private metadata and v
   assert.equal(payload.dueDateDeltaAlerts[0].identifier, privatePayload.dueDateDeltaAlerts[0].identifier);
   assert.equal(payload.dueDateDeltaAlerts[0].creationDate, privatePayload.dueDateDeltaAlerts[0].creationDate);
   assert.equal(payload.dueDateDeltaAlerts[0].dueDateDeltaUnit, 1); assert.equal(payload.dueDateDeltaAlerts[0].dueDateDeltaCount, -1);
-  assert.equal(planReminderUpdate(graph, { ...request(values[0]), changes: { dueDate: null } }, owner, now).supported, false);
+  assert.equal(planReminderUpdate(graph, { ...request(values[0]), changes: { dueDate: null } }, owner, now).supported, true);
   const removed = planReminderUpdate(graph, { ...request(values[0]), changes: { earlyReminder: null } }, owner, now + 2000);
   assert.ok(removed.supported); assert.equal(removed.after.earlyReminder, null);
   assert.deepEqual(removed.write.fields.DueDateDeltaAlertsData, { type: "ENCRYPTED_BYTES", value: null });
   assert.equal(removed.operationCount, 4); assert.equal(removed.dependencies.length, 0);
   delete values[0].fields.DueDateDeltaAlertsData;
   assert.equal(planReminderUpdate(await loadSchedulingGraph(values[0], owner, lookup(values)), { ...request(values[0]), changes: { earlyReminder: { unit: "minutes", count: 15 } } }, owner, now).supported, false);
+  const plainGraph = await loadSchedulingGraph(values[0], owner, lookup(values));
+  const sourceId = "Reminder/00000000-0000-4000-8000-000000000011";
+  const source: CloudKitRecord = { ...structuredClone(values[0]), recordName: sourceId, recordChangeTag: "source-before", fields: { ...values[0].fields,
+    DueDateDeltaAlertsData: { type: "ENCRYPTED_BYTES", value: b64(utf8(JSON.stringify({ ...privatePayload, reminderIdentifier: sourceId.slice(9) }))) } } };
+  delete source.fields.AlarmIDs; delete source.fields.RecurrenceRuleIDs;
+  const witnessedGraph = await attachEarlyReminderWitness(plainGraph, source);
+  assert.notEqual(witnessedGraph.fingerprint, plainGraph.fingerprint);
+  const creation = planReminderUpdate(witnessedGraph, { ...request(values[0]), changes: { earlyReminder: { unit: "days", count: 2 } } }, owner, now);
+  assert.ok(creation.supported); assert.equal(creation.after.earlyReminder?.unit, "days");
+  const createdPayload = JSON.parse(Buffer.from(String(creation.write.fields.DueDateDeltaAlertsData.value), "base64").toString());
+  assert.equal(createdPayload.accountIdentifier, privatePayload.accountIdentifier);
+  assert.equal(createdPayload.reminderIdentifier, values[0].recordName.slice(9));
+  assert.notEqual(createdPayload.dueDateDeltaAlerts[0].identifier, privatePayload.dueDateDeltaAlerts[0].identifier);
+  assert.equal(createdPayload.dueDateDeltaAlerts[0].creationDate, now / 1000 - 978_307_200);
+  assert.equal(createdPayload.dueDateDeltaAlerts[0].dueDateDeltaUnit, 2); assert.equal(createdPayload.dueDateDeltaAlerts[0].dueDateDeltaCount, -2);
+  assert.ok(creation.guards.some(record => record.recordName === sourceId && record.recordChangeTag === "source-before"));
+  const foreignSource = structuredClone(source); foreignSource.fields.List = { type: "REFERENCE", value: { recordName: "List/OTHER", action: "VALIDATE", zoneID } };
+  assert.throws(() => planReminderUpdate({ ...witnessedGraph, earlyReminderWitness: foreignSource }, { ...request(values[0]), changes: { earlyReminder: { unit: "days", count: 2 } } }, owner, now), hasCode("CONFLICT"));
 });
 
 test("child date scheduling protects the exact same-list open parent and rejects cross-list or unavailable parents", async () => {
@@ -378,8 +396,8 @@ test("date moves and location proximity edits protect the complete mixed graph w
   assert.deepEqual(edit.before.locationAlarm?.place, edit.after.locationAlarm?.place);
   verifySchedulingWrite(dependency, values[5], { ...values[5], recordChangeTag: "location-trigger-after", fields: { ...values[5].fields, ...dependency.fields } });
   assert.deepEqual(values, before);
-  assert.equal(planReminderUpdate(graph, { ...request(values[0]), changes: { dueDate: null } }, owner, now).supported, false);
-  assert.equal(planReminderUpdate(graph, { ...request(values[0]), changes: { allDay: true, dueDate: "2027-07-11T00:00:00Z" } }, owner, now).supported, false);
+  assert.equal(planReminderUpdate(graph, { ...request(values[0]), changes: { dueDate: null } }, owner, now).supported, true);
+  assert.equal(planReminderUpdate(graph, { ...request(values[0]), changes: { allDay: true, dueDate: "2027-07-11T00:00:00Z" } }, owner, now).supported, true);
   values[5].fields.UnobservedLocationData = { type: "BYTES", value: "AA==" };
   assert.equal(planReminderUpdate(await loadSchedulingGraph(values[0], owner, lookup(values)), request(values[0]), owner, now).supported, false);
 });
@@ -473,6 +491,107 @@ test("location create, radius/place edit and soft removal preserve a mixed date 
   for (const locationAlarm of [{ radiusMeters: 0 }, { place: { ...place, latitude: 91 } }, { place: { ...place, extra: true } }, { radiusMeters: Infinity }, {}]) assert.equal(UpdateReminderInput.safeParse({ ...request(initial[0]), changes: { locationAlarm } }).success, false);
   const initialGraph = await loadSchedulingGraph(initial[0], owner, lookup(initial));
   assert.throws(() => planReminderUpdate(initialGraph, { ...request(initial[0]), changes: { locationAlarm: { radiusMeters: 250 } } }, owner, now), hasCode("VALIDATION_ERROR"));
+});
+
+test("recurrence lifecycle and mixed calendar conversions preserve location and early metadata until date clearing", async () => {
+  const values = withLocation().filter(record => record.recordType !== "RecurrenceRule");
+  // Both native UUID and canonical record-name trigger links survive the whole journey.
+  values[3].fields.TriggerID = { type: "STRING", value: values[4].recordName };
+  delete values[0].fields.RecurrenceRuleIDs;
+  const earlyPayload = { reminderIdentifier: values[0].recordName.slice(9), accountIdentifier: "00000000-0000-4000-8000-000000000010", minimumSupportedVersion: 20230430,
+    dueDateDeltaAlerts: [{ identifier: "00000000-0000-4000-8000-000000000009", creationDate: 800_000_000, dueDateDeltaUnit: 1, dueDateDeltaCount: -1, minimumSupportedAppVersion: 0 }] };
+  const earlyField = { type: "ENCRYPTED_BYTES", value: b64(utf8(JSON.stringify(earlyPayload))) };
+  values[0].fields.DueDateDeltaAlertsData = earlyField;
+  const store = new Map(values.map(record => [record.recordName, structuredClone(record)]));
+  const locationBefore = values.filter(record => record.recordName !== alarmId && record.recordName !== triggerId && record.recordType !== "Reminder");
+  let calls = 0;
+  const client = new CloudKitRemindersClient(new AppleHTTP(new CookieJar(), async (_, init) => {
+    calls++; const body = JSON.parse(String(init?.body)); assert.equal(body.atomic, true);
+    const stale = body.operations.find((op: { operationType: string; record: CloudKitRecord }) => op.operationType !== "create" && store.get(op.record.recordName)?.recordChangeTag !== op.record.recordChangeTag);
+    if (stale) return Response.json({ records: body.operations.map((op: { record: CloudKitRecord }) => ({ recordName: op.record.recordName, serverErrorCode: op === stale ? "CONFLICT" : "ATOMIC_ERROR" })) });
+    return Response.json({ records: body.operations.map((op: { operationType: string; record: CloudKitRecord }) => {
+      if (op.operationType === "delete") { store.delete(op.record.recordName); return { recordName: op.record.recordName, deleted: true }; }
+      const before = store.get(op.record.recordName), fields = { ...before?.fields, ...op.record.fields };
+      for (const [key, unknownField] of Object.entries(fields)) {
+        const field = unknownField as { type: string; value: unknown };
+        if (field.value === null) delete fields[key];
+        else if (op.operationType === "create" && field.type === "REFERENCE") fields[key] = { ...field, value: { ...(field.value as object), zoneID } };
+      }
+      const after = { ...op.record, fields, recordChangeTag: `${before?.recordChangeTag ?? "new"}-next`, zoneID, raw: {} };
+      store.set(after.recordName, after); return { ...after, zoneID: undefined };
+    }).reverse() });
+  }), { dsid: "123", clientId: "synthetic", clientBuildNumber: "synthetic", clientMasteringNumber: "synthetic",
+    cloudKitURL: "https://p01-ckdatabasews.icloud.com/database/1/com.apple.reminders/production/private", remindersZoneOwner: owner });
+  const planCurrent = async (changes: Parameters<typeof planReminderUpdate>[1]["changes"]) => {
+    const root = store.get(values[0].recordName)!;
+    return planReminderUpdate(await loadSchedulingGraph(root, owner, lookup([...store.values()])), { ...request(root), changes }, owner, now + calls * 1000);
+  };
+  const apply = async (plan: Awaited<ReturnType<typeof planCurrent>>) => {
+    assert.ok(plan.supported); const before = structuredClone([...store.values()]);
+    const confirmed = await client.modifyScheduling(plan.write, plan.dependencies, undefined, plan.guards);
+    for (const dependency of plan.dependencies) verifySchedulingWrite(dependency, before.find(record => record.recordName === dependency.recordName), confirmed.find(record => record.recordName === dependency.recordName)!, owner);
+    for (const record of locationBefore) assert.deepEqual(store.get(record.recordName)!.fields, record.fields);
+  };
+  const create = await planCurrent({ recurrence: { frequency: "weekly", interval: 3, weekdays: [1, 3], endDate: "2027-09-01T08:00:00Z" } });
+  assert.ok(create.supported); assert.equal(create.dependencies.length, 1);
+  const createdRule = create.dependencies[0]; assert.equal(createdRule.operationType, "create");
+  assert.deepEqual(create.after.recurrence, { frequency: "weekly", interval: 3, weekdays: [1, 3], endDate: "2027-09-01T08:00:00.000Z" });
+  const badCreate = structuredClone(create.dependencies); badCreate[0].fields.Calendar = { type: "STRING", value: "unknown" };
+  await assert.rejects(client.modifyScheduling(create.write, badCreate, undefined, create.guards), hasCode("VALIDATION_ERROR")); assert.equal(calls, 0);
+  await apply(create);
+  const remove = await planCurrent({ recurrence: null }); assert.ok(remove.supported);
+  assert.equal(remove.after.recurrence, null); assert.equal(remove.write.fields.DueDate, undefined);
+  await apply(remove);
+  assert.deepEqual(store.get(createdRule.recordName)!.fields.Deleted, { type: "INT64", value: 1 });
+  assert.equal(store.get(createdRule.recordName)!.fields.Reminder, undefined);
+  assert.deepEqual(store.get(values[0].recordName)!.fields.DueDateDeltaAlertsData, earlyField);
+  const recreate = await planCurrent({ recurrence: { frequency: "hourly", interval: 2 } }); assert.ok(recreate.supported);
+  assert.notEqual(recreate.dependencies[0].recordName, createdRule.recordName);
+  assert.equal(Object.keys(recreate.dependencies[0].fields).length, 7); assert.equal(recreate.dependencies[0].fields.Frequency.value, 4); await apply(recreate);
+  await assert.rejects(planCurrent({ allDay: true, dueDate: "2027-07-11T00:00:00Z", recurrence: { frequency: "hourly", interval: 3 } }), hasCode("VALIDATION_ERROR"));
+  const allDay = await planCurrent({ allDay: true, dueDate: "2027-07-11T00:00:00Z" }); assert.ok(allDay.supported);
+  assert.deepEqual(allDay.dependencies.filter(record => record.operationType === "delete").map(record => [record.recordType, record.operationType]), [["AlarmTrigger", "delete"], ["Alarm", "delete"]]);
+  assert.equal(allDay.write.fields.DueDateDeltaAlertsData, undefined); assert.equal(allDay.after.earlyReminder?.unit, "hours");
+  assert.equal(allDay.after.recurrence, null); assert.deepEqual(allDay.write.fields.RecurrenceRuleIDs.value, []);
+  assert.equal(allDay.dependencies.find(record => record.recordType === "RecurrenceRule")!.fields.Deleted.value, 1);
+  assert.deepEqual(allDay.write.fields.AlarmIDs.value, [locationBefore[0].recordName.slice(6)]);
+  await apply(allDay); assert.equal(store.has(alarmId), false); assert.equal(store.has(triggerId), false);
+  assert.deepEqual(store.get(values[0].recordName)!.fields.DueDateDeltaAlertsData, earlyField);
+  const allDayClear = await planCurrent({ dueDate: null }); assert.ok(allDayClear.supported);
+  assert.equal(allDayClear.write.fields.AllDay, undefined); assert.equal(allDayClear.write.fields.TimeZone, undefined);
+  assert.deepEqual(allDayClear.write.fields.DueDateDeltaAlertsData, { type: "ENCRYPTED_BYTES", value: null });
+  const timed = await planCurrent({ allDay: false, dueDate: "2027-07-12T09:00:00+01:00", timeZone: "Europe/London", recurrence: { frequency: "daily", interval: 2 } }); assert.ok(timed.supported);
+  assert.equal(timed.dependencies.filter(record => record.operationType === "create").length, 3);
+  assert.equal(timed.write.fields.DueDateDeltaAlertsData, undefined); await apply(timed);
+  assert.deepEqual(store.get(values[0].recordName)!.fields.DueDateDeltaAlertsData, earlyField);
+  const clear = await planCurrent({ dueDate: null, recurrence: null, earlyReminder: null }); assert.ok(clear.supported);
+  assert.equal(clear.after.recurrence, null); assert.equal(clear.after.earlyReminder, null);
+  assert.equal(clear.write.fields.TimeZone, undefined); assert.equal(clear.write.fields.AllDay, undefined);
+  assert.equal(clear.dependencies.filter(record => record.operationType === "delete").length, 2);
+  assert.deepEqual(clear.write.fields.AlarmIDs.value, [locationBefore[0].recordName.slice(6)]);
+  const beforeClear = structuredClone([...store.values()]), raced = store.get(locationBefore[1].recordName)!;
+  const exactTag = raced.recordChangeTag; raced.recordChangeTag = "concurrent-location";
+  await assert.rejects(client.modifyScheduling(clear.write, clear.dependencies, undefined, clear.guards), hasCode("CONFLICT"));
+  for (const record of beforeClear) assert.deepEqual(store.get(record.recordName)?.fields, record.fields);
+  raced.recordChangeTag = exactTag;
+  const missingLocationGuard = clear.guards.filter(record => record.recordName !== locationBefore[1].recordName);
+  await assert.rejects(client.modifyScheduling(clear.write, clear.dependencies, undefined, missingLocationGuard), hasCode("VALIDATION_ERROR"));
+  await apply(clear); assert.equal(calls, 7);
+  const clearedRoot = store.get(values[0].recordName)!;
+  assert.equal(clearedRoot.fields.DueDate, undefined); assert.equal(clearedRoot.fields.DueDateDeltaAlertsData, undefined);
+  assert.deepEqual(clearedRoot.fields.TimeZone, { type: "STRING", value: "Europe/London" }); assert.deepEqual(clearedRoot.fields.AllDay, { type: "INT64", value: 0 });
+  const invalidGraph = await loadSchedulingGraph(clearedRoot, owner, lookup([...store.values()]));
+  assert.equal(planReminderUpdate(invalidGraph, { ...request(clearedRoot), changes: { recurrence: { frequency: "daily", interval: 1 } } }, owner, now).supported, false);
+  assert.throws(() => planReminderUpdate(invalidGraph, { ...request(clearedRoot), changes: { recurrence: null } }, owner, now), hasCode("VALIDATION_ERROR"));
+  for (const changes of [{ dueDate: null, recurrence: { frequency: "daily" as const, interval: 1 } }, { dueDate: null, earlyReminder: { unit: "hours" as const, count: 1 } }, { allDay: true, dueDate: "2027-08-01T00:00:00Z", locationAlarm: null }]) assert.throws(() => planReminderUpdate(invalidGraph, { ...request(clearedRoot), changes }, owner, now), hasCode("VALIDATION_ERROR"));
+  const addDate = await planCurrent({ dueDate: "2027-08-14T03:00:00+01:00", timeZone: "Europe/London", allDay: false });
+  assert.ok(addDate.supported); assert.equal(addDate.dependencies.filter(record => record.operationType === "create").length, 2);
+  assert.equal(addDate.after.dueDate, "2027-08-14T02:00:00.000Z");
+  assert.ok(addDate.guards.some(record => record.recordName === locationBefore[0].recordName));
+  await apply(addDate); assert.equal(calls, 8);
+  const addedDateTrigger = addDate.dependencies.find(record => record.recordType === "AlarmTrigger")!;
+  assert.equal(decodeDateComponents(addedDateTrigger.fields.DateComponentsData.value).hour, 3);
+  assert.throws(() => planReminderUpdate(invalidGraph, { ...request(clearedRoot), changes: { dueDate: "2027-08-14T03:00:00+01:00" } }, owner, now), hasCode("VALIDATION_ERROR"));
 });
 
 test("new scheduling reference verification rejects missing or contradictory actions", () => {

@@ -2,7 +2,7 @@ import { AppError, WriteOutcomeUnknownError, requireValue as requireInput } from
 import type { CloudKitWriteRecord } from "../reminders/writes.ts";
 import { decodeDateComponents, type LinkedDateWrite } from "../reminders/linked-date.ts";
 import { LOCATION_ENCRYPTED_FIELDS, validLocationMutation } from "../reminders/location-alarm.ts";
-import { validRecurrenceMutation } from "../reminders/recurrence.ts";
+import { validRecurrenceMutation, validRecurrenceCreation } from "../reminders/recurrence.ts";
 import { earlyReminderPayload } from "../reminders/early-reminder.ts";
 import { schedulingOperation, type SchedulingWrite } from "../reminders/scheduling-plan.ts";
 import { canonicalJSON } from "../lib/canonical.ts";
@@ -618,7 +618,10 @@ export class CloudKitRemindersClient {
       requireInput(Array.isArray(field.value) && (field.type === "UNKNOWN_LIST" && field.value.length === 0 ||
         field.type === "STRING_LIST" && field.value.length <= (key === "AlarmIDs" ? 2 : 1) && new Set(field.value).size === field.value.length && field.value.every(id => typeof id === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id))), "Scheduling links require a bounded observed relationship shape.");
     }
-    const creates = dependencies.filter(record => record.operationType === "create");
+    const allCreates = dependencies.filter(record => record.operationType === "create");
+    const ruleCreates = allCreates.filter(record => record.recordType === "RecurrenceRule");
+    if (ruleCreates.length) requireInput(ruleCreates.length === 1 && canonicalJSON(root.fields.RecurrenceRuleIDs?.value) === canonicalJSON([ruleCreates[0].recordName.slice(15)]) && !versionGuards.some(record => record.recordType === "RecurrenceRule"), "Creating recurrence requires one new rule and its exact root link.");
+    const creates = allCreates.filter(record => record.recordType !== "RecurrenceRule");
     if (creates.length) {
       const alarms = creates.filter(record => record.recordType === "Alarm"), triggers = creates.filter(record => record.recordType === "AlarmTrigger");
       const rootIds = root.fields.AlarmIDs?.value;
@@ -637,7 +640,18 @@ export class CloudKitRemindersClient {
     }
     const retired = dependencies.filter(record => record.fields.Deleted?.value === 1);
     const retiredDate = dependencies.filter(record => record.operationType === "delete");
-    if (retiredDate.length) requireInput(retiredDate.length === 2 && retiredDate[0].recordType === "AlarmTrigger" && retiredDate[1].recordType === "Alarm" && canonicalJSON(root.fields.AlarmIDs?.value) === "[]", "Retiring a date alarm requires the complete pair and root unlink in the same atomic group.");
+    if (retiredDate.length) {
+      const retained = root.fields.AlarmIDs?.value;
+      requireInput(retiredDate.length === 2 && retiredDate[0].recordType === "AlarmTrigger" && retiredDate[1].recordType === "Alarm" &&
+        Array.isArray(retained) && !retained.includes(retiredDate[1].recordName.slice(6)), "Retiring a date alarm requires the complete pair and root unlink in the same atomic group.");
+      for (const id of retained) {
+        const alarm = versionGuards.find(record => record.recordType === "Alarm" && record.recordName.slice(6) === id);
+        const triggerUid = (alarm?.fields.TriggerID as { value?: unknown })?.value;
+        const trigger = versionGuards.find(record => record.recordType === "AlarmTrigger" && (record.recordName.slice(13) === triggerUid || record.recordName === triggerUid));
+        requireInput(alarm && trigger && referenceField(alarm, "Reminder", "Reminder", this.expectedOwner) === root.recordName && referenceField(trigger, "Alarm", "Alarm", this.expectedOwner) === alarm.recordName &&
+          (alarm.fields.DueDateResolutionTokenAsNonce as { value?: unknown })?.value === 0 && (trigger.fields.Type as { value?: unknown })?.value === "Location", "Every retained alarm must be an unchanged version-guarded location pair.");
+      }
+    }
     if (retired.some(record => record.recordType === "RecurrenceRule")) requireInput(canonicalJSON(root.fields.RecurrenceRuleIDs?.value) === "[]", "Retiring recurrence requires its root unlink in the same atomic group.");
     for (const record of dependencies) {
       requestedRecordName(record.recordName, [record.recordType]);
@@ -665,10 +679,14 @@ export class CloudKitRemindersClient {
       } else if (!create && record.recordType === "AlarmTrigger") {
         requireInput(keys.length === 1 && record.fields.DateComponentsData?.type === "BYTES" || validLocationMutation(record.fields), "Unsupported trigger mutation.");
         if (record.fields.DateComponentsData) decodeDateComponents(record.fields.DateComponentsData.value);
+      } else if (record.recordType === "RecurrenceRule") {
+        requireInput(validRecurrenceCreation(record.fields) && record.fields.Reminder?.type === "REFERENCE" &&
+          canonicalJSON(record.fields.Reminder.value) === canonicalJSON({ recordName: root.recordName, action: "VALIDATE" }) &&
+          Object.values(record.fields).every(field => field.value !== null), "Unsupported recurrence creation template.");
       } else {
         const location = record.recordType === "AlarmTrigger" && record.fields.Type?.value === "Location";
         const expected = record.recordType === "Alarm" ? ["AlarmUID", "TriggerID", "DueDateResolutionTokenAsNonce", "Reminder", "Imported", "Deleted"] : location ? ["ReferenceFrameString", "Radius", "Type", "Proximity", "Address", "Alarm", "Imported", "Title", "Latitude", "Deleted", "Longitude", "LocationUID"] : ["DateComponentsData", "Type", "Alarm", "Imported", "Deleted"];
-        requireInput(record.recordType !== "RecurrenceRule" && keys.length === expected.length && keys.every(key => expected.includes(key)) &&
+        requireInput(keys.length === expected.length && keys.every(key => expected.includes(key)) &&
           record.fields.Imported?.type === "INT64" && record.fields.Imported.value === 0 && record.fields.Deleted?.type === "INT64" && record.fields.Deleted.value === 0, "Unsupported scheduling creation template.");
         if (record.recordType === "Alarm") {
           const trigger = creates.find(item => item.recordType === "AlarmTrigger" && item.recordName.slice(13) === record.fields.TriggerID?.value);

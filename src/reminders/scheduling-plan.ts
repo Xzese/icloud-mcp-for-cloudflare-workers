@@ -1,7 +1,7 @@
 import { AppError, WriteOutcomeUnknownError } from "../errors.ts";
-import { readRecurrence, recurrenceEdit } from "./recurrence.ts";
+import { readRecurrence, recurrenceEdit, recurrenceCreation } from "./recurrence.ts";
 import { inspectLocationAlarms, locationFields, LocationAlarmSummary } from "./location-alarm.ts";
-import { earlyReminderPayload, editEarlyReminder } from "./early-reminder.ts";
+import { earlyReminderPayload, editEarlyReminder, createEarlyReminder } from "./early-reminder.ts";
 import { b64, utf8 } from "../crypto/bytes.ts";
 import { normalizeReminder, referenceField, type CloudKitRecord, type CloudKitRecordItem } from "../icloud/cloudkit.ts";
 import { canonicalJSON } from "../lib/canonical.ts";
@@ -32,10 +32,11 @@ export function schedulingPlan(graph: SchedulingGraph, write: CloudKitWriteRecor
     throw new AppError("UNSUPPORTED_FEATURE", "This schedule requires an unsupported nested, relative, multiple-alarm or start-date recipe.");
   }
   const { locations, dateGraph, locationRecords } = inspectLocationAlarms(graph, owner);
-  if ((locations.length || changes.locationAlarm !== undefined && changes.locationAlarm !== null) && (changes.dueDate === null || changes.allDay !== undefined)) throw new AppError("UNSUPPORTED_FEATURE", "Clearing or converting a date with a location alarm requires a different native recipe.");
+  if (changes.locationAlarm !== undefined && (changes.dueDate === null || changes.allDay !== undefined)) throw new AppError("VALIDATION_ERROR", "Clear or convert the date while preserving the location alarm; edit or remove the location in a separate reviewed request.", 400);
   const dateReminder = normalizeReminder(dateGraph.reminder, owner);
-  const early = Object.hasOwn(graph.reminder.fields, "DueDateDeltaAlertsData") ? earlyReminderPayload(graph.reminder) : null;
-  if (early && (changes.dueDate === null || changes.allDay !== undefined)) throw new AppError("UNSUPPORTED_FEATURE", "Clearing or converting a date with an early reminder requires a different native recipe.");
+  const earlyField = graph.reminder.fields.DueDateDeltaAlertsData as { type?: string; value?: unknown } | undefined;
+  const early = Object.hasOwn(graph.reminder.fields, "DueDateDeltaAlertsData") && !(earlyField?.type === "ENCRYPTED_BYTES" && earlyField.value === null) ? earlyReminderPayload(graph.reminder) : null;
+  if (changes.dueDate === null && changes.earlyReminder) throw new AppError("VALIDATION_ERROR", "Clearing the date removes its early reminder; do not combine it with an offset edit.", 400);
   const rule = graph.records.find(record => record.recordType === "RecurrenceRule");
   if (rule) {
     live(rule);
@@ -49,10 +50,14 @@ export function schedulingPlan(graph: SchedulingGraph, write: CloudKitWriteRecor
     linkedDatePlan(dateGraph, currentWrite, owner);
   } else if (dateGraph.records.length !== (rule ? 2 : 1) + (graph.schedulingParent ? 1 : 0)) throw new AppError("UNSUPPORTED_FEATURE", "The graph contains unexpected scheduling participants.");
   const afterAllDay = changes.allDay ?? reminder.allDay;
+  const hourlyRule = rule && readRecurrence(rule).frequency === "hourly" ? rule : undefined;
+  if (afterAllDay === true && changes.recurrence?.frequency === "hourly") throw new AppError("VALIDATION_ERROR", "Hourly recurrence requires a timed date and cannot be created or edited on an all-day date.", 400);
+  if (hourlyRule && changes.allDay === true && changes.recurrence) throw new AppError("VALIDATION_ERROR", "All-day conversion removes hourly recurrence; change its frequency in a separate reviewed request.", 400);
+  if (hourlyRule && reminder.allDay === true && changes.allDay !== false && changes.dueDate !== null && changes.recurrence === undefined) throw new AppError("UNSUPPORTED_FEATURE", "The current hourly/all-day combination is outside the observed native recipe.");
   if (afterAllDay === true && changes.dueDate !== undefined && changes.dueDate !== null &&
     (Date.parse(changes.dueDate) % 86_400_000 !== 0 || !changes.dueDate.endsWith("Z"))) throw new AppError("VALIDATION_ERROR", "An all-day calendar date must be supplied explicitly at midnight UTC.", 400);
   if (afterAllDay === true && changes.timeZone !== undefined) throw new AppError("UNSUPPORTED_FEATURE", "All-day scheduling has no stored time zone; omit timeZone.");
-  if (rule && reminder.allDay === false && !dateReminder.alarmIds?.length && changes.allDay !== true &&
+  if (rule && reminder.allDay === false && !dateReminder.alarmIds?.length && changes.allDay !== true && changes.dueDate !== null &&
     ["DueDate", "TimeZone"].some(key => Object.hasOwn(write.fields, key))) throw new AppError("UNSUPPORTED_FEATURE", "This timed recurrence has no verified date-alarm graph.");
   const token = (...keys: string[]) => {
     const map = JSON.parse(String(write.fields.ResolutionTokenMap.value));
@@ -67,22 +72,27 @@ export function schedulingPlan(graph: SchedulingGraph, write: CloudKitWriteRecor
   if (changes.dueDate === null) {
     if (changes.recurrence) throw new AppError("VALIDATION_ERROR", "Clearing a linked date also removes its recurrence; do not combine it with a recurrence edit.", 400);
     if (changes.timeZone !== undefined || changes.allDay !== undefined) throw new AppError("UNSUPPORTED_FEATURE", "Linked date clearing preserves the current time-zone and all-day fields.");
-    for (const [key, ids] of [["AlarmIDs", reminder.alarmIds], ["RecurrenceRuleIDs", reminder.recurrenceRuleIds]] as const) if (ids?.length) write.fields[key] = { type: "UNKNOWN_LIST", value: [] };
-    token("recurrenceRuleIDs");
-    dependencies = retirementOrder(graph.records.filter(record => record.recordType !== "Reminder")).map(retire);
+    if (dateReminder.alarmIds?.length) write.fields.AlarmIDs = { type: locations.length ? "STRING_LIST" : "UNKNOWN_LIST", value: locations.map(location => location.alarm.recordName.slice(6)) };
+    if (rule) { write.fields.RecurrenceRuleIDs = { type: "UNKNOWN_LIST", value: [] }; token("recurrenceRuleIDs"); }
+    if (early) { write.fields.DueDateDeltaAlertsData = { type: "ENCRYPTED_BYTES", value: null }; token("dueDateDeltaAlertsData"); }
+    dependencies = retirementOrder(dateGraph.records.filter(record => record.recordType !== "Reminder")).map(retire);
   } else if (changes.allDay === true && reminder.allDay === false) {
     if (!changes.dueDate || Date.parse(changes.dueDate) % 86_400_000 !== 0 || !changes.dueDate.endsWith("Z")) throw new AppError("VALIDATION_ERROR", "All-day conversion requires the requested calendar date as an explicit midnight-UTC dueDate.", 400);
     if (changes.timeZone !== undefined) throw new AppError("VALIDATION_ERROR", "All-day conversion removes the stored time zone; omit timeZone.", 400);
     write.fields.TimeZone = { type: "STRING", value: null };
-    write.fields.AlarmIDs = { type: "UNKNOWN_LIST", value: [] };
+    write.fields.AlarmIDs = { type: locations.length ? "STRING_LIST" : "UNKNOWN_LIST", value: locations.map(location => location.alarm.recordName.slice(6)) };
     token("timeZone");
-    dependencies = retirementOrder(graph.records.filter(record => ["Alarm", "AlarmTrigger"].includes(record.recordType))).map(retire);
-    if (rule) guards.push(rule);
-  } else if (changes.allDay === false && reminder.allDay === true) {
-    if (!changes.dueDate || !changes.timeZone || reminder.alarmIds?.length) throw new AppError("VALIDATION_ERROR", "Timed conversion requires an explicit dueDate and IANA timeZone on an all-day reminder without alarms.", 400);
+    dependencies = retirementOrder(dateGraph.records.filter(record => ["Alarm", "AlarmTrigger"].includes(record.recordType))).map(retire);
+    if (hourlyRule) {
+      dependencies.push(retire(hourlyRule));
+      write.fields.RecurrenceRuleIDs = { type: "UNKNOWN_LIST", value: [] };
+      token("recurrenceRuleIDs");
+    } else if (rule) guards.push(rule);
+  } else if (changes.allDay === false && reminder.allDay === true || afterAllDay === false && reminder.dueDate === null && locations.length > 0 && !dateReminder.alarmIds?.length && changes.dueDate !== undefined) {
+    if (!changes.dueDate || !changes.timeZone || dateReminder.alarmIds?.length) throw new AppError("VALIDATION_ERROR", "Adding a timed date alarm requires explicit dueDate and IANA timeZone without an existing date alarm.", 400);
     const alarmUID = crypto.randomUUID().toUpperCase(), triggerUID = crypto.randomUUID().toUpperCase();
     const alarmId = `Alarm/${alarmUID}`, triggerId = `AlarmTrigger/${triggerUID}`;
-    write.fields.AlarmIDs = { type: "STRING_LIST", value: [alarmUID] };
+    write.fields.AlarmIDs = { type: "STRING_LIST", value: [...(reminder.alarmIds ?? []).map(id => id.slice(6)), alarmUID] };
     token("dueDate", "timeZone", "allDay");
     dependencies = [
       { operationType: "create", recordName: alarmId, recordType: "Alarm", fields: {
@@ -100,7 +110,7 @@ export function schedulingPlan(graph: SchedulingGraph, write: CloudKitWriteRecor
   } else if (["DueDate", "TimeZone", "AllDay"].some(key => Object.hasOwn(write.fields, key)) && dateReminder.alarmIds?.length) {
     ({ dependencies, guards } = linkedDatePlan(dateGraph, write, owner));
   } else guards = graph.records.filter(record => record.recordType !== "Reminder");
-  if (locations.length && ["DueDate", "TimeZone"].some(key => Object.hasOwn(write.fields, key)) && !dateReminder.alarmIds?.length) throw new AppError("UNSUPPORTED_FEATURE", "Adding a date alarm to a location-only graph requires a different native recipe.");
+  if (locations.length && changes.dueDate !== null && !dependencies.some(record => record.operationType === "create" && record.recordType === "Alarm") && afterAllDay !== true && ["DueDate", "TimeZone"].some(key => Object.hasOwn(write.fields, key)) && !dateReminder.alarmIds?.length) throw new AppError("UNSUPPORTED_FEATURE", "Adding a date alarm to a location-only graph requires a different native recipe.");
   for (const record of locationRecords) if (!guards.some(guard => guard.recordName === record.recordName)) guards.push(record);
   if (changes.locationAlarm !== undefined) {
     const location = locations[0], change = changes.locationAlarm;
@@ -137,17 +147,41 @@ export function schedulingPlan(graph: SchedulingGraph, write: CloudKitWriteRecor
       } });
     }
   }
-  if (changes.recurrence) {
-    if (!rule || reminder.dueDate === null) throw new AppError("UNSUPPORTED_FEATURE", "Recurrence creation requires a separate native recipe; target an existing dated rule.");
-    const { fields } = recurrenceEdit(rule, changes.recurrence);
-    if (!Object.keys(fields).length) throw new AppError("VALIDATION_ERROR", "The recurrence is unchanged.", 400);
-    guards = guards.filter(record => record.recordName !== rule.recordName);
-    dependencies.push({ recordName: rule.recordName, recordType: "RecurrenceRule", recordChangeTag: rule.recordChangeTag!, fields });
+  if (changes.recurrence !== undefined && changes.dueDate !== null && !dependencies.some(record => record.recordType === "RecurrenceRule" && record.fields.Deleted?.value === 1)) {
+    if (changes.recurrence === null) {
+      if (!rule) throw new AppError("VALIDATION_ERROR", "There is no recurrence to remove.", 400);
+      guards = guards.filter(record => record.recordName !== rule.recordName);
+      dependencies.push(retire(rule));
+      write.fields.RecurrenceRuleIDs = { type: "UNKNOWN_LIST", value: [] };
+      token("recurrenceRuleIDs");
+    } else if (rule) {
+      const { fields } = recurrenceEdit(rule, changes.recurrence);
+      if (!Object.keys(fields).length) throw new AppError("VALIDATION_ERROR", "The recurrence is unchanged.", 400);
+      guards = guards.filter(record => record.recordName !== rule.recordName);
+      dependencies.push({ recordName: rule.recordName, recordType: "RecurrenceRule", recordChangeTag: rule.recordChangeTag!, fields });
+    } else {
+      if ((changes.dueDate ?? reminder.dueDate) === null || afterAllDay !== true && !dateReminder.alarmIds?.length && !dependencies.some(record => record.operationType === "create" && record.recordType === "Alarm")) throw new AppError("UNSUPPORTED_FEATURE", "Recurrence creation requires a known all-day date or complete absolute-date graph.");
+      const ruleUID = crypto.randomUUID().toUpperCase();
+      write.fields.RecurrenceRuleIDs = { type: "STRING_LIST", value: [ruleUID] };
+      token("recurrenceRuleIDs");
+      dependencies.push({ operationType: "create", recordName: `RecurrenceRule/${ruleUID}`, recordType: "RecurrenceRule", fields: recurrenceCreation(reminder.id, changes.recurrence) });
+    }
   }
-  if (changes.earlyReminder !== undefined) {
-    if (reminder.dueDate === null || reminder.allDay !== false) throw new AppError("UNSUPPORTED_FEATURE", "Early reminder edits require an existing timed date.");
-    if (!early) throw new AppError("UNSUPPORTED_FEATURE", "Early reminder creation requires private account metadata that is not inferred.");
-    write.fields.DueDateDeltaAlertsData = changes.earlyReminder === null ? { type: "ENCRYPTED_BYTES", value: null } : editEarlyReminder(graph.reminder, changes.earlyReminder);
+  if (changes.earlyReminder !== undefined && changes.dueDate !== null) {
+    if (reminder.dueDate === null) throw new AppError("UNSUPPORTED_FEATURE", "Early reminder edits require an existing date.");
+    if (!early) {
+      if (changes.earlyReminder === null) throw new AppError("VALIDATION_ERROR", "There is no early reminder to remove.", 400);
+      const source = graph.earlyReminderWitness;
+      if (!source) throw new AppError("UNSUPPORTED_FEATURE", "Early reminder creation requires an exact versioned same-list private metadata source.");
+      live(source);
+      const sourceReminder = normalizeReminder(source, owner);
+      if (sourceReminder.listId !== reminder.listId || sourceReminder.completed !== false || sourceReminder.deleted !== false || sourceReminder.parentReminderId !== null ||
+        source.zoneID?.zoneName !== "Reminders" || ![owner, "__defaultOwner__"].includes(source.zoneID.ownerRecordName ?? owner)) throw new AppError("CONFLICT", "The early reminder source must remain an open root in the same private list.", 409);
+      const existingSource = graph.records.find(record => record.recordName === source.recordName);
+      if (existingSource && (existingSource.recordChangeTag !== source.recordChangeTag || canonicalJSON(existingSource.fields) !== canonicalJSON(source.fields))) throw new AppError("CONFLICT", "The early reminder source version differs from the scheduling graph.", 409);
+      write.fields.DueDateDeltaAlertsData = createEarlyReminder(graph.reminder, source, changes.earlyReminder, now);
+      if (!guards.some(record => record.recordName === source.recordName)) guards.push(source);
+    } else write.fields.DueDateDeltaAlertsData = changes.earlyReminder === null ? { type: "ENCRYPTED_BYTES", value: null } : editEarlyReminder(graph.reminder, changes.earlyReminder);
   }
   if (graph.schedulingParent) {
     live(graph.schedulingParent);

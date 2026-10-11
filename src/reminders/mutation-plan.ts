@@ -18,7 +18,7 @@ export function planReminderUpdate(graph: SchedulingGraph, input: UpdateReminder
   let dependencies: SchedulingWrite[] = [], guards: CloudKitRecord[] = [];
   try {
     if (scheduling && graph.unsupportedReason) throw new AppError("UNSUPPORTED_FEATURE", graph.unsupportedReason);
-    if (scheduling && (input.changes.locationAlarm !== undefined || input.changes.earlyReminder !== undefined || input.changes.recurrence || before.parentReminderId || (before.alarmIds?.length ?? 0) || (before.recurrenceRuleIds?.length ?? 0) || before.allDay === true || input.changes.allDay === true)) {
+    if (scheduling && (input.changes.locationAlarm !== undefined || input.changes.earlyReminder !== undefined || input.changes.recurrence !== undefined || Object.hasOwn(graph.reminder.fields, "DueDateDeltaAlertsData") || before.parentReminderId || (before.alarmIds?.length ?? 0) || (before.recurrenceRuleIds?.length ?? 0) || before.allDay === true || input.changes.allDay === true)) {
       ({ dependencies, guards } = schedulingPlan(graph, write, input, owner, now));
     }
   }
@@ -39,9 +39,9 @@ export function planReminderUpdate(graph: SchedulingGraph, input: UpdateReminder
     dueDate: write.fields.DueDate ? write.fields.DueDate.value === null ? null : new Date(Number(write.fields.DueDate.value)).toISOString() : before.dueDate,
     timeZone: write.fields.TimeZone ? write.fields.TimeZone.value as string | null : before.timeZone,
     allDay: write.fields.AllDay ? write.fields.AllDay.value === 1 : before.allDay,
-    recurrence: input.changes.dueDate === null && dependencies.some(record => record.recordType === "RecurrenceRule") ? null : rule && ruleWrite ? readRecurrence({ ...rule, fields: { ...rule.fields, ...ruleWrite.fields } }) : beforeSummary.recurrence,
+    recurrence: ruleWrite?.fields.Deleted?.value === 1 ? null : ruleWrite ? readRecurrence({ ...ruleWrite, raw: {}, fields: { ...rule?.fields, ...ruleWrite.fields } }) : beforeSummary.recurrence,
     locationAlarm: afterLocation,
-    earlyReminder: input.changes.earlyReminder !== undefined ? input.changes.earlyReminder : beforeSummary.earlyReminder,
+    earlyReminder: input.changes.dueDate === null ? null : input.changes.earlyReminder !== undefined ? input.changes.earlyReminder : beforeSummary.earlyReminder,
   };
   const zoneID = { zoneName: "Reminders", zoneType: "REGULAR_CUSTOM_ZONE", ...(owner !== "__defaultOwner__" ? { ownerRecordName: owner } : {}) };
   const operations = [{ operationType: "update", record: write },

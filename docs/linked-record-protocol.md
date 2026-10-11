@@ -16,10 +16,10 @@ captures and not an acceptance oracle.
 | Simple reminder edit | Existing single-record builder, exact version and confirmation checks. |
 | Timed recurring active-occurrence date/time-zone change | Supported with one current absolute date alarm, preserving recurrence and linked IDs. |
 | Timed absolute date alarm, with optional recurrence | Supported in-place Reminder/Alarm/AlarmTrigger atomic recipe below. |
-| Linked date clearing or timed/all-day conversion | Supported for the known date pair with explicit calendar-date/instant inputs; no location or early reminder during conversion. |
+| Linked date clearing or timed/all-day conversion | Supported with explicit calendar-date/instant inputs, preserving a known location pair. Conversion preserves early reminders; clearing removes them. |
 | Location alarm | One known pair can be created from a resolved place, edited, preserved during a date move or soft retired. |
-| Existing early reminder | One minutes/hours offset can be edited or removed; missing account metadata prevents creation. |
-| Existing known recurrence | Daily/weekly/monthly/yearly intervals, weekly weekdays, monthly dates or ordinal weekday, yearly months and explicit end instant. Anchor/creation edits remain blocked. |
+| Early reminder | One minutes/hours/days/weeks/months offset can be created from a guarded same-list native witness, edited or removed. |
+| Known recurrence | Hourly/daily/weekly/monthly/yearly intervals, weekly weekdays, monthly dates or ordinal weekday, yearly months and explicit end instant. Creation and removal supported; anchor edits remain blocked. |
 | Unknown recurrence or scheduling field | Blocked. |
 | Completed historical occurrence | Cannot be rescheduled, reopened implicitly or redirected to a successor. |
 | Parent/subtask scheduling | Independent parent dates; child dates guard the exact open root parent in the same list. No cascade or deeper nesting. |
@@ -428,8 +428,8 @@ retirement only, never hard deletion of a Reminder or arbitrary caller-selected 
 The expanded recipes and explicit input examples are documented in
 [write access](write-access.md#additional-scheduling-recipes). Private captures remain ignored;
 checked-in fixtures use invented identities and account metadata. Actual notification delivery,
-recurrence creation/anchors and early-reminder creation
-without independently established account metadata remain outside the verified scope.
+recurrence anchors and early-reminder creation without a validated native account witness
+remain outside the verified scope.
 
 Final controlled connector checks confirmed and visually inspected recurring-date clearing,
 timed→all-day conversion, a subsequent all-day date move, reverse timed conversion, existing
@@ -479,6 +479,42 @@ radius to 600 metres; Apple Reminders displayed all three changes while the date
 The new pair's identifiers were preserved during editing. Connector removal also kept the
 absolute date pair and visibly disabled Location.
 
-Early payloads captured on two synthetic roots shared an account identifier, but no
-authenticated account field has been established as its source. Creation without an existing
-payload remains refused; native account identifiers are never guessed from zone owners or DSIDs.
+## Native creation, removal and combined transitions
+
+Further live-app captures established new recurrence rules with seven base fields and
+Hourly as `Frequency=4`. Selecting Repeat Never unlinks and soft-retires the rule, removes
+its Reminder backreference and preserves the date, early reminder and location pair.
+Turning Time off on an hourly reminder also removes its rule; other known recurrence
+frequencies survive that conversion. These recipes now support fresh recurrence identities
+and explicit `changes.recurrence: null` without a due-date clear.
+
+The early-reminder custom editor offers minutes, hours, days, weeks and months. Captured
+payloads map them to `dueDateDeltaUnit` 0 through 4 with negative offset counts. Native
+timed/all-day conversions preserve the early payload byte-for-byte. Clearing Date removes
+the payload and recurrence while retaining an existing location pair. The native app's old
+date dependencies showed both physical deletion and soft retirement across samples;
+the connector uses the separately proven exact-version trigger-first deletion recipe.
+
+Early payloads on multiple synthetic roots shared an account identifier, but no authenticated
+account field has been established as its source. Creation therefore obtains that identifier
+from a bounded same-list native witness, never from zone owners or DSIDs. The witness is a
+separate preparation dependency, not a target scheduling link. A fresh exact read verifies its
+full fields and version after graph validation; the source root's fields and identity are fingerprinted. The atomic
+write guards that source's version while minting the target's own reminder and alert identifiers.
+No source schedule or references are copied to the target.
+
+Controlled connector checks visibly confirmed a mixed all-day reminder converted to
+14 August 2027 at 09:00 Europe/London while preserving its one-month early reminder and
+400-metre arriving station alarm. Creating an every-two-hours rule displayed correctly;
+converting back to all-day removed that hourly rule and preserved both other alerts.
+A separate newly created every-three-weeks Monday/Thursday rule also appeared in the native
+editor. Full API readbacks and the retained session generation/deadline agreed with these changes.
+
+Additional connector checks created a two-week early reminder on a dated root that had no
+early payload; the native editor displayed the new offset. Clearing the mixed reminder's
+date removed its recurrence and early payload while retaining the arriving location alarm.
+Adding a date back to that location-only reminder displayed 15 August 2027 at 09:00
+Europe/London, and a subsequent newly created one-day early reminder appeared with the
+station and 400-metre radius intact. An intervening stale preparation was refused before
+dispatch; the later change used freshly read state and a new preparation. These checks verify
+stored schedules and native editor parity, not actual notification delivery.

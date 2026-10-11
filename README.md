@@ -116,8 +116,8 @@ version tags. Creates need a new UUID `idempotencyKey` for each distinct reminde
 same key and content after an uncertain result. Updates need the last-read `recordChangeTag`
 and a nonempty `changes` object. `get_reminder` reads the exact current item, including completed
 or soft-deleted state, without scanning history. Only specified fields change. Supported fields are title, notes,
-priority, flag, due date, time zone and all-day status, plus bounded custom recurrence edits,
-early reminder edits and location alarm creation, editing and removal. Scheduling updates support
+priority, flag, due date, time zone and all-day status, plus bounded custom recurrence creation,
+editing and removal, early reminders and location alarm creation, editing and removal. Scheduling updates support
 one absolute date alarm, optionally one location alarm and one known recurrence. Linked date clearing and explicit
 timed/all-day conversion retire the old date-alarm pair atomically. Subtask scheduling guards
 the exact open parent in the same list. See [supported recipes](docs/linked-record-protocol.md)
@@ -127,7 +127,9 @@ child check fails closed on errors or unfinished pagination; it does not prove p
 against newly added, unreferenced children. No subtask cascades are supported. Use Apple's app
 for parent/child lifecycle actions. Deletion sets Apple's `Deleted` marker
 with a normal update; no hard-delete or restore tool is exposed. Moving lists, arbitrary linked-record
-editing, recurrence creation/anchor changes and early reminder creation are excluded.
+editing and recurrence anchor changes are excluded. New early reminders use an exact-version
+witness from another native early reminder in the same list to obtain Apple's account metadata;
+the connector never derives that identifier from credentials or zone owners.
 
 The `create_subtask` and `set_reminder_parent` tools create undated children, move a
 simple childless reminder under a root, reparent it or return it to top level.

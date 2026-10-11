@@ -57,6 +57,15 @@ function reminderRecord(id, { recurrence = false, alarm = false } = {}) {
   };
 }
 
+function earlyPayloadField(reminderId, accountIdentifier, { unit = 1, count = -1, identifier = randomUUID().toUpperCase() } = {}) {
+  const payload = {
+    reminderIdentifier: reminderId.slice("Reminder/".length), accountIdentifier,
+    minimumSupportedVersion: 20230430,
+    dueDateDeltaAlerts: [{ creationDate: 1_700_000_000, identifier, dueDateDeltaUnit: unit, dueDateDeltaCount: count, minimumSupportedAppVersion: 0 }],
+  };
+  return { field: field("ENCRYPTED_BYTES", Buffer.from(JSON.stringify(payload), "utf8").toString("base64")), payload };
+}
+
 function sessionFixture(expired = false) {
   const now = Date.now();
   return {
@@ -98,6 +107,7 @@ export async function verifyReminderWrites(options) {
       records: new Map([[listId, listRecord()], [reminderId, reminderRecord(reminderId)],
         ["Reminder/WRITE-RECURRING", reminderRecord("Reminder/WRITE-RECURRING", { recurrence: true })],
         ["Reminder/WRITE-ALARMED", reminderRecord("Reminder/WRITE-ALARMED", { alarm: true })]]),
+      omitLookupZoneIds: new Set(), foreignZoneIds: new Set(),
       requests: [], modifies: [], nextModify: null, holdLookup: null, holdModify: null,
     };
     const bindings = {
@@ -115,7 +125,9 @@ export async function verifyReminderWrites(options) {
         assert.equal(body.query.recordType, "reminderList");
         assert.equal(body.query.filterBy.find(filter => filter.fieldName === "List").fieldValue.value.recordName, listId);
         const includeCompleted = body.query.filterBy.find(filter => filter.fieldName === "includeCompleted").fieldValue.value === 1;
-        return jsonResponse({ records: [...state.records.values()].filter(record => record.recordType === "Reminder" && record.fields.List.value.recordName === listId && record.fields.Deleted.value === 0 && (includeCompleted || record.fields.Completed.value === 0)) });
+        const records = [...state.records.values()].filter(record => record.recordType === "Reminder" && record.fields.List.value.recordName === listId && record.fields.Deleted.value === 0 && (includeCompleted || record.fields.Completed.value === 0));
+        return jsonResponse({ records: records.map(record => state.foreignZoneIds.has(record.recordName)
+          ? { ...record, zoneID: { ...record.zoneID, ownerRecordName: "synthetic-foreign-owner" } } : record) });
       }
       if (url.pathname.endsWith("/records/lookup")) {
         if (state.holdLookup) {
@@ -126,7 +138,14 @@ export async function verifyReminderWrites(options) {
         }
         const records = body.records.map(({ recordName }) => {
           const record = state.records.get(recordName);
-          return record ? localEvidence ? { ...record, zoneID: undefined } : record : { recordName, serverErrorCode: "NOT_FOUND" };
+          if (!record) return { recordName, serverErrorCode: "NOT_FOUND" };
+          let result = state.foreignZoneIds.has(recordName)
+            ? { ...record, zoneID: { ...record.zoneID, ownerRecordName: "synthetic-foreign-owner" } } : record;
+          if (localEvidence || state.omitLookupZoneIds.has(recordName)) {
+            result = { ...result };
+            delete result.zoneID;
+          }
+          return result;
         });
         return jsonResponse({ records });
       }
@@ -190,6 +209,31 @@ export async function verifyReminderWrites(options) {
             });
             if (action === "committed-500") return jsonResponse({ serverErrorCode: "SERVICE_UNAVAILABLE" }, 500);
             if (action === "missing-parent-confirmation") return jsonResponse({ records: records.slice(0, 1) });
+            return jsonResponse({ records: records.reverse() });
+          }
+          if (body.operations.some(candidate => Object.hasOwn(candidate.record.fields, "DueDateDeltaAlertsData"))) {
+            assert.equal(body.operations.length, 2);
+            state.modifies.push({ earlyReminderGroup: true, operationCount: body.operations.length });
+            const action = state.nextModify; state.nextModify = null;
+            const sourceGuard = body.operations.find(candidate => Object.keys(candidate.record.fields).length === 1 && candidate.record.fields.Deleted?.type === "INT64" && candidate.record.fields.Deleted.value === 0);
+            assert.ok(sourceGuard, "Early reminder creation must guard its exact metadata source.");
+            if (action === "early-source-race") {
+              const source = state.records.get(sourceGuard.record.recordName);
+              state.records.set(source.recordName, { ...source, recordChangeTag: `concurrent-${source.recordChangeTag}` });
+            }
+            const stale = body.operations.find(candidate => candidate.record.recordChangeTag !== state.records.get(candidate.record.recordName)?.recordChangeTag);
+            if (stale) return jsonResponse({ records: body.operations.map(candidate => ({
+              recordName: candidate.record.recordName, serverErrorCode: candidate === stale ? "SERVER_RECORD_CHANGED" : "ATOMIC_ERROR",
+            })) });
+            const records = body.operations.map(candidate => {
+              assert.equal(candidate.operationType, "update");
+              if (candidate === sourceGuard) assert.deepEqual(candidate.record.fields, { Deleted: field("INT64", 0) });
+              const current = state.records.get(candidate.record.recordName);
+              const next = { ...current, fields: { ...current.fields, ...candidate.record.fields },
+                recordChangeTag: `early-updated-${state.modifies.length}-${current.recordName}` };
+              state.records.set(next.recordName, next);
+              return next;
+            });
             return jsonResponse({ records: records.reverse() });
           }
           assert.equal(localEvidence, true);
@@ -562,7 +606,7 @@ export async function verifyReminderWrites(options) {
     generation = await workerHarness.seedReady();
     const invoke = async (name, args) => {
       const reply = await mcp("tools/call", { name, arguments: args });
-      if (reply.result.isError) throw Object.assign(new Error("Synthetic MCP tool rejected the operation."), { code: reply.result.structuredContent.error.code });
+      if (reply.result.isError) throw Object.assign(new Error(JSON.stringify(reply.result)), { code: reply.result.structuredContent?.error?.code });
       return reply.result.structuredContent;
     };
     const testKey = randomUUID();
@@ -615,6 +659,96 @@ export async function verifyReminderWrites(options) {
     state.nextModify = "changed-resolution-tokens";
     const tokenMismatch = await mcp("tools/call", { name: "update_reminder", arguments: { listId, reminderId, recordChangeTag: state.records.get(reminderId).recordChangeTag, changes: { title: "Unconfirmed token change" }, expectedGeneration: generation } });
     assert.equal(tokenMismatch.result.structuredContent.error.code, "WRITE_OUTCOME_UNKNOWN");
+
+    // Creating an early alarm copies only validated account metadata from an exact same-list source and atomically guards it.
+    const accountIdentifier = "8a187515-3b92-4658-a9d0-815b5fd95a52";
+    const earlySourceId = "Reminder/62C454A0-052A-486A-8325-C05F76215D16";
+    const earlyTargetId = "Reminder/8E1C9422-9FA4-4D6B-9E6D-25D796196CE4";
+    const earlyRaceId = "Reminder/28466777-079D-49F5-B217-BD8E45184B5D";
+    const earlyAlarmId = "Alarm/EARLY-SOURCE-ALARM";
+    const earlyTriggerUuid = "3c48b583-32f2-4b25-adb2-16be6b21f0a4";
+    const earlySource = reminderRecord(earlySourceId);
+    earlySource.fields.AllDay = field("INT64", 1);
+    earlySource.fields.DueDate = field("TIMESTAMP", Date.parse("2030-03-04T00:00:00.000Z"));
+    earlySource.fields.TimeZone = field("STRING", null);
+    earlySource.fields.AlarmIDs = field("STRING_LIST", [earlyAlarmId]);
+    const { field: sourcePayloadField, payload: sourcePayload } = earlyPayloadField(earlySourceId, accountIdentifier, { unit: 4, count: -1 });
+    earlySource.fields.DueDateDeltaAlertsData = sourcePayloadField;
+    state.records.set(earlyAlarmId, { recordName: earlyAlarmId, recordType: "Alarm", recordChangeTag: "early-source-alarm-tag",
+      zoneID: { zoneName: "Reminders", zoneType: "REGULAR_CUSTOM_ZONE", ownerRecordName: zoneOwner },
+      fields: { Deleted: field("INT64", 0), TriggerID: field("STRING", earlyTriggerUuid) } });
+    state.records.set("AlarmTrigger/" + earlyTriggerUuid, { recordName: "AlarmTrigger/" + earlyTriggerUuid, recordType: "AlarmTrigger", recordChangeTag: "early-source-trigger-tag",
+      zoneID: { zoneName: "Reminders", zoneType: "REGULAR_CUSTOM_ZONE", ownerRecordName: zoneOwner }, fields: { Deleted: field("INT64", 0) } });
+    const earlyTarget = reminderRecord(earlyTargetId);
+    earlyTarget.fields.AllDay = field("INT64", 1);
+    earlyTarget.fields.DueDate = field("TIMESTAMP", Date.parse("2030-03-04T00:00:00.000Z"));
+    earlyTarget.fields.TimeZone = field("STRING", null);
+    state.records.set(earlySourceId, earlySource);
+    // Native lookup omits the source record's zoneID; the exact list query and
+    // target lookup already establish the authenticated private Reminders zone.
+    state.omitLookupZoneIds.add(earlySourceId);
+    state.records.set(earlyTargetId, earlyTarget);
+    const earlyRequest = { listId, reminderId: earlyTargetId, recordChangeTag: earlyTarget.recordChangeTag,
+      changes: { earlyReminder: { unit: "weeks", count: 1 } }, expectedGeneration: generation };
+    const beforeEarlyPreview = state.modifies.length;
+    const earlyPreview = await invoke("prepare_reminder_update", earlyRequest);
+    assert.equal(earlyPreview.supported, true, earlyPreview.unsupportedReason ?? "");
+    assert.equal(earlyPreview.after.earlyReminder.unit, "weeks");
+    assert.equal(state.modifies.length, beforeEarlyPreview);
+    const sourceFieldsBefore = structuredClone(earlySource.fields);
+    const earlyCreated = await invoke("update_reminder", { ...earlyRequest, preparationToken: earlyPreview.preparationToken });
+    assert.equal(earlyCreated.record.allDay, true, "A dated all-day target can receive an early reminder.");
+    assert.equal(state.modifies.at(-1).earlyReminderGroup, true);
+    assert.equal(state.modifies.at(-1).operationCount, 2);
+    const createdPayload = JSON.parse(Buffer.from(state.records.get(earlyTargetId).fields.DueDateDeltaAlertsData.value, "base64").toString("utf8"));
+    assert.equal(createdPayload.reminderIdentifier, earlyTargetId.slice("Reminder/".length));
+    assert.equal(createdPayload.accountIdentifier, accountIdentifier);
+    assert.equal(createdPayload.minimumSupportedVersion, 20230430);
+    assert.equal(createdPayload.dueDateDeltaAlerts[0].dueDateDeltaUnit, 3);
+    assert.equal(createdPayload.dueDateDeltaAlerts[0].dueDateDeltaCount, -1);
+    assert.notEqual(createdPayload.dueDateDeltaAlerts[0].identifier, sourcePayload.dueDateDeltaAlerts[0].identifier);
+    assert.deepEqual(state.records.get(earlySourceId).fields, sourceFieldsBefore, "The metadata source guard must not change source fields.");
+    assert.ok(!JSON.stringify(earlyCreated).includes(accountIdentifier), "Private account metadata must not leave the Apple write payload.");
+
+    const earlyForeignTarget = reminderRecord("Reminder/8FA06F35-D472-4496-A8DE-771F8D3BE288");
+    state.records.set(earlyForeignTarget.recordName, earlyForeignTarget);
+    state.foreignZoneIds.add(earlySourceId);
+    const beforeForeignZone = state.modifies.length;
+    const foreignZonePreview = await mcp("tools/call", { name: "prepare_reminder_update", arguments: { listId, reminderId: earlyForeignTarget.recordName,
+      recordChangeTag: earlyForeignTarget.recordChangeTag, changes: { earlyReminder: { unit: "hours", count: 1 } }, expectedGeneration: generation } });
+    assert.equal(foreignZonePreview.result.structuredContent.error.code, "PROTOCOL_CHANGED", "An explicit foreign source owner must be refused.");
+    assert.equal(state.modifies.length, beforeForeignZone);
+    state.foreignZoneIds.delete(earlySourceId);
+
+    const earlyRace = reminderRecord(earlyRaceId);
+    state.records.set(earlyRaceId, earlyRace);
+    const earlyRaceBefore = structuredClone(earlyRace);
+    state.nextModify = "early-source-race";
+    const earlyRaceReply = await mcp("tools/call", { name: "update_reminder", arguments: { ...earlyRequest, reminderId: earlyRaceId,
+      recordChangeTag: earlyRace.recordChangeTag, preparationToken: undefined } });
+    assert.equal(earlyRaceReply.result.structuredContent.error.code, "CONFLICT");
+    assert.deepEqual(state.records.get(earlyRaceId), earlyRaceBefore, "A concurrent source version change must reject the atomic write without changing its target.");
+
+    // A valid source in another list cannot supply metadata when the selected list has none.
+    state.records.delete(earlySourceId); state.records.delete(earlyTargetId); state.records.delete(earlyRaceId); state.records.delete(earlyForeignTarget.recordName);
+    state.records.delete(earlyAlarmId); state.records.delete("AlarmTrigger/" + earlyTriggerUuid); state.omitLookupZoneIds.delete(earlySourceId);
+    const otherListId = "List/WRITE-OTHER-SOURCE";
+    state.records.set(otherListId, { ...listRecord(), recordName: otherListId });
+    const crossListSource = reminderRecord("Reminder/DA4F3D41-9D2C-4E88-A80D-3E7CFF17453F");
+    crossListSource.fields.List = field("REFERENCE", { recordName: otherListId, action: "VALIDATE", zoneID: { zoneName: "Reminders", ownerRecordName: zoneOwner } });
+    crossListSource.fields.DueDateDeltaAlertsData = earlyPayloadField(crossListSource.recordName, accountIdentifier).field;
+    const crossListTarget = reminderRecord("Reminder/7531E813-2CC9-4A89-953D-8CF28C189A44");
+    state.records.set(crossListSource.recordName, crossListSource);
+    state.records.set(crossListTarget.recordName, crossListTarget);
+    const crossListRequest = { listId, reminderId: crossListTarget.recordName, recordChangeTag: crossListTarget.recordChangeTag,
+      changes: { earlyReminder: { unit: "days", count: 1 } }, expectedGeneration: generation };
+    const beforeNoSource = state.modifies.length;
+    const noSourcePreview = await invoke("prepare_reminder_update", crossListRequest);
+    assert.equal(noSourcePreview.supported, false);
+    assert.match(noSourcePreview.unsupportedReason, /this list/);
+    const noSourceMutation = await mcp("tools/call", { name: "update_reminder", arguments: crossListRequest });
+    assert.equal(noSourceMutation.result.structuredContent.error.code, "UNSUPPORTED_FEATURE");
+    assert.equal(state.modifies.length, beforeNoSource, "Cross-list metadata must never produce an Apple write.");
 
     // Native D1 ledger and real MCP schemas exercise simple request-driven jobs.
     const jobKey = randomUUID();

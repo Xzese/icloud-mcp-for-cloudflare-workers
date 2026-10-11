@@ -81,8 +81,8 @@ export const ReminderChanges = z.object({
   timeZone: nullableTimeZone,
   allDay,
   locationAlarm: LocationAlarmChange.nullable().describe("Create one location alarm with full place, proximity and radius; edit supplied existing metadata; null removes the location alarm."),
-  earlyReminder: EarlyReminder.nullable().describe("Edit the offset of an existing one-alert minute/hour-based early reminder, preserving its private metadata. Null removes an existing early reminder."),
-  recurrence: RecurrenceChanges.describe("Edit an existing known recurrence: frequency/interval, weekly ISO weekdays, monthly dates or ordinal weekday, yearly months, and an explicit end instant. Omitted compatible patterns and endDate stay unchanged."),
+  earlyReminder: EarlyReminder.nullable().describe("Create one minute/hour/day/week/month early reminder using an exact same-list private metadata source, or edit an existing offset while preserving its private metadata. Null removes an existing early reminder."),
+  recurrence: RecurrenceChanges.nullable().describe("Create or edit one known recurrence; null removes it: hourly/daily/weekly/monthly/yearly frequency and interval, weekly ISO weekdays, monthly dates or ordinal weekday, yearly months, and an explicit end instant. Omitted compatible patterns and endDate stay unchanged."),
 }).partial().strict();
 
 export const CreateReminderInput = z.object({
@@ -272,7 +272,7 @@ export function buildReminderFieldUpdate(input: UpdateReminderInputData, current
   if (changes.dueDate !== undefined) nextDue = changes.dueDate;
   if (changes.timeZone !== undefined) nextZone = changes.timeZone;
   if (changes.allDay !== undefined) nextAllDay = changes.allDay;
-  const linked = (reminder.alarmIds?.length ?? 0) > 0 || (reminder.recurrenceRuleIds?.length ?? 0) > 0;
+  const linked = (reminder.alarmIds?.length ?? 0) > 0 || (reminder.recurrenceRuleIds?.length ?? 0) > 0 || Object.hasOwn(current.fields, "DueDateDeltaAlertsData");
   if (changes.dueDate === null && !linked) {
     if (changes.allDay === undefined && nextAllDay) nextAllDay = false;
     if (changes.timeZone === undefined) nextZone = null;

@@ -12,6 +12,35 @@ export interface SchedulingGraph {
   complete: boolean;
   unsupportedReason: string | null;
   schedulingParent?: CloudKitRecord;
+  earlyReminderWitness?: CloudKitRecord;
+}
+
+function graphFingerprint(graph: Pick<SchedulingGraph, "records" | "edges">, earlyReminderWitness?: CloudKitRecord) {
+  const value: Record<string, unknown> = {
+    records: [...graph.records].sort((a, b) => a.recordName.localeCompare(b.recordName)).map(record => ({
+      id: record.recordName, type: record.recordType, version: record.recordChangeTag, zone: record.zoneID, fields: record.fields,
+    })),
+    edges: [...graph.edges].sort((a, b) => a.to.localeCompare(b.to)),
+  };
+  if (earlyReminderWitness) value.earlyReminderWitness = {
+    id: earlyReminderWitness.recordName,
+    type: earlyReminderWitness.recordType,
+    version: earlyReminderWitness.recordChangeTag,
+    zone: earlyReminderWitness.zoneID,
+    fields: earlyReminderWitness.fields,
+  };
+  return fingerprint(value);
+}
+
+export async function attachEarlyReminderWitness(graph: SchedulingGraph, witness: CloudKitRecord): Promise<SchedulingGraph> {
+  if (witness.recordType !== "Reminder" || !witness.recordName.startsWith("Reminder/") || witness.recordName === graph.reminder.recordName ||
+    !witness.recordChangeTag || witness.deleted === true || witness.zoneID?.zoneName !== "Reminders" ||
+    witness.zoneID.ownerRecordName !== graph.reminder.zoneID?.ownerRecordName) {
+    throw new AppError("CONFLICT", "The early reminder metadata source changed or is outside the target's private Reminders zone.", 409);
+  }
+  const attached = { ...graph, earlyReminderWitness: witness };
+  attached.fingerprint = await graphFingerprint(attached, witness);
+  return attached;
 }
 
 export async function loadSchedulingGraph(
@@ -80,5 +109,5 @@ export async function loadSchedulingGraph(
   const unsupportedReason = null;
   const sorted = [...records.values()].sort((a, b) => a.recordName.localeCompare(b.recordName));
   return { reminder, records: sorted, edges, complete: true,
-    unsupportedReason, ...(schedulingParent ? { schedulingParent } : {}), fingerprint: await fingerprint({ records: sorted.map(record => ({ id: record.recordName, type: record.recordType, version: record.recordChangeTag, zone: record.zoneID, fields: record.fields })), edges: [...edges].sort((a, b) => a.to.localeCompare(b.to)) }) };
+    unsupportedReason, ...(schedulingParent ? { schedulingParent } : {}), fingerprint: await graphFingerprint({ records: sorted, edges }) };
 }
