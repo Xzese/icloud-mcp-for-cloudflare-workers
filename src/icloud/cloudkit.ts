@@ -1,6 +1,8 @@
 import { AppError, WriteOutcomeUnknownError, requireValue as requireInput } from "../errors.ts";
 import type { CloudKitWriteRecord } from "../reminders/writes.ts";
 import { decodeDateComponents, type LinkedDateWrite } from "../reminders/linked-date.ts";
+import { earlyReminderPayload } from "../reminders/early-reminder.ts";
+import { schedulingOperation, type SchedulingWrite } from "../reminders/scheduling-plan.ts";
 import { canonicalJSON } from "../lib/canonical.ts";
 import { decodeDocument } from "../reminders/crdt.ts";
 import { AppleHTTP, validatedAppleURL, appleWebHeaders } from "../transport/apple-http.ts";
@@ -575,7 +577,7 @@ export class CloudKitRemindersClient {
 
   async modifyRecords(operations: { operationType: "create" | "update"; record: CloudKitWriteRecord }[], beforeDispatch?: () => Promise<void>, versionGuards: CloudKitRecord[] = []): Promise<CloudKitRecord[]> {
     for (const { operationType, record } of operations) this.validateWrite(operationType, record);
-    return this.executeRecords(operations, beforeDispatch, versionGuards);
+    return await this.executeRecords(operations, beforeDispatch, versionGuards) as CloudKitRecord[];
   }
 
   async modifyLinkedDate(root: CloudKitWriteRecord, dependencies: LinkedDateWrite[], beforeDispatch?: () => Promise<void>, versionGuards: CloudKitRecord[] = []) {
@@ -598,12 +600,70 @@ export class CloudKitRemindersClient {
       }
     }
     requireInput(versionGuards.length <= 1 && versionGuards.every(record => record.recordType === "RecurrenceRule"), "Date updates may only guard one unchanged recurrence rule.");
-    return this.executeRecords([{ operationType: "update", record: root },
-      ...dependencies.map(record => ({ operationType: "update" as const, record }))], beforeDispatch, versionGuards);
+    return await this.executeRecords([{ operationType: "update", record: root },
+      ...dependencies.map(record => ({ operationType: "update" as const, record }))], beforeDispatch, versionGuards) as CloudKitRecord[];
   }
 
-  private async executeRecords(operations: { operationType: "create" | "update"; record: CloudKitWriteRecord | LinkedDateWrite }[],
-    beforeDispatch?: () => Promise<void>, versionGuards: CloudKitRecord[] = []): Promise<CloudKitRecord[]> {
+  async modifyScheduling(root: CloudKitWriteRecord, dependencies: SchedulingWrite[], beforeDispatch?: () => Promise<void>, versionGuards: CloudKitRecord[] = []) {
+    const links = new Set(["AlarmIDs", "RecurrenceRuleIDs", "DueDateDeltaAlertsData"]);
+    this.validateWrite("update", { ...root, fields: Object.fromEntries(Object.entries(root.fields).filter(([key]) => !links.has(key))) });
+    if (root.fields.DueDateDeltaAlertsData) {
+      requireInput(root.fields.DueDateDeltaAlertsData.type === "ENCRYPTED_BYTES", "Early reminder writes require the observed encrypted-bytes field.");
+      if (root.fields.DueDateDeltaAlertsData.value !== null) earlyReminderPayload({ ...root, raw: {} });
+    }
+    for (const key of ["AlarmIDs", "RecurrenceRuleIDs"]) if (root.fields[key]) {
+      const field = root.fields[key];
+      requireInput(Array.isArray(field.value) && (field.type === "UNKNOWN_LIST" && field.value.length === 0 ||
+        field.type === "STRING_LIST" && field.value.length <= 1 && field.value.every(id => typeof id === "string" && /^[0-9a-f-]{36}$/i.test(id))), "Scheduling links require a bounded observed relationship shape.");
+    }
+    const creates = dependencies.filter(record => record.operationType === "create");
+    if (creates.length) {
+      const alarm = creates.find(record => record.recordType === "Alarm"), trigger = creates.find(record => record.recordType === "AlarmTrigger");
+      requireInput(creates.length === 2 && alarm && trigger && canonicalJSON(root.fields.AlarmIDs?.value) === canonicalJSON([alarm.recordName.slice(6)]), "A new date graph requires exactly one linked alarm/trigger pair.");
+    }
+    const retired = dependencies.filter(record => record.fields.Deleted?.value === 1);
+    const retiredDate = dependencies.filter(record => record.operationType === "delete");
+    if (retiredDate.length) requireInput(retiredDate.length === 2 && retiredDate[0].recordType === "AlarmTrigger" && retiredDate[1].recordType === "Alarm" && canonicalJSON(root.fields.AlarmIDs?.value) === "[]", "Retiring a date alarm requires the complete pair and root unlink in the same atomic group.");
+    if (retired.some(record => record.recordType === "RecurrenceRule")) requireInput(canonicalJSON(root.fields.RecurrenceRuleIDs?.value) === "[]", "Retiring recurrence requires its root unlink in the same atomic group.");
+    for (const record of dependencies) {
+      requestedRecordName(record.recordName, [record.recordType]);
+      requireInput(["Alarm", "AlarmTrigger", "RecurrenceRule"].includes(record.recordType) && record.recordName.length <= 255, "Unsupported scheduling identity.");
+      const create = record.operationType === "create";
+      requireInput(create ? record.recordChangeTag === undefined : typeof record.recordChangeTag === "string" && record.recordChangeTag.length > 0 && record.recordChangeTag.length <= 512, "Scheduling updates require exact version tags; creates must not carry one.");
+      const keys = Object.keys(record.fields);
+      if (record.operationType === "delete") {
+        requireInput(["Alarm", "AlarmTrigger"].includes(record.recordType) && keys.length === 0, "Only exact-tag alarm/trigger retirement can delete records; deletion cannot carry fields.");
+      } else if (!create && record.fields.Deleted) {
+        requireInput(record.recordType === "RecurrenceRule" && record.fields.Deleted.type === "INT64" && record.fields.Deleted.value === 1 && keys.every(key => key === "Deleted" || record.recordType === "RecurrenceRule" && key === "Reminder") &&
+          (!record.fields.Reminder || record.fields.Reminder.type === "REFERENCE" && record.fields.Reminder.value === null), "Unsupported scheduling retirement.");
+      } else if (!create && record.recordType === "RecurrenceRule") {
+        requireInput(keys.length >= 1 && keys.length <= 2 && keys.every(key => key === "Frequency" && record.fields[key].type === "INT64" && [0, 1, 2, 3].includes(Number(record.fields[key].value)) || key === "Interval" && record.fields[key].type === "INT64" && [1, 2].includes(Number(record.fields[key].value))), "Unsupported recurrence mutation.");
+      } else if (!create && record.recordType === "Alarm") {
+        requireInput(keys.length === 1 && record.fields.DueDateResolutionTokenAsNonce?.type === "DOUBLE" && typeof record.fields.DueDateResolutionTokenAsNonce.value === "number" && Number.isFinite(record.fields.DueDateResolutionTokenAsNonce.value) && Math.abs(record.fields.DueDateResolutionTokenAsNonce.value) <= Number.MAX_SAFE_INTEGER, "Unsupported alarm mutation.");
+      } else if (!create && record.recordType === "AlarmTrigger") {
+        requireInput(keys.length === 1 && (record.fields.DateComponentsData?.type === "BYTES" || record.fields.Proximity?.type === "INT64" && [1, 2].includes(Number(record.fields.Proximity.value))), "Unsupported trigger mutation.");
+        if (record.fields.DateComponentsData) decodeDateComponents(record.fields.DateComponentsData.value);
+      } else {
+        const expected = record.recordType === "Alarm" ? ["AlarmUID", "TriggerID", "DueDateResolutionTokenAsNonce", "Reminder", "Imported", "Deleted"] : ["DateComponentsData", "Type", "Alarm", "Imported", "Deleted"];
+        requireInput(record.recordType !== "RecurrenceRule" && keys.length === expected.length && keys.every(key => expected.includes(key)) &&
+          record.fields.Imported?.type === "INT64" && record.fields.Imported.value === 0 && record.fields.Deleted?.type === "INT64" && record.fields.Deleted.value === 0, "Unsupported scheduling creation template.");
+        if (record.recordType === "Alarm") {
+          const trigger = dependencies.find(item => item.recordType === "AlarmTrigger" && item.operationType === "create");
+          requireInput(record.fields.AlarmUID.type === "STRING" && record.fields.AlarmUID.value === record.recordName.slice(6) && record.fields.TriggerID.type === "STRING" && record.fields.TriggerID.value === trigger?.recordName.slice(13) &&
+            record.fields.Reminder.type === "REFERENCE" && canonicalJSON(record.fields.Reminder.value) === canonicalJSON({ recordName: root.recordName, action: "VALIDATE" }) &&
+            record.fields.DueDateResolutionTokenAsNonce.type === "DOUBLE" && typeof record.fields.DueDateResolutionTokenAsNonce.value === "number" && Number.isFinite(record.fields.DueDateResolutionTokenAsNonce.value), "Unsupported absolute alarm creation.");
+        } else {
+          const alarm = dependencies.find(item => item.recordType === "Alarm" && item.operationType === "create");
+          requireInput(record.fields.Type.type === "STRING" && record.fields.Type.value === "Date" && record.fields.Alarm.type === "REFERENCE" && canonicalJSON(record.fields.Alarm.value) === canonicalJSON({ recordName: alarm?.recordName, action: "VALIDATE" }) && record.fields.DateComponentsData.type === "BYTES", "Unsupported date trigger creation.");
+          decodeDateComponents(record.fields.DateComponentsData.value);
+        }
+      }
+    }
+    return this.executeRecords([{ operationType: "update", record: root }, ...dependencies.map(schedulingOperation)], beforeDispatch, versionGuards);
+  }
+
+  private async executeRecords(operations: { operationType: "create" | "update" | "delete"; record: { recordName: string; recordType: string; recordChangeTag?: string; fields?: Record<string, unknown> } }[],
+    beforeDispatch?: () => Promise<void>, versionGuards: CloudKitRecord[] = []): Promise<CloudKitRecordItem[]> {
     requireInput(operations.length > 0 && operations.length + versionGuards.length <= 32, "An atomic write requires mutations and guards within its record budget.");
     const guards = structuredClone(versionGuards);
     const guardOperations = guards.map(record => {
@@ -642,6 +702,10 @@ export class CloudKitRemindersClient {
       requireValue(page.records.length === group.length, "Apple omitted an atomic write confirmation.");
       return group.map(({ operationType, record }) => {
         const confirmed = page.records.find(item => item.recordName === record.recordName);
+        if (operationType === "delete") {
+          requireValue(confirmed && confirmed.deleted === true && !("recordType" in confirmed) && Object.keys(confirmed.raw).length === 2 && confirmed.raw.recordName === record.recordName && confirmed.raw.deleted === true, "Apple returned an invalid scheduling deletion confirmation.");
+          return confirmed;
+        }
         requireValue(confirmed && "recordType" in confirmed && confirmed.recordType === record.recordType && !confirmed.deleted && typeof confirmed.recordChangeTag === "string" && confirmed.recordChangeTag.length > 0, "Apple returned an invalid reminder write confirmation.");
         if (operationType === "update") requireValue(confirmed.recordChangeTag !== record.recordChangeTag, "Apple did not advance the reminder version.");
         const guarded = guards.find(guard => guard.recordName === record.recordName);

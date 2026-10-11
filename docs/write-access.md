@@ -40,16 +40,17 @@ Each action sends exactly one version-checked record update; it never cascades.
 An incomplete/errorful or over-budget child inspection blocks the action. This check is **not**
 proof of commit-time protection against a newly added, unreferenced child. Bulk deletion uses the
 same per-item checks and additionally rescans after commit to report any remaining subtasks. Use Apple's app for completing, reopening or deleting parents and their subtasks.
-Moving lists, list management, attachments, creating/replacing alarms, changing recurrence rules
-and tags are outside this interface. Supported timed absolute-alarm date/time-zone changes use
-the linked update below. Other linked date recipes are not inferred.
+Moving lists, list management, attachments and tags are outside this interface. The bounded
+scheduling recipes below can create or retire a date-alarm pair and edit existing simple
+recurrence, early-reminder offsets and location proximity. Arbitrary alarm/rule edits are refused.
 Unchanged linked fields remain untouched. Editing title or notes replaces that text document
 with plain text, including its formatting; an omitted document remains intact.
 
 ## Timed recurring and absolute-alarm date updates
 
-`update_reminder` can change the due date or time zone of an **open timed root** with one
-absolute date alarm and at most one existing recurrence rule. This is permanent ready-account
+`update_reminder` can change the due date or time zone of an **open timed reminder** with one
+absolute date alarm, optionally one location alarm and at most one existing recurrence rule.
+A subtask additionally requires an exact-version guard on its open root parent in the same list. This is permanent ready-account
 functionality on both deployment targets, not an opt-in flag. `capabilities.linkedScheduling`
 reports connection availability; `prepare_reminder_update` reports whether the exact reminder
 graph supports this recipe.
@@ -67,16 +68,47 @@ The trigger components represent that instant in the selected zone. A **zone-onl
 the instant and changes the displayed local time; to retain the local clock, supply the matching
 new instant as `dueDate` too. The format cannot distinguish repeated fall-back local times, so
 those are explicitly refused. Dates must remain in Gregorian years 1-9999.
-Clearing a linked date/zone, timed/all-day conversion, start dates, multiple/location/relative
-alarms, nested schedules and unknown trigger/calendar fields need separate recipes.
-No recurrence interval, end date or anchor is changed or inferred.
+Start dates, multiple alarms of the same type, unknown trigger/calendar fields, recurrence
+creation/end dates/anchors and deeper nesting remain unsupported. The additional recipes below
+require explicit inputs and do not infer calendar-date or wall-clock intent.
 
 Controlled native API acceptance moved a weekly reminder from 10 January 2027 at 09:00
 Europe/London to 11 July 2027 at 09:00 BST, then restored its original date. Both writes,
 full dependency readback and stale-tag refusal passed; linked IDs, recurrence fields,
 completed-history version/state and the retained session deadline were preserved.
-Apple-app rendering and actual alarm firing were not visually verified. See
+Additional Apple-app checks are recorded with the expanded recipes below. Actual alarm delivery
+was not tested. See
 [the recipe evidence](linked-record-protocol.md#permanent-in-place-absolute-date-updates).
+
+## Additional scheduling recipes
+
+Every linked update uses a fresh complete graph, exact versions, one atomic batch and strict
+confirmation checks. Existing resolution tokens retain their replica ID and increment their
+counter; new fields receive a new token. A counter overflow is refused. Unchanged participants
+receive marker-only version guards, and uncertain outcomes are never replayed automatically.
+
+- `changes.dueDate: null` clears a known date schedule and its simple recurrence. The root
+  unlinks both; the recurrence is retired with `Deleted=1` and no Reminder backreference.
+  The exact date trigger is deleted before its alarm, in the same atomic batch.
+- Timed to all-day conversion requires `allDay: true` and the requested calendar date as an
+  explicit midnight-UTC `dueDate`; omit `timeZone`. It removes the stored zone and date alarm.
+  Reverse conversion requires `allDay: false`, an explicit instant and an IANA `timeZone`,
+  and creates a validated date-alarm pair while preserving an existing simple recurrence.
+- `changes.recurrence` edits an existing simple rule using `frequency` (`daily`, `weekly`,
+  `monthly`, `yearly`) and `interval` (1, or 2 for weekly). End dates, custom rules and creation
+  remain refused.
+- `changes.earlyReminder` edits one existing offset using positive `count` and `unit`
+  (`minutes` or `hours`); `null` removes it. Its account metadata is preserved. Creation is
+  refused when that metadata is absent, as are date clearing/conversion with an early reminder.
+- `changes.locationAlarm: { proximity: "arriving" | "leaving" }` edits one existing location
+  alarm while preserving its place, coordinates, radius and identity. A date move can preserve
+  that complete location pair alongside the absolute date pair. Location creation/removal,
+  radius edits, and clearing/conversion with a location alarm remain refused.
+- Parent dates do not cascade to children. A child's date update guards the exact same-list,
+  open root parent; unavailable, foreign, completed or nested parents are refused.
+
+These internal date-alarm deletions do not expose an arbitrary delete tool or permanently
+remove the Reminder itself. The ordinary reminder-delete tool continues to use soft deletion.
 
 ## Subtask relationships
 
@@ -183,11 +215,10 @@ authorized manifests, dispatch intent and results; it does not change Apple sess
 ### Prepared updates and bulk jobs
 
 `prepare_reminder_update` provides a read-only exact-version preview. Supported single-record
-and in-place linked-date
-updates receive a ten-minute owner/account/generation/request/graph-bound token, accepted as
+and bounded scheduling updates receive a ten-minute owner/account/generation/request/graph-bound token, accepted as
 optional `preparationToken` by `update_reminder`. Changed requests or stale graphs are rejected
 before dispatch. Linked-date previews include all modified/guarded versions and complete
-atomic record/byte counts. No recurrence anchor, relative-alarm or wall-clock reinterpretation
+atomic record/byte counts. No recurrence anchor or wall-clock reinterpretation
 policy is inferred; `policy` accepts only omission or an empty object.
 The API preview is `POST /api/reminder-updates/prepare`.
 See [linked protocol evidence and scope](linked-record-protocol.md).

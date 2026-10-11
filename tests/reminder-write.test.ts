@@ -177,3 +177,24 @@ test("completion, reopening and soft deletion preserve content/tokens and enforc
   rejects("complete", { ...current, fields: { ...current.fields, RecurrenceRuleIDs: { type: "STRING_LIST", value: ["RecurrenceRule/RULE-A"] } } }, "UNSUPPORTED_FEATURE");
   rejects("delete", { ...current, fields: { ...current.fields, ParentReminder: { type: "REFERENCE", value: { recordName: "Reminder/PARENT-A" } } } }, "UNSUPPORTED_FEATURE");
 });
+
+test("updates advance native resolution counters on the same replica and preserve unrelated tokens", () => {
+  const current = currentRecord();
+  const encoded = JSON.parse(String((current.fields.ResolutionTokenMap as { value: string }).value));
+  encoded.map.titleDocument.counter = 7; encoded.map.lastModifiedDate.counter = 9;
+  current.fields.ResolutionTokenMap = { type: "STRING", value: JSON.stringify(encoded) };
+  const request = { listId: baseInput.listId, reminderId: current.recordName, recordChangeTag: "tag-current", changes: { title: "Native counter edit" } };
+  const write = buildUpdateReminder(request, current, owner, 1_800_000_100_000);
+  const changed = JSON.parse(String(write.fields.ResolutionTokenMap.value)).map;
+  assert.equal(changed.titleDocument.counter, 8); assert.equal(changed.lastModifiedDate.counter, 10);
+  assert.equal(changed.titleDocument.replicaID, encoded.map.titleDocument.replicaID);
+  assert.equal(changed.lastModifiedDate.replicaID, encoded.map.lastModifiedDate.replicaID);
+  assert.ok(changed.titleDocument.modificationTime > encoded.map.titleDocument.modificationTime);
+  assert.deepEqual(changed.notesDocument, encoded.map.notesDocument);
+  const olderClock = buildUpdateReminder(request, current, owner, 1_799_999_000_000);
+  const older = JSON.parse(String(olderClock.fields.ResolutionTokenMap.value)).map;
+  assert.equal(older.titleDocument.counter, 8); assert.equal(older.titleDocument.modificationTime, encoded.map.titleDocument.modificationTime);
+  encoded.map.titleDocument.counter = Number.MAX_SAFE_INTEGER;
+  current.fields.ResolutionTokenMap = { type: "STRING", value: JSON.stringify(encoded) };
+  assert.throws(() => buildUpdateReminder(request, current, owner, 1_800_000_100_000), error => error instanceof AppError && error.code === "PROTOCOL_CHANGED");
+});

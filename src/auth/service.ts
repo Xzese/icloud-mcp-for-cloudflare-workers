@@ -17,7 +17,7 @@ import { PrepareUpdateInput, PreparedUpdateInput, createPreparation, checkPrepar
 import { JOB_TOOLS } from "../jobs/schemas.ts";
 import { EvidenceInput, AtomicProtectionInput, captureEvidenceGraph, sanitizeEvidence, verifyAtomicProtection } from "../reminders/evidence.ts";
 import { jobExecutionMode } from "../jobs/execution.ts";
-import { verifyLinkedDateWrite, type LinkedDateWrite } from "../reminders/linked-date.ts";
+import { verifySchedulingWrite, type SchedulingWrite } from "../reminders/scheduling-plan.ts";
 import { CreateSubtaskInput, HAS_SUBTASKS_MESSAGE, SetReminderParentInput, buildCreateSubtask, buildSetReminderParent, listChildren, requireNoChildren, subtaskParents } from "../reminders/subtasks.ts";
 
 export interface MutationHooks {
@@ -120,7 +120,8 @@ function verifyWriteFields(write: CloudKitWriteRecord, confirmed: CloudKitRecord
       if (reminder.parentReminderId !== expected) throw new WriteOutcomeUnknownError(write.recordName);
     } else if (key !== "List") {
       const actual = confirmed.fields[key];
-      if (!actual || typeof actual !== "object" || Array.isArray(actual) || !("type" in actual) || !("value" in actual) || actual.type !== field.type) throw new WriteOutcomeUnknownError(write.recordName);
+      if (field.value === null && !actual) continue;
+      if (!actual || typeof actual !== "object" || Array.isArray(actual) || !("type" in actual) || !("value" in actual) || (actual.type !== field.type && !(field.type === "UNKNOWN_LIST" && actual.type === "STRING_LIST" && Array.isArray(actual.value) && actual.value.length === 0))) throw new WriteOutcomeUnknownError(write.recordName);
       if (key === "ResolutionTokenMap") {
         if (typeof actual.value !== "string" || typeof field.value !== "string") throw new WriteOutcomeUnknownError(write.recordName);
         let expected: unknown, returned: unknown;
@@ -259,7 +260,7 @@ export class AppleConnectionService {
       return { generation: input.expectedGeneration, supported: plan.supported, classification: plan.classification, before: plan.before, after: plan.after,
         linkedFeatures: { alarms: reminder.alarmIds?.length ?? 0, recurrenceRules: reminder.recurrenceRuleIds?.length ?? 0, graphComplete: graph.complete },
         unsupportedReason: plan.unsupportedReason, preparationToken: token, expiresAt: token ? expiresAt : null, operationCount: plan.operationCount,
-        message: "Preparation is not user authorization. No reminder was modified. Timed absolute-date updates preserve the current alarm/trigger identities and recurrence rule; other linked recipes are explicitly unsupported." };
+        message: "Preparation is not user authorization. No reminder was modified. Supported scheduling recipes are validated against the exact current linked graph; unknown recipes are explicitly unsupported." };
     });
   }
   async validateJobLists(expectedGeneration: number, account: string, ids: string[]) {
@@ -413,10 +414,10 @@ export class AppleConnectionService {
           }
         } else {
           const update = omitField(omitField(input, "action"), "expectedGeneration");
-          let dependencies: LinkedDateWrite[] = [], dependencyRecords: CloudKitRecord[] = [], guards: CloudKitRecord[] = [];
+          let dependencies: SchedulingWrite[] = [], dependencyRecords: CloudKitRecord[] = [], guards: CloudKitRecord[] = [];
           if (input.action === "update") {
             write = buildReminderFieldUpdate({ listId: input.listId, reminderId: input.reminderId, recordChangeTag: input.recordChangeTag, changes: input.changes }, current!, owner);
-            if (["DueDate", "TimeZone", "AllDay"].some(key => Object.hasOwn(write.fields, key))) {
+            if (input.changes.locationAlarm !== undefined || input.changes.earlyReminder !== undefined || input.changes.recurrence || ["DueDate", "TimeZone", "AllDay"].some(key => Object.hasOwn(write.fields, key))) {
               const graph = await loadSchedulingGraph({ ...current!, zoneID: current!.zoneID ?? { zoneName: "Reminders", ownerRecordName: owner } },
                 owner, ids => client.lookupSchedulingRecords(ids));
               const request = UpdateReminderInput.parse({ listId: input.listId, reminderId: input.reminderId, recordChangeTag: input.recordChangeTag, changes: input.changes });
@@ -435,15 +436,16 @@ export class AppleConnectionService {
             write = buildLifecycleReminder(input.action, update, current!, owner);
             await requireNoChildren(client, owner, input.listId, targetId);
           }
-          const confirmations = dependencies.length ? await client.modifyLinkedDate(write, dependencies, dispatch, guards) :
+          const confirmations = dependencies.length || guards.length || ["AlarmIDs", "RecurrenceRuleIDs", "DueDateDeltaAlertsData"].some(key => Object.hasOwn(write.fields, key)) ? await client.modifyScheduling(write, dependencies, dispatch, guards) :
             [await client.modifyReminder("update", write, dispatch)];
+          if (!("recordType" in confirmations[0])) throw new WriteOutcomeUnknownError(targetId);
           confirmed = confirmations[0];
           stage.confirm();
           applied = true;
           verifyWriteFields(write, confirmed, current!, owner, input.listId);
           for (const dependency of dependencies) {
-            verifyLinkedDateWrite(dependency, dependencyRecords.find(record => record.recordName === dependency.recordName)!,
-              confirmations.find(record => record.recordName === dependency.recordName)!);
+            verifySchedulingWrite(dependency, dependencyRecords.find(record => record.recordName === dependency.recordName)!,
+              confirmations.find(record => record.recordName === dependency.recordName)!, owner);
           }
         }
         const record = omitField(normalizeReminder(confirmed, owner), "raw");

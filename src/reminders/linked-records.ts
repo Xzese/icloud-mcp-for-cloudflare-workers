@@ -11,6 +11,7 @@ export interface SchedulingGraph {
   fingerprint: string;
   complete: boolean;
   unsupportedReason: string | null;
+  schedulingParent?: CloudKitRecord;
 }
 
 export async function loadSchedulingGraph(
@@ -23,7 +24,7 @@ export async function loadSchedulingGraph(
   let bytes = 0;
   const add = (record: CloudKitRecord) => {
     if (!SCHEDULING_TYPES.some(type => type === record.recordType) || !record.recordName.startsWith(`${record.recordType}/`) || !record.recordChangeTag || record.deleted ||
-      record.zoneID?.zoneName !== "Reminders" || ![owner, "__defaultOwner__"].includes(record.zoneID.ownerRecordName ?? owner)) {
+      record.zoneID?.zoneName !== "Reminders" || record.zoneID.zoneType !== undefined && record.zoneID.zoneType !== "REGULAR_CUSTOM_ZONE" || ![owner, "__defaultOwner__"].includes(record.zoneID.ownerRecordName ?? owner)) {
       throw new AppError("PROTOCOL_CHANGED", "The scheduling graph has an invalid identity, zone, state or version.");
     }
     if (records.has(record.recordName)) throw new AppError("PROTOCOL_CHANGED", "The scheduling graph contains duplicate or cyclic links.");
@@ -66,8 +67,18 @@ export async function loadSchedulingGraph(
       add({ ...record, zoneID: record.zoneID ?? reminder.zoneID });
     }
   }
-  const unsupportedReason = normalized.parentReminderId ? "Parent/subtask scheduling is not supported." : null;
+  let schedulingParent: CloudKitRecord | undefined;
+  if (normalized.parentReminderId) {
+    const found = await lookup([normalized.parentReminderId]);
+    if (!found.complete || found.recordErrors.length || found.unresolvedRecordNames.length || found.records.length !== 1 || !("recordType" in found.records[0])) throw new AppError("CONFLICT", "The exact scheduling parent could not be resolved.", 409);
+    schedulingParent = { ...found.records[0], zoneID: found.records[0].zoneID ?? reminder.zoneID };
+    const parent = normalizeReminder(schedulingParent, owner);
+    if (schedulingParent.recordName !== normalized.parentReminderId || parent.listId !== normalized.listId || parent.completed !== false || parent.deleted !== false || parent.parentReminderId) throw new AppError("UNSUPPORTED_FEATURE", "Subtask scheduling requires an open root parent in the same list.");
+    add(schedulingParent);
+    edges.push({ from: reminder.recordName, to: schedulingParent.recordName });
+  }
+  const unsupportedReason = null;
   const sorted = [...records.values()].sort((a, b) => a.recordName.localeCompare(b.recordName));
   return { reminder, records: sorted, edges, complete: true,
-    unsupportedReason, fingerprint: await fingerprint({ records: sorted.map(record => ({ id: record.recordName, type: record.recordType, version: record.recordChangeTag, zone: record.zoneID, fields: record.fields })), edges: [...edges].sort((a, b) => a.to.localeCompare(b.to)) }) };
+    unsupportedReason, ...(schedulingParent ? { schedulingParent } : {}), fingerprint: await fingerprint({ records: sorted.map(record => ({ id: record.recordName, type: record.recordType, version: record.recordChangeTag, zone: record.zoneID, fields: record.fields })), edges: [...edges].sort((a, b) => a.to.localeCompare(b.to)) }) };
 }

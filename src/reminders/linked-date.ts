@@ -14,6 +14,7 @@ export const DateComponents = z.object({
   era: z.literal(1), year: z.number().int().min(1).max(9999), month: z.number().int().min(1).max(12),
   day: z.number().int().min(1).max(31), hour: z.number().int().min(0).max(23),
   minute: z.number().int().min(0).max(59), second: z.number().int().min(0).max(59), timeZone: TimeZone,
+  nanosecond: z.literal(0).optional(),
 }).strict().refine(value => {
   const date = new Date(0);
   date.setUTCFullYear(value.year, value.month - 1, value.day);
@@ -32,7 +33,7 @@ function field(record: CloudKitRecord, name: string, type: string): unknown {
   }
   return wrapper.value;
 }
-export function dateComponents(due: string, timeZone: string) {
+export function dateComponents(due: string, timeZone: string, includeZeroNanosecond = false) {
   const date = new Date(due);
   if (!Number.isSafeInteger(date.getTime()) || date.getUTCMilliseconds() !== 0 || date.getUTCFullYear() < 1 || date.getUTCFullYear() > 9999) {
     throw new AppError("VALIDATION_ERROR", "Linked dates require an explicit instant with whole-second precision in years 1-9999.", 400);
@@ -46,7 +47,7 @@ export function dateComponents(due: string, timeZone: string) {
   if (parts.find(part => part.type === "era")?.value !== "AD") throw new AppError("VALIDATION_ERROR", "The linked date is outside the supported Gregorian calendar range.", 400);
   const value = (type: string) => Number(parts.find(part => part.type === type)?.value);
   const result = DateComponents.safeParse({ era: 1, year: value("year"), month: value("month"), day: value("day"),
-    hour: value("hour"), minute: value("minute"), second: value("second"), timeZone: { identifier: timeZone } });
+    hour: value("hour"), minute: value("minute"), second: value("second"), timeZone: { identifier: timeZone }, ...(includeZeroNanosecond ? { nanosecond: 0 } : {}) });
   if (!result.success) throw new AppError("VALIDATION_ERROR", "The linked date is outside the supported Gregorian calendar range.", 400);
   // The trigger format has no UTC-offset/fold field. Refuse a repeated local
   // time rather than claim it can distinguish the two fall-back occurrences.
@@ -97,7 +98,7 @@ export function linkedDatePlan(graph: SchedulingGraph, write: CloudKitWriteRecor
   const due = write.fields.DueDate ? write.fields.DueDate.value : reminder.dueDate === null ? null : Date.parse(reminder.dueDate);
   const zone = write.fields.TimeZone ? write.fields.TimeZone.value : reminder.timeZone;
   const allDay = write.fields.AllDay ? write.fields.AllDay.value === 1 : reminder.allDay;
-  if (!graph.complete || reminder.parentReminderId || reminder.completed !== false || reminder.deleted !== false ||
+  if (!graph.complete || reminder.parentReminderId && graph.schedulingParent?.recordName !== reminder.parentReminderId || reminder.completed !== false || reminder.deleted !== false ||
     reminder.startDate !== null || reminder.allDay !== false || allDay !== false || reminder.dueDate === null || !reminder.timeZone ||
     typeof due !== "number" || !Number.isSafeInteger(due) || typeof zone !== "string" ||
     reminder.alarmIds?.length !== 1 || (reminder.recurrenceRuleIds?.length ?? 0) > 1) {
@@ -106,7 +107,7 @@ export function linkedDatePlan(graph: SchedulingGraph, write: CloudKitWriteRecor
   const alarm = graph.records.find(record => record.recordName === reminder.alarmIds![0]);
   const triggers = graph.records.filter(record => record.recordType === "AlarmTrigger");
   const rule = graph.records.find(record => record.recordType === "RecurrenceRule");
-  if (!alarm || alarm.recordType !== "Alarm" || triggers.length !== 1 || graph.records.length !== (rule ? 4 : 3)) {
+  if (!alarm || alarm.recordType !== "Alarm" || triggers.length !== 1 || graph.records.length !== (rule ? 4 : 3) + (graph.schedulingParent ? 1 : 0)) {
     throw new AppError("UNSUPPORTED_FEATURE", "The date graph does not contain exactly the expected current alarm, trigger and optional recurrence.");
   }
   const trigger = triggers[0];
@@ -124,7 +125,8 @@ export function linkedDatePlan(graph: SchedulingGraph, write: CloudKitWriteRecor
   }
   if (rule && referenceField(rule, "Reminder", "Reminder", owner) !== reminder.id) throw new AppError("PROTOCOL_CHANGED", "The recurrence belongs to a different reminder.");
   const oldComponents = decodeDateComponents(field(trigger, "DateComponentsData", "BYTES"));
-  if (canonicalJSON(oldComponents) !== canonicalJSON(dateComponents(reminder.dueDate, reminder.timeZone)) ||
+  const includeZeroNanosecond = Object.hasOwn(oldComponents, "nanosecond");
+  if (canonicalJSON(oldComponents) !== canonicalJSON(dateComponents(reminder.dueDate, reminder.timeZone, includeZeroNanosecond)) ||
     field(alarm, "DueDateResolutionTokenAsNonce", "DOUBLE") !== dueDateNonce(field(graph.reminder, "ResolutionTokenMap", "STRING"))) {
     throw new AppError("CONFLICT", "The current date, resolution token and alarm/trigger disagree; wait for synchronization and review again.", 409);
   }
@@ -134,7 +136,7 @@ export function linkedDatePlan(graph: SchedulingGraph, write: CloudKitWriteRecor
       DueDateResolutionTokenAsNonce: { type: "DOUBLE", value: dueDateNonce(tokenMap) },
     } },
     { recordName: trigger.recordName, recordType: "AlarmTrigger", recordChangeTag: trigger.recordChangeTag!, fields: {
-      DateComponentsData: { type: "BYTES", value: b64(utf8(JSON.stringify(dateComponents(new Date(due).toISOString(), zone)))) },
+      DateComponentsData: { type: "BYTES", value: b64(utf8(JSON.stringify(dateComponents(new Date(due).toISOString(), zone, includeZeroNanosecond)))) },
     } },
   ];
   return { dependencies, guards: rule ? [rule] : [] };

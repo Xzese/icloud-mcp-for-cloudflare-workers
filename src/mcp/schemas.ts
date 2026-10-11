@@ -128,7 +128,7 @@ export const ConnectionStatusOutput = z.object({
   message: z.string(),
 }).strict();
 
-const schedule = z.object({ dueDate: text, timeZone: text, allDay: flag }).strict();
+const schedule = z.object({ locationAlarm: z.object({ proximity: z.enum(["arriving", "leaving"]) }).strict().nullable(), dueDate: text, timeZone: text, allDay: flag, recurrence: z.object({ frequency: z.enum(["daily", "weekly", "monthly", "yearly"]), interval: counter }).strict().nullable(), earlyReminder: z.object({ unit: z.enum(["minutes", "hours"]), count: counter }).strict().nullable() }).strict();
 export const PrepareUpdateOutput = z.object({
   generation: counter, supported: z.boolean(), classification: z.enum(["single-record", "linked-date", "unverified-linked-schedule"]),
   before: schedule, after: schedule.nullable(), linkedFeatures: z.object({ alarms: counter, recurrenceRules: counter, graphComplete: z.boolean() }).strict(),

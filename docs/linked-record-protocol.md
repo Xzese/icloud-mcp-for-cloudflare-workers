@@ -16,10 +16,13 @@ captures and not an acceptance oracle.
 | Simple reminder edit | Existing single-record builder, exact version and confirmation checks. |
 | Timed recurring active-occurrence date/time-zone change | Supported with one current absolute date alarm, preserving recurrence and linked IDs. |
 | Timed absolute date alarm, with optional recurrence | Supported in-place Reminder/Alarm/AlarmTrigger atomic recipe below. |
-| Linked date clearing or timed/all-day conversion | Blocked independently; no UTC/calendar-date or DST policy is inferred. |
-| Location alarm / unknown recurrence or scheduling field | Blocked. |
+| Linked date clearing or timed/all-day conversion | Supported for the known date pair with explicit calendar-date/instant inputs; no location or early reminder during conversion. |
+| Existing location alarm | One known location pair can be preserved during a date move or have its arriving/leaving proximity edited. Creation/removal/radius edits remain blocked. |
+| Existing early reminder | One minutes/hours offset can be edited or removed; missing account metadata prevents creation. |
+| Existing simple recurrence | Daily/weekly/monthly/yearly interval 1, or weekly interval 2; custom/end/anchor/creation edits remain blocked. |
+| Unknown recurrence or scheduling field | Blocked. |
 | Completed historical occurrence | Cannot be rescheduled, reopened implicitly or redirected to a successor. |
-| Parent/subtask scheduling | Blocked: commit-time protection unverified. |
+| Parent/subtask scheduling | Independent parent dates; child dates guard the exact open root parent in the same list. No cascade or deeper nesting. |
 | Bulk deletion of simple reminders | Supported per item with single-delete checks; post-commit subtask report, no prevention claim. |
 
 The internal allowlisted lookup accepts only Reminder, Alarm, AlarmTrigger and RecurrenceRule
@@ -374,13 +377,16 @@ a later recurring completion were **not** verified by this API acceptance.
 
 For this validated graph, the nonce is
 `dueDate.counter * 100000000000 + dueDate.modificationTime`. The original native token had
-counter 5; connector writes used a new replica UUID and counter 1, preserved unrelated tokens,
-and were accepted with matching readback. A zone-only edit keeps the existing due-date token
+counter 5; the historical API-only acceptance reset the counter to 1 and was accepted with
+matching server readback. Later Apple-app verification exposed that reset as insufficient:
+existing tokens must retain their replica ID and advance their counter. The current builder
+implements that correction. A zone-only edit keeps the existing due-date token
 and nonce and reconstructs components for the same instant in the new zone. Synthetic
 coverage exercises that path; the live move/restore changed only the date.
 
-The planner requires an open, nondeleted, timed root with a due instant and IANA zone,
-one bidirectionally linked absolute date alarm/trigger and at most one unchanged recurrence.
+The absolute-date planner requires an open, nondeleted, timed reminder with a due instant
+and IANA zone, one bidirectionally linked absolute date alarm/trigger and at most one recurrence.
+The expanded planner separately validates an optional location pair and subtask parent.
 The current token, nonce and decoded components must agree before any write. Components
 must be whole-second Gregorian values with the observed field set, within years 1-9999;
 unknown fields or calendar semantics are never dropped. The selected instant is converted
@@ -395,7 +401,43 @@ response: the former refuses the entire group, the latter returns uncertainty wi
 Structural graph completeness and recipe approval remain distinct. No rollout flag controls
 this support; capability reporting reflects session availability, not support for every graph.
 
-Date/zone clearing, all-day conversion, start dates, relative/location/multiple alarms,
-nested scheduling, recurrence-rule edits and lifecycle advancement still require different
-recipes. These are explicit unsupported operations, not hidden deployment toggles.
+The expanded recipes below cover bounded clearing, conversion, existing early/location
+alarms, simple recurrence edits and one-level child scheduling. Start dates, unknown/multiple
+alarms of the same type, custom recurrence and lifecycle advancement remain refused.
 Simple bulk deletion is permanent; it reports post-commit subtasks rather than preventing them.
+
+## Native transition captures and expanded scheduling acceptance
+
+Controlled October 2026 captures used synthetic reminders in the dedicated Test list.
+Native changes established calendar-date conversion, removal of the date alarm/trigger,
+simple recurrence frequencies and fortnightly interval, early-reminder offset payloads, and
+location arriving/leaving records after selecting a suggested public station.
+
+The native resolution map preserves each existing field's replica ID and increments its
+counter (observed 2→3→4→5). Resetting an existing counter to 1 can produce a successful server
+write that the Apple app does not apply. Updates now advance those counters, preserve unrelated
+tokens and derive the absolute alarm nonce from the resulting due-date token.
+
+Retirement probes established that a stale delete version rejects the full atomic batch,
+and that the trigger must be deleted before its alarm. A reversed order produces an atomic
+validating-reference rejection. Successful retirement returns exact identity-only tombstones;
+subsequent lookups return `NOT_FOUND`. Recurrence retirement retains the native soft marker
+and removes its Reminder backreference. The public transport permits this bounded alarm-pair
+retirement only, never hard deletion of a Reminder or arbitrary caller-selected records.
+
+The expanded recipes and explicit input examples are documented in
+[write access](write-access.md#additional-scheduling-recipes). Private captures remain ignored;
+checked-in fixtures use invented identities and account metadata. Actual notification delivery,
+custom recurrence anchors/end dates, location creation/removal and early-reminder creation
+without independently established account metadata remain outside the verified scope.
+
+Final controlled connector checks confirmed and visually inspected recurring-date clearing,
+timed→all-day conversion, a subsequent all-day date move, reverse timed conversion, existing
+fortnightly/yearly rule edits, a combined date/location/one-hour-early update, early removal,
+and independent parent/child dates. Clearing also read back both retired date records as
+`NOT_FOUND` and the recurrence as `Deleted=1` without its Reminder backreference. The station
+selection preserved its 412-metre radius during connector edits. Session generation and the
+absolute retained-session deadline were unchanged throughout. A reverse-conversion response
+with omitted record zone triggered uncertainty and was reconciled read-only; confirmation
+validation now uses the authenticated owner for its expanded references rather than relying
+on optional record-level zone metadata. No uncertain mutation was replayed.

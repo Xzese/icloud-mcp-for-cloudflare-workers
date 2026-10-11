@@ -11,7 +11,7 @@ const EnvelopeSchema = z.object({ version: z.literal(1), keyId: z.string().min(1
 const Token = z.object({ requestHash: z.string().regex(/^[a-f0-9]{64}$/), graphFingerprint: z.string().regex(/^[a-f0-9]{64}$/), expiresAt: z.number().int().safe().positive() }).strict();
 export const PreparationToken = z.string().min(1).max(12_288).describe("Expiring owner/account/session-bound preparation token; not user authorization.");
 export const PreparedUpdateInput = UpdateReminderInput.extend({ preparationToken: PreparationToken.optional() }).strict();
-export const PrepareUpdateInput = UpdateReminderInput.extend({ expectedGeneration: z.number().int().nonnegative().safe().describe("Required Apple session generation from connection_status."), policy: SchedulePolicy.optional().describe("Only an empty object or omission is accepted. Supported timed absolute-date edits preserve alarm/trigger identities and recurrence; no recurrence anchor, relative alarm or wall-clock reinterpretation is requested.") }).strict();
+export const PrepareUpdateInput = UpdateReminderInput.extend({ expectedGeneration: z.number().int().nonnegative().safe().describe("Required Apple session generation from connection_status."), policy: SchedulePolicy.optional().describe("Only an empty object or omission is accepted. Calendar conversion uses an explicit midnight-UTC dueDate; no implicit wall-clock reinterpretation or recurrence anchor policy is accepted.") }).strict();
 export function preparationContext(owner: string, account: string, generation: number, recordId: string): EnvelopeContext {
   return { ownerId: owner, accountId: account, generation, recordId: `reminder-preparation-v1/${recordId}`, schemaVersion: 1 };
 }
