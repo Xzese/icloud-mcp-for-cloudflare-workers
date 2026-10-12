@@ -139,7 +139,7 @@ function newResolutionToken(modificationTime: number): { counter: number; modifi
   return { counter: 1, modificationTime, replicaID: crypto.randomUUID().toUpperCase() };
 }
 
-function createResolutionTokenMap(fieldNames: readonly string[], nowMs: number): string {
+export function createResolutionTokenMap(fieldNames: readonly string[], nowMs: number): string {
   const modificationTime = nowMs / 1000 - APPLE_EPOCH_SECONDS;
   const map: Record<string, ReturnType<typeof newResolutionToken>> = Object.create(null) as Record<string, ReturnType<typeof newResolutionToken>>;
   for (const fieldName of fieldNames) map[fieldName] = newResolutionToken(modificationTime);

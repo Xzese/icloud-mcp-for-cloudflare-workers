@@ -121,11 +121,13 @@ export async function verifyReminderWrites(options) {
       state.requests.push({ method: request.method, path: url.pathname });
       const body = request.method === "POST" ? await request.clone().json() : undefined;
       if (url.pathname.endsWith("/records/query")) {
-        if (body.query.recordType === "Lists") return jsonResponse({ records: [state.records.get(listId)] });
+        if (body.query.recordType === "Lists") return jsonResponse({ records: [...state.records.values()].filter(record => record.recordType === "List") });
         assert.equal(body.query.recordType, "reminderList");
-        assert.equal(body.query.filterBy.find(filter => filter.fieldName === "List").fieldValue.value.recordName, listId);
+        const requestedList = body.query.filterBy.find(filter => filter.fieldName === "List").fieldValue.value.recordName;
+        if (state.nextListQuery) { const response = state.nextListQuery; state.nextListQuery = null; return jsonResponse(response); }
+        assert.ok(state.records.get(requestedList)?.recordType === "List");
         const includeCompleted = body.query.filterBy.find(filter => filter.fieldName === "includeCompleted").fieldValue.value === 1;
-        const records = [...state.records.values()].filter(record => record.recordType === "Reminder" && record.fields.List.value.recordName === listId && record.fields.Deleted.value === 0 && (includeCompleted || record.fields.Completed.value === 0));
+        const records = [...state.records.values()].filter(record => record.recordType === "Reminder" && record.fields.List.value.recordName === requestedList && record.fields.Deleted.value === 0 && (includeCompleted || record.fields.Completed.value === 0));
         return jsonResponse({ records: records.map(record => state.foreignZoneIds.has(record.recordName)
           ? { ...record, zoneID: { ...record.zoneID, ownerRecordName: "synthetic-foreign-owner" } } : record) });
       }
@@ -254,7 +256,7 @@ export async function verifyReminderWrites(options) {
           return jsonResponse({ records: records.reverse() });
         }
         assert.equal(body.operations.length, 1, "Each controlled action sends one exact reminder write.");
-        assert.equal(operation.record.recordType, "Reminder");
+        assert.ok(["Reminder", "List"].includes(operation.record.recordType));
         state.modifies.push({ operationType: operation.operationType, recordName: operation.record.recordName, recordChangeTag: operation.record.recordChangeTag, fields: Object.keys(operation.record.fields).sort() });
         const action = state.nextModify;
         state.nextModify = null;
@@ -369,7 +371,7 @@ export async function verifyReminderWrites(options) {
 
     const toolsReply = await mcp("tools/list", {});
     const tools = toolsReply.result.tools;
-    assert.deepEqual(tools.map(tool => tool.name).sort(), ["complete_reminder", "connection_status", "create_reminder", "create_subtask", "set_reminder_parent", "delete_reminder", "get_all_open_reminders", "get_reminder", "get_reminder_lists", "get_reminders", "reopen_reminder", "update_reminder", "prepare_reminder_update", ...JOB_TOOLS].sort());
+    assert.deepEqual(tools.map(tool => tool.name).sort(), ["complete_reminder", "connection_status", "create_reminder", "create_subtask", "set_reminder_parent", "delete_reminder", "get_all_open_reminders", "get_reminder", "get_reminder_lists", "get_reminder_list", "create_reminder_list", "rename_reminder_list", "delete_reminder_list", "get_reminders", "reopen_reminder", "update_reminder", "prepare_reminder_update", ...JOB_TOOLS].sort());
     const createTool = tools.find(tool => tool.name === "create_reminder");
     const updateTool = tools.find(tool => tool.name === "update_reminder");
     assert.deepEqual({ readOnly: createTool.annotations.readOnlyHint, destructive: createTool.annotations.destructiveHint, idempotent: createTool.annotations.idempotentHint }, { readOnly: false, destructive: false, idempotent: true });
@@ -1021,6 +1023,102 @@ export async function verifyReminderWrites(options) {
       assert.ok(state.modifies.at(-1).fields.every(key => !["DueDate", "TimeZone", "AllDay"].includes(key)));
     } finally { await dateHarness.worker.dispose(); }
 
+    // Standard list lifecycle follows native shapes, including missing Count/zone metadata.
+    const listHarness = await makeWorker();
+    try {
+      const { state, mcp } = listHarness;
+      const generation = await listHarness.seedReady();
+      await mcp("tools/list", {});
+      const callList = async (name, args) => {
+        const response = await mcp("tools/call", { name, arguments: { ...args, expectedGeneration: generation } });
+        return response.result;
+      };
+      const name = "Synthetic standard list 📝", key = randomUUID(), id = `List/${key.toUpperCase()}`;
+      const creationReply = await callList("create_reminder_list", { name, idempotencyKey: key });
+      assert.equal(creationReply.isError, undefined, JSON.stringify(creationReply));
+      const created = creationReply.structuredContent;
+      assert.equal(created.list.id, id); assert.equal(created.list.title, name);
+      assert.equal(created.list.count, null, "Native standard lists omit Count.");
+      assert.equal(created.replayed, false);
+      assert.equal(state.records.get(id).fields.IsLinkedToAccount.value, 1);
+      assert.equal(state.records.get(id).fields.ShouldAutoCategorizeItems.isEncrypted, true);
+      assert.equal(state.records.get(id).fields.Name.isEncrypted, true);
+      const writes = state.modifies.length;
+      assert.equal((await callList("create_reminder_list", { name, idempotencyKey: key })).structuredContent.replayed, true);
+      assert.equal((await callList("create_reminder_list", { name: "Different", idempotencyKey: key })).structuredContent.error.code, "CONFLICT");
+      assert.equal(state.modifies.length, writes);
+      state.omitLookupZoneIds.add(id);
+      const exact = (await callList("get_reminder_list", { listId: id })).structuredContent.list;
+      assert.equal(exact.id, id); assert.equal(exact.recordChangeTag, created.list.recordChangeTag);
+      const original = structuredClone(state.records.get(id));
+      const rename = { listId: id, recordChangeTag: exact.recordChangeTag, name: "Renamed synthetic list" };
+      const renamed = (await callList("rename_reminder_list", rename)).structuredContent.list;
+      assert.equal(renamed.title, rename.name);
+      const current = state.records.get(id);
+      for (const [fieldName, field] of Object.entries(original.fields))
+        if (!["Name", "ResolutionTokenMap"].includes(fieldName)) assert.deepEqual(current.fields[fieldName], field);
+      const beforeMap = JSON.parse(original.fields.ResolutionTokenMap.value).map;
+      const afterMap = JSON.parse(current.fields.ResolutionTokenMap.value).map;
+      assert.equal(afterMap.name.replicaID, beforeMap.name.replicaID);
+      assert.equal(afterMap.name.counter, beforeMap.name.counter + 1);
+      for (const fieldName of Object.keys(beforeMap)) if (fieldName !== "name") assert.deepEqual(afterMap[fieldName], beforeMap[fieldName]);
+      const beforeRefusal = state.modifies.length;
+      assert.equal((await callList("rename_reminder_list", rename)).structuredContent.error.code, "CONFLICT");
+      const deletion = { listId: id, recordChangeTag: renamed.recordChangeTag, confirmName: renamed.title };
+      assert.equal((await callList("delete_reminder_list", { ...deletion, confirmName: "Wrong name" })).structuredContent.error.code, "CONFLICT");
+      state.omitLookupZoneIds.delete(id);
+      state.foreignZoneIds.add(id);
+      assert.equal((await callList("rename_reminder_list", { ...rename, recordChangeTag: renamed.recordChangeTag })).isError, true);
+      state.foreignZoneIds.delete(id);
+      state.omitLookupZoneIds.add(id);
+      const group = structuredClone(current); group.fields.IsGroup = field("INT64", 1); state.records.set(id, group);
+      assert.equal((await callList("delete_reminder_list", deletion)).structuredContent.error.code, "UNSUPPORTED_FEATURE");
+      state.records.set(id, current);
+      const member = reminderRecord(`Reminder/${randomUUID().toUpperCase()}`);
+      member.fields.List.value.recordName = id; member.fields.Completed = field("INT64", 1); state.records.set(member.recordName, member);
+      assert.equal((await callList("delete_reminder_list", deletion)).structuredContent.error.code, "UNSUPPORTED_FEATURE", "Completed reminders must prevent deletion even when membership appears empty.");
+      member.fields.Completed = field("INT64", 0);
+      assert.equal((await callList("delete_reminder_list", deletion)).structuredContent.error.code, "UNSUPPORTED_FEATURE");
+      assert.equal(state.modifies.length, beforeRefusal, "All preflight refusals must avoid writes.");
+      state.records.delete(member.recordName);
+      state.nextListQuery = { records: [{ recordName: "Reminder/PAGE-FAIL", serverErrorCode: "NOT_FOUND" }] };
+      assert.equal((await callList("delete_reminder_list", deletion)).structuredContent.error.code, "UNSUPPORTED_FEATURE");
+      assert.equal(state.modifies.length, beforeRefusal);
+      state.nextModify = "record-conflict";
+      assert.equal((await callList("delete_reminder_list", deletion)).structuredContent.error.code, "CONFLICT", "Definitive atomic rejection must not be reported as an unknown write.");
+      assert.equal(state.records.get(id).fields.Deleted.value, 0);
+      state.nextListQuery = { records: [], continuationMarker: "synthetic-empty-next" };
+      const beforeEmptyPages = state.requests.filter(request => request.path.endsWith("/records/query")).length;
+      const deleted = (await callList("delete_reminder_list", deletion)).structuredContent.list;
+      assert.equal(state.requests.filter(request => request.path.endsWith("/records/query")).length, beforeEmptyPages + 2, "Empty-list deletion must follow a valid continued page before writing.");
+      assert.equal(deleted.deleted, true); assert.equal(state.records.get(id).fields.IsLinkedToAccount.value, 0);
+      assert.equal((await callList("get_reminder_list", { listId: id })).structuredContent.list.deleted, true);
+      const afterDeletion = state.modifies.length;
+      assert.equal((await callList("delete_reminder_list", deletion)).isError, true);
+      assert.equal(state.modifies.length, afterDeletion);
+      assert.equal(state.records.get(listId).fields.Deleted.value, 0, "Unrelated lists remain intact.");
+
+      const uncertainKey = randomUUID(), uncertainId = `List/${uncertainKey.toUpperCase()}`;
+      const uncertainInput = { name: "Lost list creation response", idempotencyKey: uncertainKey };
+      state.nextModify = "committed-network-drop";
+      const beforeUnknown = state.modifies.length;
+      const unknownError = (await callList("create_reminder_list", uncertainInput)).structuredContent.error;
+      assert.equal(unknownError.code, "WRITE_OUTCOME_UNKNOWN");
+      assert.equal(unknownError.listId, uncertainId); assert.equal(unknownError.reminderId, undefined);
+      assert.match(unknownError.message, /get_reminder_list/);
+      assert.equal(state.modifies.length, beforeUnknown + 1);
+      assert.equal((await callList("get_reminder_list", { listId: uncertainId })).structuredContent.list.title, uncertainInput.name);
+      assert.equal((await callList("create_reminder_list", uncertainInput)).structuredContent.replayed, true);
+      assert.equal(state.modifies.length, beforeUnknown + 1, "Read-only creation reconciliation must not replay a committed request.");
+      const beforeLostDelete = state.modifies.length;
+      const unknownList = (await callList("get_reminder_list", { listId: uncertainId })).structuredContent.list;
+      state.nextModify = "committed-network-drop";
+      assert.equal((await callList("delete_reminder_list", { listId: uncertainId, recordChangeTag: unknownList.recordChangeTag, confirmName: unknownList.title })).structuredContent.error.code, "WRITE_OUTCOME_UNKNOWN");
+      assert.equal((await callList("get_reminder_list", { listId: uncertainId })).structuredContent.list.deleted, true);
+      assert.equal(state.modifies.length, beforeLostDelete + 1);
+
+    } finally { await listHarness.worker.dispose(); }
+
     return { checks: [
       "login-owner-origin-denial-before-state-or-Apple-access",
       "MCP-discovery-annotations-Unicode-create-and-idempotent-reconciliation",
@@ -1049,6 +1147,8 @@ export async function verifyReminderWrites(options) {
       "observed-parents-refuse-noncascading-lifecycle-writes",
       "permanent-linked-date-preview-atomic-update-stale-dependency-and-unknown-no-retry",
       "API-linked-zone-change-preserves-instant-and-token-and-unrelated-text-edits",
+      "native-standard-list-create-rename-empty-delete-and-unknown-reconciliation",
+      "list-metadata-omissions-completed-items-stale-version-and-owner-group-refusals",
     ] };
   } finally {
     if (workerHarness) await workerHarness.worker.dispose();

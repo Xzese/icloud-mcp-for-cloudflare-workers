@@ -1,5 +1,6 @@
 import { AppError, WriteOutcomeUnknownError, requireValue as requireInput } from "../errors.ts";
 import type { CloudKitWriteRecord } from "../reminders/writes.ts";
+import type { ListWrite } from "../reminders/list-writes.ts";
 import { decodeDateComponents, type LinkedDateWrite } from "../reminders/linked-date.ts";
 import { LOCATION_ENCRYPTED_FIELDS, validLocationMutation } from "../reminders/location-alarm.ts";
 import { validRecurrenceMutation, validRecurrenceCreation } from "../reminders/recurrence.ts";
@@ -571,6 +572,75 @@ export class CloudKitRemindersClient {
     }
     parseTopLevelError(result, { path, upstreamStatus: response.status, hasSessionCookie });
     return result;
+  }
+
+  async modifyList(operationType: "create" | "update", record: ListWrite, beforeDispatch: () => Promise<void>): Promise<CloudKitRecord> {
+    requireInput((operationType === "create" || operationType === "update") && this.owner !== undefined &&
+      record.recordType === "List" && record.recordName.length <= 255,
+      "Only authenticated private list writes are supported.");
+    requestedRecordName(record.recordName, ["List"]);
+    const createFields = ["Name", "SortingStyle", "IsLinkedToAccount", "Imported", "IsGroup", "Deleted", "ReminderIDs",
+      "ShouldAutoCategorizeItems", "ShouldCategorizeGroceryItems", "ResolutionTokenMap"];
+    const renameFields = ["Name", "ResolutionTokenMap"];
+    const deleteFields = ["Deleted", "IsLinkedToAccount", "ResolutionTokenMap"];
+    const keys = Object.keys(record.fields);
+    const sameKeys = (expected: string[]) => keys.length === expected.length && expected.every(key => Object.hasOwn(record.fields, key));
+    requireInput(operationType === "create" ? sameKeys(createFields) : sameKeys(renameFields) || sameKeys(deleteFields),
+      "Unexpected list write field set.");
+    requireInput(operationType === "create" ? record.recordChangeTag === undefined :
+      typeof record.recordChangeTag === "string" && record.recordChangeTag.length > 0 && record.recordChangeTag.length <= 512,
+      "A list update requires an exact version tag.");
+    for (const [key, field] of Object.entries(record.fields)) {
+      const type = ["Name", "SortingStyle", "ReminderIDs", "ResolutionTokenMap"].includes(key) ? "STRING" : "INT64";
+      const encrypted = key === "Name" || key === "ShouldAutoCategorizeItems" || key === "ShouldCategorizeGroceryItems";
+      requireInput(field !== null && typeof field === "object" && !Array.isArray(field) &&
+        Object.keys(field).every(name => name === "type" || name === "value" || name === "isEncrypted") &&
+        field.type === type && (encrypted ? field.isEncrypted === true && Object.hasOwn(field, "isEncrypted") : !Object.hasOwn(field, "isEncrypted")) &&
+        (type === "STRING" ? typeof field.value === "string" : Number.isSafeInteger(field.value)),
+      "Invalid list write field.");
+    }
+    if (operationType === "create") {
+      requireInput(record.fields.SortingStyle.value === "manual" && record.fields.IsLinkedToAccount.value === 1 &&
+        record.fields.Imported.value === 0 && record.fields.IsGroup.value === 0 && record.fields.Deleted.value === 0 &&
+        record.fields.ReminderIDs.value === "[]" && record.fields.ShouldAutoCategorizeItems.value === 0 &&
+        record.fields.ShouldCategorizeGroceryItems.value === 0,
+      "The list creation fields do not match the observed native shape.");
+    } else if (sameKeys(renameFields)) {
+      requireInput(record.fields.Name.type === "STRING", "A list rename requires a name.");
+    } else {
+      requireInput(record.fields.Deleted.value === 1 && record.fields.IsLinkedToAccount.value === 0,
+        "The list deletion fields do not match the observed native shape.");
+    }
+    const payload = { zoneID: this.requestZone, atomic: true, operations: [{ operationType, record }] };
+    requireInput(new TextEncoder().encode(JSON.stringify(payload)).length <= MAX_REQUEST_BYTES, "List write exceeded the request budget.");
+    await beforeDispatch();
+    try {
+      const result = await this.post("/records/modify", payload);
+      const parsed = pageRecords(result.records, 1, 1, this.expectedOwner);
+      if (parsed.recordErrors.length) {
+        requireValue(parsed.recordErrors.length === 1 && parsed.recordErrors[0].recordName === record.recordName && !parsed.records.length, "Unexpected list write error.");
+        parseTopLevelError({ serverErrorCode: parsed.recordErrors[0].serverErrorCode, recordName: record.recordName },
+          { path: "/records/modify", upstreamStatus: 200, hasSessionCookie: this.http.jar.header(this.endpoint).length > 0 });
+      }
+      const confirmed = parsed.records[0];
+      requireValue(parsed.records.length === 1 && confirmed && "recordType" in confirmed &&
+        confirmed.recordType === "List" && confirmed.recordName === record.recordName &&
+        typeof confirmed.recordChangeTag === "string" && confirmed.recordChangeTag.length > 0,
+        "Apple did not confirm the exact list mutation.");
+      if (operationType === "update") requireValue(confirmed.recordChangeTag !== record.recordChangeTag, "Apple did not advance the list version.");
+      for (const [key, submitted] of Object.entries(record.fields)) {
+        const observed = confirmed.fields[key];
+        requireValue(observed !== null && typeof observed === "object" && !Array.isArray(observed) &&
+          "type" in observed && "value" in observed && observed.type === submitted.type &&
+          canonicalJSON(observed.value) === canonicalJSON(submitted.value) &&
+          (submitted.isEncrypted !== true || "isEncrypted" in observed && observed.isEncrypted === true),
+        "Apple did not confirm the submitted list fields.");
+      }
+      return confirmed as CloudKitRecord;
+    } catch (error) {
+      if (error instanceof AppError && ["REAUTH_REQUIRED", "FORBIDDEN", "RATE_LIMITED", "CONFLICT"].includes(error.code)) throw error;
+      throw new WriteOutcomeUnknownError(record.recordName);
+    }
   }
 
   async modifyReminder(operationType: "create" | "update", record: CloudKitWriteRecord, beforeDispatch?: () => Promise<void>): Promise<CloudKitRecord> {
