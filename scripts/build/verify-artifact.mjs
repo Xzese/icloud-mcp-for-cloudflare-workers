@@ -40,7 +40,11 @@ if (hosting.d1 !== 'DB' || !hosting.capabilities?.includes('mcp')) throw new Err
 const schema = await readFile(path.join(root, 'schema.sql'), 'utf8');
 const migration = await readFile(path.join(root, 'migrations/0001_reminder_jobs.sql'), 'utf8');
 if (!schema.includes(migration.slice(migration.indexOf('CREATE TABLE')).trim())) throw new Error('Fresh-install and additive job schemas differ.');
-if (await readFile(path.join(root, 'dist/.openai/drizzle/0000_schema.sql'), 'utf8') !== schema) throw new Error('Packaged job schema differs from canonical source.');
+const migrations = (await readdir(path.join(root, 'migrations'))).filter(file => /^\d{4}_[a-z0-9_]+\.sql$/.test(file)).sort();
+if (JSON.stringify((await readdir(path.join(root, 'dist/.openai/drizzle'))).sort()) !== JSON.stringify(migrations)) throw new Error('Packaged Sites migration history is incomplete.');
+for (const file of migrations) {
+  if (await readFile(path.join(root, 'dist/.openai/drizzle', file), 'utf8') !== await readFile(path.join(root, 'migrations', file), 'utf8')) throw new Error(`Packaged migration differs from canonical source: ${file}`);
+}
 await mkdir(path.join(root, 'docs'), { recursive: true });
 await writeFile(path.join(root, 'docs/artifact-manifest.json'), JSON.stringify({
   kind: 'local-production-build', compatibilityDate: config.compatibility_date,

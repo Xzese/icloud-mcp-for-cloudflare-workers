@@ -1,5 +1,4 @@
 import { AppError, requireValue } from "../errors.ts";
-export const QUEUE_CONSUMER_AVAILABLE = Symbol("standalone-reminder-queue-consumer");
 export interface RuntimeEnv {
   DB?: D1Database;
   REMINDERS_OWNER_ID?: string;
@@ -13,10 +12,6 @@ export interface RuntimeEnv {
   APPLE_SESSION_RENEWAL_ENABLED?: string;
   APPLE_SESSION_CHECK_INTERVAL_MS?: string;
   LOCAL_REMINDER_EVIDENCE_ENABLED?: string;
-  REMINDER_JOB_EXECUTION_MODE?: string;
-  REMINDER_JOB_QUEUE_NAME?: string;
-  REMINDER_JOB_QUEUE?: Queue<{ jobId: string; revision: number }>;
-  [QUEUE_CONSUMER_AVAILABLE]?: true;
 }
 export function requireOwner(request: Request, env: RuntimeEnv): string {
   // The Sites dispatcher or standalone Access adapter must authenticate and

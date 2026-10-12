@@ -1,6 +1,6 @@
 import { readFile, writeFile } from "node:fs/promises";
 import { parse, stringify } from "smol-toml";
-import { reminderQueueConfig } from "./reminder-queue-config.mjs";
+import { requestDrivenConfig } from "./reminder-job-config.mjs";
 const checking = process.argv.includes("--check");
 const built = JSON.parse(await readFile("dist/server/wrangler.json", "utf8"));
 if (!built.main || !built.compatibility_flags?.includes("nodejs_compat")) throw new Error("Build the standalone Worker first.");
@@ -19,10 +19,9 @@ if (!/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i.test(db.d
 if (!/^[a-z0-9][a-z0-9-]{0,62}$/.test(configured.name ?? "")) throw new Error("Configure a valid Worker name.");
 const output = { ...built, ...configured, main: "dist/server/index.js", assets: { ...built.assets, ...configured.assets, directory: "dist/client", binding: "ASSETS", run_worker_first: true }, d1_databases: [{ ...db }], preview_urls: false };
 if (!configured.vars) delete output.vars;
-// Retired catalogue schedules must not survive generated configurations.
+Object.assign(output, requestDrivenConfig(configured));
 delete output.triggers;
 delete output.queues;
-Object.assign(output, reminderQueueConfig(configured));
 delete output.services;
 delete output.r2_buckets;
 await writeFile("wrangler.generated.toml", stringify(output) + "\n", { mode: 0o600 });

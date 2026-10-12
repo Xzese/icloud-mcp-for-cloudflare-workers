@@ -1,7 +1,8 @@
 # Reminders list management
 
 The MCP tools `get_reminder_list`, `create_reminder_list`, `rename_reminder_list` and
-`delete_reminder_list` use the existing authenticated private CloudKit connection.
+`delete_reminder_list`, plus `get_reminder_list_appearance` and
+`update_reminder_list_appearance`, use the existing authenticated private CloudKit connection.
 
 ## Scope and limits
 
@@ -71,3 +72,36 @@ were preserved. The native evidence list and protocol probe were cleaned up; unr
 lists remained intact. No unconfirmed mutation was replayed.
 
 Existing sessions, authentication settings and D1 schema are unchanged.
+
+## List colour and emoji appearance
+
+`get_reminder_list_appearance` reads one exact owned standard private list and returns its
+current tag, typed colour state (`default`, recognized `preset`, `custom` or `unsupported`)
+and badge state (`none`, `emoji` or `unsupported`). Existing list summaries remain unchanged.
+`update_reminder_list_appearance` requires that ID/tag and the current `expectedGeneration`,
+plus `colorPreset`, `emoji` or both. The twelve observed presets are red, orange, yellow,
+green, light-blue, blue, indigo, pink, purple, brown, grey and rose. Emoji must be one complete
+RGI emoji sequence; plain text, lone regional indicators and arbitrary combining accents are
+refused before dispatch. Clearing, arbitrary RGB data and standard badge writes are excluded
+until their native transitions are captured. Shared/group lists remain excluded.
+
+The selected fields use native STRING JSON `Color` and `BadgeEmblem` values. Both plain
+STRING write wrappers were accepted by Apple without the Name field's encryption flag.
+Only the corresponding `color`/`badgeEmblem` resolution tokens advance, retaining their
+existing replicas and every unrelated token. Exact List parent metadata, membership,
+pinning data, unknown fields and asset identity/encryption metadata remain preserved. Known
+signed membership-asset URLs and JSON object ordering are normalized for receipt comparison;
+checksums and other metadata are retained. Token maps keep their established 65,536-byte limit.
+
+A fresh empty synthetic native list supplied all twelve colour captures and an emoji capture.
+The built production Worker wrote indigo and a star emoji, and Reminders displayed both while
+retaining its synthetic section. A native green reverse edit was read correctly. A subsequent
+orange/bookmark update committed once under a deliberately dropped acknowledgement; exact
+readback confirmed it, and the original stale request returned `CONFLICT` with zero additional
+writes. The same session generation and fixed expiry were retained. The List and section
+remain disposable evidence for further section/group investigations.
+
+All 184 unit tests, full Worker integration, TypeScript, lint (six existing warnings), local
+transport, public configuration, Sites build/artifact and standalone Cloudflare checks passed.
+Independent review verified the corrections for List parent preservation, complete emoji
+validation and larger token-map JSON receipts. No personal lists were mutated.

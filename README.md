@@ -59,6 +59,11 @@ Review Git history before publishing a repository that previously contained priv
 
 ## Tools
 
+Read the [MCP and API reference](docs/mcp-api.md) for **every tool's inputs, results,
+behaviour and rationale**, including how recurring completion, reopening, deletion and
+subtask actions follow the observed Apple Reminders lifecycle. The reference distinguishes
+native behaviour from connector safeguards and links the supporting live evidence and limits.
+
 | Tool | Behaviour |
 | --- | --- |
 | `connection_status` | Report connection state, session generation and tool availability; does not contact Apple. |
@@ -66,11 +71,20 @@ Review Git history before publishing a repository that previously contained priv
 | `get_reminders` | Authorize an exact `listId` live, then fetch one current page without catalogue synchronization; open reminders by default. |
 | `get_all_open_reminders` | Discover selectable lists once per operation, then fetch open reminders with resumable per-list pages. |
 | `get_reminder` | Read one exact ID, including completed or soft-deleted state, for current version tags and recovery. |
+| `search_reminders` | Search one or all selectable private lists by title/notes text, status, flag, priority, due range, literal tags and the separate native URL with bounded continuations. |
+| `get_reminder_list` | Read one exact private list and its current version, including soft-deleted state for reconciliation. |
+| `create_reminder_list`, `rename_reminder_list`, `delete_reminder_list` | Create or rename standard private lists, or soft-delete a fully verified empty list. |
+| `get_reminder_list_appearance`, `update_reminder_list_appearance` | Read native appearance or set a built-in colour and/or emoji using the current List version. |
+| `get_shopping_categories`, `set_reminder_category` | Read materialised Shopping categories, including empty categories, or move an ordinary item to an existing category using exact reminder/List/category versions. |
+| `get_reminder_organization` | Read the separate native URL and literal tag names without exposing raw assets. |
+| `set_reminder_url`, `set_reminder_tags` | Replace/clear the selected reminder's URL or complete tag selection atomically. |
+| `move_reminder`, `copy_reminder` | Transfer an undated ordinary childless root between owned private standard lists with exact source/List versions. |
 | `create_reminder` | Create one open reminder using a stable UUID `idempotencyKey`. |
+| `create_subtask`, `set_reminder_parent` | Create an undated child or attach, reparent or return a simple reminder to top level in the same list. |
 | `update_reminder` | Edit specified fields of one open reminder using its current `recordChangeTag`. |
-| `complete_reminder` | Complete one open reminder using its current version. |
-| `reopen_reminder` | Reopen one completed reminder and clear its completion date. |
-| `delete_reminder` | Soft-delete one open or completed reminder using its current version. |
+| `complete_reminder` | Complete an ordinary reminder/family, or advance a supported recurrence and return completed occurrence history. |
+| `reopen_reminder` | Reopen an ordinary reminder/family, independent occurrence history or a supported final daily/weekly occurrence at its end date. |
+| `delete_reminder` | Follow native detach/cascade deletion, or explicitly skip one supported recurring occurrence or retire all future occurrences. |
 | `prepare_reminder_update` | Preview an exact simple edit or supported timed recurring/absolute-alarm date update. |
 | `create_reminder_job`, `append_reminder_job_items` | Stage encrypted, bounded immutable bulk manifests with stable UUID keys. |
 | `preview_reminder_job`, `start_reminder_job` | Seal/review and accept a manifest without executing Apple mutations. |
@@ -81,6 +95,9 @@ Tools return `structuredContent` plus a text copy for client compatibility. Ever
 a typed output schema for successful results and describes its parameters in the input schema.
 Application failures return `isError: true` with a
 sanitized error object and matching JSON text, including recovery IDs when a write is uncertain.
+Use `structuredContent.error.code`, `retryable` and `requestId` for connector diagnostics.
+The hosted adapter can rewrite the outer `error_code` to `INVALID_ARGUMENT` even when the
+raw MCP response carries a specific protocol or conflict code; the nested code remains intact.
 Read tools are marked read-only; Apple-facing tools use `openWorldHint: true`. Creation is additive,
 while editing, completion, reopening and deletion are marked destructive. All mutation tools
 use `idempotentHint: true`: identical creation inputs reuse the same UUID, and existing-item writes
@@ -92,6 +109,24 @@ Use the IDs returned by `get_reminder_lists`. `get_reminders` accepts `includeCo
 `continuation`. An all-open result with `complete: false` may include a separate opaque continuation;
 call `get_all_open_reminders` again with that value and combine the returned records. Inspect errors
 before retrying and respect any `retryAfterSeconds`. A partial result is not the entire collection.
+
+Search reads one live Apple page per call. An empty result can still have a continuation;
+repeat the same filters and newly returned single-use token until `complete` is true. Omitting
+`listId` fixes the discovered owned private list selection for that search. Pages do not form
+an immutable snapshot. Native tag/URL filters are available; synced custom Smart Lists are not implemented.
+
+Organization changes use native linked URL and tag records, preserving unrelated content.
+Shopping moves update Apple's native category membership, item ordering and grocery-learning
+correction, so later copies of the same product title follow the manual choice. Category reads
+use a category-only metadata feed and can require multiple pages; only the selected list's
+categories are returned. See [the Shopping tool contracts and limits](docs/mcp-api.md#shopping-categories).
+Moves preserve identity; copies create a new reminder plus new URL/tag identities, with title
+and notes copied as plain text. Transfers exclude schedules, recurrence, alarms, descendants,
+assignments, sections and other attachments. Copy keys and request/content hashes are stored
+in the encrypted session before dispatch so an uncertain response can be reconciled with the
+same key and inputs. Replayed copies perform no write, even after guard versions advance;
+changed copied content or reused keys with different inputs conflict. Read the
+[capability map and remaining limits](docs/native-reminders-parity.md) for the broader backlog.
 
 ## List management
 
@@ -105,13 +140,14 @@ is no separate write approval flag. Review [the write protocol and limitations](
 `connection_status` reports `writeEnabled` and the create/update/complete/reopen/delete
 capabilities based on the current connection state.
 
-[Durable jobs](docs/reminder-jobs.md) default to authenticated continuation on both deployment targets.
+[Durable jobs](docs/reminder-jobs.md) use authenticated continuation on both deployment targets.
 Simple bulk creation is a normal ready-account capability once the additive job schema is
 installed; no feature flag is required. Timed absolute-alarm date updates, including the active
 occurrence of a recurring reminder, are also permanent ready-account capabilities.
 Bulk deletion of simple reminders is permanent too: each item gets the single-delete exact-version and
-subtask checks, and a subtask attached natively during commit is reported, not cascaded. Standalone Workers can opt into a strictly configured
-Queue consumer and durable outbox recovery schedule; Sites remains request-driven. See
+subtask checks, and a subtask attached natively during commit is reported, not cascaded.
+Only `continue_reminder_job` advances a job; status and start requests do not execute Apple
+writes. No Cloudflare Queue or cron runner is used. See
 [the linked-date recipe and live evidence](docs/linked-record-protocol.md#permanent-in-place-absolute-date-updates)
 for exact scope, preservation rules and remaining unsupported transitions.
 
@@ -125,13 +161,36 @@ editing and removal, early reminders and location alarm creation, editing and re
 one absolute date alarm, optionally one location alarm and one known recurrence. Linked date clearing and explicit
 timed/all-day conversion retire the old date-alarm pair atomically. Subtask scheduling guards
 the exact open parent in the same list. See [supported recipes](docs/linked-record-protocol.md)
-for required inputs and refusal boundaries. Completion, reopening and deletion refuse recurring, alarmed and nested
-reminders and observed parents, and send one tagged record update. A bounded complete-list
-child check fails closed on errors or unfinished pagination; it does not prove protection
-against newly added, unreferenced children. No subtask cascades are supported. Use Apple's app
-for parent/child lifecycle actions. Deletion sets Apple's `Deleted` marker
-with a normal update; no hard-delete or restore tool is exposed. Moving lists, arbitrary linked-record
-editing and recurrence anchor changes are excluded. New early reminders use an exact-version
+for required inputs and refusal boundaries. Completion and reopening support ordinary one-level
+families with the known family and List guarded in one atomic group. Parent completion completes
+open children; reopening restores only children completed with that parent, preserving independently
+completed children. A child action changes only the selected child. `affectedRecords` identifies
+changed reminders. Recurring, early/location-alarmed and deeper families remain excluded;
+ordinary members can have one supported absolute-date pair. Direct deletion
+detaches the selected reminder from its List and parent; parent deletion soft-deletes its
+children while preserving their native links and completion state. Exact reads of a detached
+deleted reminder return `listId: null`. No hard-delete or restore tool is exposed.
+Root-only recurring completion supports interval-one timed weekly recurrence, optionally with
+one absolute date alarm, all-day daily recurrence and the observed last-day monthly pattern.
+The active ID remains open at its next calendar due date; `completedOccurrence` returns fresh
+completed history at the old date. Weekly alarm pairs are replaced separately for the active
+record and history. Retain the original ID/tag arguments: durable occurrence intents reconcile
+uncertain acknowledgements by exact reads without creating another history. An all-day daily
+interval-one root with an inclusive end calendar date, or a timed interval-one weekly root
+ending on its exact local cadence, completes its final occurrence in place, returning no
+history, and can reopen at that same date. Daily end instants outside midnight UTC require
+the explicit `recurrenceCalendarTimeZone`; timed weekly rules use their stored zone.
+Recurring deletion requires explicit `occurrence` or `all_future` scope and has its own
+bounded daily, weekly and last-day monthly recipes. These distinctions match the observed
+native app; see the [recurring lifecycle explanation](docs/mcp-api.md#recurring-reminders-why-completion-can-leave-a-reminder-open).
+Other end conditions, overdue
+skipping and recurrence patterns still require separate recipes.
+A complete bounded family inspection fails closed on read errors or
+unfinished pagination. Observed native additions advanced root/List versions, but universal
+protection against unreferenced native additions remains unproven. See
+[native lifecycle evidence](docs/lifecycle-protocol.md). Bounded ordinary move/copy is described
+in [the parity contracts](docs/native-reminders-parity.md); arbitrary linked-record editing and
+recurrence anchor changes remain excluded. New early reminders use an exact-version
 witness from another native early reminder in the same list to obtain Apple's account metadata;
 the connector never derives that identifier from credentials or zone owners.
 
@@ -139,8 +198,12 @@ The `create_subtask` and `set_reminder_parent` tools create undated children, mo
 simple childless reminder under a root, reparent it or return it to top level.
 They are permanent ready-account capabilities; `capabilities.subtasks` reports session availability.
 They require same-list, open, undated, non-recurring/un-alarmed nodes and exact child/destination
-tags, with affected parents guarded in one atomic group. Deeper nesting and cascades remain
-unsupported; simple bulk-create jobs still reject parent inputs. See
+tags, with affected parents guarded in one atomic group. Relationship changes refuse deeper
+nesting; family lifecycle uses the separate native recipes described above. Simple bulk-create
+jobs still reject parent inputs. Ordinary and subtask creation atomically append their
+identities to native List ordering. Lifecycle inspection resolves query and ordering identities
+exactly before planning, covering committed children hidden by query-index lag. List and parent
+version guards reject changes after inspection, including concurrent connector List deletion. See
 [subtask contracts and limits](docs/write-access.md#subtask-relationships).
 
 `CONFLICT` requires a fresh read and review. `WRITE_OUTCOME_UNKNOWN` means Apple may have saved
@@ -544,6 +607,7 @@ using the [documented upgrade path](docs/reminder-jobs.md), without resetting se
 Run the checks before contributing:
 
 ```bash
+npm run lint
 npm run typecheck
 npm test
 npm run build

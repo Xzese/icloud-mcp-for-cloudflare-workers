@@ -118,7 +118,7 @@ export interface CloudKitWriteRecord {
   recordType: "Reminder";
   fields: Record<string, { type: string; value: unknown }>;
   recordChangeTag?: string;
-  parent?: { recordName: string };
+  parent?: { recordName: string } | null;
 }
 
 function validateNow(nowMs: number): number {
@@ -210,7 +210,7 @@ function currentReminder(record: CloudKitRecord, expectedOwner: string, listId: 
   if (record.recordType !== "Reminder" || record.recordName !== recordName || record.deleted === true) {
     throw new AppError("CONFLICT", "The reminder is no longer available for this update.", 409);
   }
-  const reminder = normalizeReminder(record, expectedOwner);
+  const reminder = normalizeReminder(record, expectedOwner, true);
   if (reminder.listId !== listId || typeof reminder.completed !== "boolean" || (expectedCompleted !== null && reminder.completed !== expectedCompleted) || reminder.deleted !== false || reminder.recordChangeTag !== recordChangeTag) {
     throw new AppError("CONFLICT", "The reminder changed or is no longer in the required state in the requested list.", 409);
   }
@@ -321,13 +321,13 @@ export function buildUpdateReminder(input: UpdateReminderInputData, current: Clo
   return write;
 }
 
-export function buildLifecycleReminder(action: ReminderLifecycleAction, input: ReminderTargetInputData, current: CloudKitRecord, expectedOwner: string, nowMs = Date.now()): CloudKitWriteRecord {
+export function buildLifecycleReminder(action: ReminderLifecycleAction, input: ReminderTargetInputData, current: CloudKitRecord, expectedOwner: string, nowMs = Date.now(), parentValidated = false): CloudKitWriteRecord {
   const parsed = ReminderTargetInput.parse(input);
   validateNow(nowMs);
   requireValue(["complete", "reopen", "delete"].includes(action), "Unsupported reminder state change.");
   const reminder = currentReminder(current, expectedOwner, parsed.listId, parsed.reminderId, parsed.recordChangeTag, action === "delete" ? null : action === "reopen");
-  if ((reminder.recurrenceRuleIds?.length ?? 0) > 0 || (reminder.alarmIds?.length ?? 0) > 0 || reminder.parentReminderId !== null) {
-    throw new AppError("UNSUPPORTED_FEATURE", "Completion, reopening and deletion are unavailable for recurring, alarmed or nested reminders.");
+  if ((reminder.recurrenceRuleIds?.length ?? 0) > 0 || (reminder.alarmIds?.length ?? 0) > 0 || reminder.parentReminderId !== null && !parentValidated) {
+    throw new AppError("UNSUPPORTED_FEATURE", "Lifecycle changes require nonrecurring, unalarmed reminders and a validated one-level family.");
   }
   const fields: CloudKitWriteRecord["fields"] = {
     LastModifiedDate: { type: "TIMESTAMP", value: nowMs },
@@ -335,14 +335,22 @@ export function buildLifecycleReminder(action: ReminderLifecycleAction, input: R
   const tokenFields = ["lastModifiedDate"];
   if (action === "delete") {
     fields.Deleted = { type: "INT64", value: 1 };
-    tokenFields.push("deleted");
+    if (parentValidated) {
+      fields.List = { type: "REFERENCE", value: null };
+      tokenFields.push("list");
+      if (reminder.parentReminderId) {
+        fields.ParentReminder = { type: "REFERENCE", value: null };
+        tokenFields.push("parentReminder");
+      }
+    } else tokenFields.push("deleted");
   } else {
     fields.Completed = { type: "INT64", value: action === "complete" ? 1 : 0 };
     fields.CompletionDate = { type: "TIMESTAMP", value: action === "complete" ? nowMs : null };
     tokenFields.push("completed", "completionDate");
   }
   fields.ResolutionTokenMap = { type: "STRING", value: updateResolutionTokenMap(current, tokenFields, nowMs) };
-  return { recordName: parsed.reminderId, recordType: "Reminder", recordChangeTag: parsed.recordChangeTag, fields };
+  return { recordName: parsed.reminderId, recordType: "Reminder", recordChangeTag: parsed.recordChangeTag, fields,
+    ...(action === "delete" && parentValidated ? { parent: null } : {}) };
 }
 
 export function matchesCreatedReminder(input: CreateReminderInputData, current: CloudKitRecord, expectedOwner: string, expectedParentId: string | null = null): boolean {

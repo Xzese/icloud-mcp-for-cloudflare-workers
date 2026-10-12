@@ -6,7 +6,7 @@ import { b64, utf8 } from "../src/crypto/bytes.ts";
 import { CloudKitRemindersClient, type CloudKitLookupResult, type CloudKitRecord } from "../src/icloud/cloudkit.ts";
 import { AppleHTTP } from "../src/transport/apple-http.ts";
 import { CookieJar } from "../src/transport/cookie-jar.ts";
-import { canonicalJSON } from "../src/lib/canonical.ts";
+import { canonicalJSON, fingerprint } from "../src/lib/canonical.ts";
 import { buildCreateReminder, CreateReminderInput, UpdateReminderInput } from "../src/reminders/writes.ts";
 import { loadSchedulingGraph, attachEarlyReminderWitness } from "../src/reminders/linked-records.ts";
 import { planReminderUpdate } from "../src/reminders/mutation-plan.ts";
@@ -14,6 +14,10 @@ import { dateComponents, decodeDateComponents, dueDateNonce } from "../src/remin
 
 import { RecurrenceChanges, readRecurrence } from "../src/reminders/recurrence.ts";
 import { verifySchedulingWrite } from "../src/reminders/scheduling-plan.ts";
+import { nextRecurringDue, planRecurringCompletion, recurringIdentities } from "../src/reminders/recurring-lifecycle.ts";
+import { planRecurringDeletion } from "../src/reminders/recurring-deletion.ts";
+import { planDateAlarmLifecycle } from "../src/reminders/date-alarm-lifecycle.ts";
+import { RecurrenceCalendarTimeZone, recurrenceEndCalendarLabel } from "../src/reminders/recurrence-calendar.ts";
 
 const owner = "synthetic-owner", listId = "List/LINKED-DATE", now = 1_800_000_000_000;
 const zoneID = { zoneName: "Reminders", ownerRecordName: owner };
@@ -61,6 +65,15 @@ test("timed recurring date plan updates exact existing identities and protects e
   const graph = await loadSchedulingGraph(values[0], owner, lookup(values));
   assert.equal(graph.complete, true); assert.equal(graph.records.length, 4);
   assert.ok(graph.edges.some(edge => edge.from === alarmId && edge.to === triggerId));
+  const asset = { type: "ASSETID", value: { downloadURL: "https://synthetic.invalid/one", wrappingKey: "synthetic-key", fileChecksum: "synthetic-checksum", referenceChecksum: "reference", size: 10 } };
+  const withAsset = { ...values[0], fields: { ...values[0].fields, UrgentPresentationAlarmsAsData: asset } };
+  const assetGraph = await loadSchedulingGraph(withAsset, owner, lookup(values));
+  const signedGraph = await loadSchedulingGraph({ ...withAsset, fields: { ...withAsset.fields, UrgentPresentationAlarmsAsData: { ...asset, value: { ...asset.value, downloadURL: "https://synthetic.invalid/two" } } } }, owner, lookup(values));
+  assert.equal(signedGraph.fingerprint, assetGraph.fingerprint);
+  for (const key of ["wrappingKey", "fileChecksum"]) {
+    const drift = await loadSchedulingGraph({ ...withAsset, fields: { ...withAsset.fields, UrgentPresentationAlarmsAsData: { ...asset, value: { ...asset.value, [key]: "changed" } } } }, owner, lookup(values));
+    assert.notEqual(drift.fingerprint, assetGraph.fingerprint);
+  }
   const plan = planReminderUpdate(graph, request(values[0]), owner, now + 1000);
   assert.equal(plan.supported, true);
   if (!plan.supported) return;
@@ -725,4 +738,379 @@ test("custom recurrence input and current-rule inspection reject incompatible, d
   const graph = await loadSchedulingGraph(values[0], owner, lookup(values));
   assert.equal(planReminderUpdate(graph, request(values[0]), owner, now + 1000).supported, false);
   assert.equal(planReminderUpdate(graph, { ...request(values[0]), changes: { dueDate: null } }, owner, now + 1000).supported, false);
+});
+
+test("ordinary absolute-date lifecycle preserves its pair, guards every version and soft-deletes without new identities", async () => {
+  const source = records().slice(0, 3); delete source[0].fields.RecurrenceRuleIDs;
+  source[0].raw = { parent: { recordName: listId } }; source[1].raw = { parent: { recordName: source[0].recordName } }; source[2].raw = { parent: { recordName: alarmId } };
+  const list: CloudKitRecord = { recordName: listId, recordType: "List", recordChangeTag: "list-before", raw: {}, fields: {
+    Name: { type: "STRING", value: "Synthetic lifecycle" }, Deleted: { type: "INT64", value: 0 }, IsGroup: { type: "INT64", value: 0 },
+    ReminderIDs: { type: "STRING", value: JSON.stringify(["KEEP", source[0].recordName, "OTHER"]) }, ResolutionTokenMap: { type: "STRING", value: JSON.stringify({ map: {} }) },
+  } };
+  const store = new Map([list, ...source].map(record => [record.recordName, record]));
+  let dispatches = 0, stale: string | undefined;
+  const client = new CloudKitRemindersClient(new AppleHTTP(new CookieJar(), async (value, init) => {
+    const payload = JSON.parse(String(init?.body));
+    if (String(value).includes("/records/lookup")) return Response.json({ records: payload.records.map((item: { recordName: string }) => {
+      const record = store.get(item.recordName)!; return { ...record, parent: record.raw.parent, raw: undefined };
+    }) });
+    dispatches++; assert.equal(payload.atomic, true); assert.equal(payload.operations.length, 4);
+    assert.ok(payload.operations.every((operation: { operationType: string }) => operation.operationType === "update"));
+    if (stale) return Response.json({ records: payload.operations.map((operation: { record: { recordName: string } }) => ({ recordName: operation.record.recordName,
+      serverErrorCode: operation.record.recordName === stale ? "CONFLICT" : "ATOMIC_ERROR" })) });
+    const results = payload.operations.map((operation: { record: CloudKitRecord & { parent?: { recordName: string | null } } }) => {
+      const before = store.get(operation.record.recordName)!, fields = { ...before.fields, ...operation.record.fields };
+      let parent = before.raw.parent;
+      if (operation.record.parent?.recordName === null) parent = undefined;
+      const wire = { ...operation.record, fields, parent, recordChangeTag: `${before.recordChangeTag}-next`, zoneID };
+      store.set(wire.recordName, { ...wire, raw: { parent } });
+      return operation.record.parent?.recordName === null ? { ...wire, parent: before.raw.parent } : wire;
+    });
+    return Response.json({ records: results.reverse() });
+  }), { dsid: "123", clientId: "synthetic", clientBuildNumber: "synthetic", clientMasteringNumber: "synthetic", cloudKitURL: "https://p01-ckdatabasews.icloud.com/database/1/com.apple.reminders/production/private", remindersZoneOwner: owner });
+  const make = async (action: "complete" | "reopen" | "delete") => {
+    const root = store.get(source[0].recordName)!;
+    const graph = await loadSchedulingGraph(root, owner, lookup([...store.values()]));
+    return planDateAlarmLifecycle(action, { listId, reminderId: root.recordName, recordChangeTag: root.recordChangeTag! }, graph, store.get(listId)!, owner, now + dispatches * 1000);
+  };
+  const complete = await make("complete");
+  for (const id of [alarmId, listId]) { stale = id; await assert.rejects(client.modifyDateAlarmLifecycle(complete, async () => {}), hasCode("CONFLICT")); }
+  stale = undefined;
+  const pairBefore = source.slice(1).map(record => structuredClone(record));
+  await client.modifyDateAlarmLifecycle(complete, async () => {});
+  assert.equal(store.get(source[0].recordName)!.fields.Completed && (store.get(source[0].recordName)!.fields.Completed as { value: number }).value, 1);
+  for (const before of pairBefore) { assert.deepEqual(store.get(before.recordName)!.fields, before.fields); assert.deepEqual(store.get(before.recordName)!.raw.parent, before.raw.parent); }
+  await client.modifyDateAlarmLifecycle(await make("reopen"), async () => {});
+  const deletion = await make("delete");
+  assert.deepEqual(Object.keys(deletion.operations[1].record.fields), ["Deleted"]); assert.deepEqual(Object.keys(deletion.operations[2].record.fields), ["Deleted"]);
+  await client.modifyDateAlarmLifecycle(deletion, async () => {});
+  assert.equal(store.size, 4); assert.equal(store.get(source[0].recordName)!.raw.parent, undefined);
+  for (const before of pairBefore) assert.deepEqual(store.get(before.recordName)!.fields, { ...before.fields, Deleted: { type: "INT64", value: 1 } });
+  assert.deepEqual(JSON.parse(String((store.get(listId)!.fields.ReminderIDs as { value: string }).value)), ["KEEP", "OTHER"]);
+  const bad = records().slice(0, 3); delete bad[0].fields.RecurrenceRuleIDs;
+  bad[1].fields.DueDateResolutionTokenAsNonce = { type: "DOUBLE", value: 0 };
+  const badGraph = await loadSchedulingGraph(bad[0], owner, lookup(bad));
+  const badInput = { listId, reminderId: bad[0].recordName, recordChangeTag: bad[0].recordChangeTag! };
+  assert.throws(() => planDateAlarmLifecycle("complete", badInput, badGraph, list, owner), hasCode("CONFLICT"));
+  bad[1].fields.DueDateResolutionTokenAsNonce = source[1].fields.DueDateResolutionTokenAsNonce;
+  bad[0].fields.UnknownParentIDs = { type: "STRING_LIST", value: ["unknown"] };
+  assert.throws(() => planDateAlarmLifecycle("complete", badInput, badGraph, list, owner), hasCode("UNSUPPORTED_FEATURE"));
+  assert.equal(dispatches, 5);
+});
+
+test("recurring completion preserves encoded history, advances calendar dates and replaces only the exact date pair atomically", async () => {
+  assert.equal(nextRecurringDue("2026-10-19T08:00:00Z", "Europe/London", false, "weekly"), "2026-10-26T09:00:00.000Z");
+  assert.equal(nextRecurringDue("2027-01-31T00:00:00Z", null, true, "last-day-monthly"), "2027-02-28T00:00:00.000Z");
+  assert.equal(nextRecurringDue("2027-02-28T00:00:00Z", null, true, "last-day-monthly"), "2027-03-31T00:00:00.000Z");
+  assert.equal(nextRecurringDue("2026-10-20T00:00:00Z", null, true, "daily"), "2026-10-21T00:00:00.000Z");
+  const values = records(), root = values[0];
+  root.fields.TitleDocument = { ...(root.fields.TitleDocument as object), type: "ENCRYPTED_BYTES" };
+  const list: CloudKitRecord = { recordName: listId, recordType: "List", recordChangeTag: "list-before", zoneID, raw: {}, fields: {
+    Deleted: { type: "INT64", value: 0 }, IsGroup: { type: "INT64", value: 0 }, ReminderIDs: { type: "STRING", value: JSON.stringify(["KEEP", root.recordName.slice(9), "OTHER"]) },
+    ResolutionTokenMap: { type: "STRING", value: JSON.stringify({ map: {} }) }, OpaqueMembership: { type: "STRING", value: "preserve" },
+  } };
+  const graph = await loadSchedulingGraph(root, owner, lookup(values)), ids = recurringIdentities();
+  const plan = await planRecurringCompletion(graph, list, owner, ids, Date.parse("2027-01-11T00:00:00Z"));
+  assert.ok(plan.history); assert.ok(plan.membership);
+  assert.equal(plan.active.fields.Completed.value, 0);
+  assert.equal(plan.history.fields.TitleDocument.type, "STRING");
+  assert.equal(plan.history.fields.TitleDocument.value, (root.fields.TitleDocument as { value: string }).value);
+  assert.equal(plan.history.fields.CreationDate.value, (root.fields.CreationDate as { value: number }).value);
+  assert.deepEqual(plan.history.fields.RecurrenceRuleIDs.value, []);
+  assert.deepEqual(JSON.parse(String(plan.membership.fields.ReminderIDs.value)), ["KEEP", ids.history, root.recordName.slice(9), "OTHER"]);
+  assert.deepEqual(plan.retired.sort(), [alarmId, triggerId].sort());
+  assert.equal(plan.operations.filter(operation => operation.operationType === "create").length, 5);
+  assert.equal(plan.operations.filter(operation => operation.operationType === "delete" && operation.record.recordType === "Reminder").length, 0);
+  assert.equal((await planRecurringCompletion(graph, list, owner, ids, plan.timestamp)).sourceFingerprint, plan.sourceFingerprint);
+  // Intents saved before zone-expansion support must remain reconcilable.
+  for (const record of [...plan.operations.filter(operation => operation.operationType === "create" && ["Alarm", "AlarmTrigger"].includes(operation.record.recordType)).map(operation => operation.record), values[3]]) {
+    assert.equal(plan.expected.find(entry => entry.id === record.recordName)?.hash,
+      await fingerprint({ id: record.recordName, type: record.recordType, fields: record.fields }));
+  }
+  let dispatches = 0;
+  const client = (stale?: string, lose = false, foreignReference?: "Alarm" | "AlarmTrigger") => new CloudKitRemindersClient(new AppleHTTP(new CookieJar(), async (_, init) => {
+    dispatches++;
+    const payload = JSON.parse(String(init?.body)); assert.equal(payload.atomic, true); assert.equal(payload.operations.length, 10);
+    if (stale) return Response.json({ records: payload.operations.map((operation: { record: { recordName: string } }) => ({ recordName: operation.record.recordName, serverErrorCode: operation.record.recordName === stale ? "CONFLICT" : "ATOMIC_ERROR" })) });
+    if (lose) return new Response("lost", { status: 503 });
+    return Response.json({ records: payload.operations.map((operation: { operationType: string; record: CloudKitRecord }) => {
+      if (operation.operationType === "delete") return { recordName: operation.record.recordName, deleted: true };
+      const before = [list, ...values].find(record => record.recordName === operation.record.recordName);
+      const fields = { ...before?.fields, ...operation.record.fields };
+      if (operation.operationType === "create" && ["Alarm", "AlarmTrigger"].includes(operation.record.recordType)) {
+        const key = operation.record.recordType === "Alarm" ? "Reminder" : "Alarm", reference = fields[key] as { type: string; value: object };
+        fields[key] = { ...reference, value: { ...reference.value, zoneID: { ...zoneID, ownerRecordName: operation.record.recordType === foreignReference ? "synthetic-foreign-owner" : owner } } };
+      }
+      return { ...operation.record, fields, recordChangeTag: `next-${operation.record.recordName}`, zoneID };
+    }).reverse() });
+  }), { dsid: "123", clientId: "synthetic", clientBuildNumber: "synthetic", clientMasteringNumber: "synthetic", cloudKitURL: "https://p01-ckdatabasews.icloud.com/database/1/com.apple.reminders/production/private", remindersZoneOwner: owner });
+  await client().modifyRecurringCompletion(plan, async () => {});
+  for (const stale of [ruleId, listId, alarmId]) await assert.rejects(client(stale).modifyRecurringCompletion(plan, async () => {}), hasCode("CONFLICT"));
+  await assert.rejects(client(undefined, true).modifyRecurringCompletion(plan, async () => {}), hasCode("WRITE_OUTCOME_UNKNOWN"));
+  for (const type of ["Alarm", "AlarmTrigger"] as const) await assert.rejects(client(undefined, false, type).modifyRecurringCompletion(plan, async () => {}), hasCode("WRITE_OUTCOME_UNKNOWN"));
+  assert.equal(dispatches, 7);
+  const endedWeekly = records(), weeklyDue = "2026-10-19T08:00:00Z", weeklyEnd = "2026-10-26T09:00:00Z";
+  endedWeekly[0].fields.DueDate = { type: "TIMESTAMP", value: Date.parse(weeklyDue) };
+  endedWeekly[2].fields.DateComponentsData = { type: "BYTES", value: b64(utf8(JSON.stringify(dateComponents(weeklyDue, "Europe/London")))) };
+  endedWeekly[3].fields.EndDate = { type: "TIMESTAMP", value: Date.parse(weeklyEnd) };
+  const weeklyTime = Date.parse("2026-10-19T12:00:00Z");
+  const endedWeeklyGraph = await loadSchedulingGraph(endedWeekly[0], owner, lookup(endedWeekly));
+  const weeklyAdvance = await planRecurringCompletion(endedWeeklyGraph, list, owner, ids, weeklyTime);
+  assert.equal(weeklyAdvance.mode, "advance"); assert.equal(weeklyAdvance.active.fields.DueDate.value, Date.parse(weeklyEnd));
+  assert.equal(weeklyAdvance.intrinsicParentGuards, undefined, "Advancing hashes and retained identities remain legacy compatible.");
+  for (const end of ["2026-10-27T09:00:00Z", "2026-10-26T08:00:00Z", "2026-10-26T09:00:00.001Z"]) {
+    const badRule = { ...endedWeekly[3], fields: { ...endedWeekly[3].fields, EndDate: { type: "TIMESTAMP", value: Date.parse(end) } } };
+    await assert.rejects(planRecurringCompletion(await loadSchedulingGraph(endedWeekly[0], owner, lookup([...endedWeekly.slice(0, 3), badRule])), list, owner, undefined, weeklyTime), hasCode("UNSUPPORTED_FEATURE"));
+  }
+  const retained = endedWeekly.map(record => structuredClone(record));
+  retained[0].fields.DueDate = { type: "TIMESTAMP", value: Date.parse(weeklyEnd) };
+  retained[0].raw.parent = { recordName: listId };
+  retained[0].fields.UrgentPresentationAlarmsAsData = { type: "ASSETID", value: { downloadURL: "https://synthetic.invalid/one", wrappingKey: "key", fileChecksum: "checksum", size: 1 } };
+  retained[1].raw.parent = { recordName: retained[0].recordName }; retained[2].raw.parent = { recordName: alarmId }; retained[3].raw.parent = { recordName: retained[0].recordName };
+  retained[2].fields.DateComponentsData = { type: "BYTES", value: b64(utf8(JSON.stringify(dateComponents(weeklyEnd, "Europe/London")))) };
+  const weeklyFinalGraph = await loadSchedulingGraph(retained[0], owner, lookup(retained));
+  const weeklyFinal = await planRecurringCompletion(weeklyFinalGraph, list, owner, undefined, weeklyTime + 7 * 86_400_000);
+  assert.equal(weeklyFinal.mode, "final"); assert.equal(weeklyFinal.intrinsicParentGuards, true); assert.equal(weeklyFinal.history, undefined);
+  assert.equal(weeklyFinal.expected.length, 5); assert.deepEqual(Object.keys(weeklyFinal.ids), ["replicas"]);
+  assert.deepEqual(weeklyFinal.guards.map(record => record.recordType), ["Alarm", "AlarmTrigger", "RecurrenceRule", "List"]);
+  assert.equal(weeklyFinal.active.fields.DueDate, undefined);
+  const completedWeekly = { ...retained[0], fields: { ...retained[0].fields, ...weeklyFinal.active.fields } };
+  const weeklyReopen = await planRecurringCompletion(await loadSchedulingGraph(completedWeekly, owner, lookup([completedWeekly, ...retained.slice(1)])), list, owner, undefined, weeklyFinal.timestamp + 1000, "reopen");
+  assert.equal(weeklyReopen.mode, "reopen"); assert.equal(weeklyReopen.expected.length, 5); assert.equal(weeklyReopen.active.fields.Completed.value, 0);
+  await assert.rejects(planRecurringCompletion(weeklyFinalGraph, list, owner, undefined, weeklyFinal.timestamp, "complete", "Europe/London"), hasCode("UNSUPPORTED_FEATURE"));
+  const unalarmedWeekly = { ...retained[0], fields: { ...retained[0].fields, AlarmIDs: { type: "UNKNOWN_LIST", value: [] } } };
+  const unalarmedFinal = await planRecurringCompletion(await loadSchedulingGraph(unalarmedWeekly, owner, lookup([unalarmedWeekly, retained[3]])), list, owner, undefined, weeklyFinal.timestamp);
+  assert.equal(unalarmedFinal.expected.length, 3); assert.equal(unalarmedFinal.intrinsicParentGuards, true);
+  let weeklyPosts = 0;
+  const weeklyClient = (drift?: string) => new CloudKitRemindersClient(new AppleHTTP(new CookieJar(), async (_, init) => {
+    weeklyPosts++; const payload = JSON.parse(String(init?.body));
+    assert.equal(payload.atomic, true); assert.equal(payload.operations.length, 5); assert.ok(payload.operations.every((operation: { operationType: string }) => operation.operationType === "update"));
+    if ([alarmId, ruleId, listId].includes(drift ?? "")) return Response.json({ records: payload.operations.map((operation: { record: CloudKitRecord }) => ({ recordName: operation.record.recordName, serverErrorCode: operation.record.recordName === drift ? "CONFLICT" : "ATOMIC_ERROR" })) });
+    return Response.json({ records: payload.operations.map((operation: { record: CloudKitRecord }) => {
+      const before = [...retained, list].find(record => record.recordName === operation.record.recordName)!;
+      const result = { ...operation.record, fields: structuredClone({ ...before.fields, ...operation.record.fields }), parent: before.raw.parent, recordChangeTag: "confirmed", zoneID };
+      if (result.parent) result.parent = { ...result.parent as object, zoneID };
+      if (before.recordType === "Reminder") {
+        const asset = result.fields.UrgentPresentationAlarmsAsData as { value: Record<string, unknown> };
+        asset.value.downloadURL = "https://synthetic.invalid/two";
+        if (drift === "crypto") asset.value.wrappingKey = "changed";
+      }
+      if (drift === "parent" && before.recordType === "Alarm") result.parent = { recordName: "Reminder/OTHER" };
+      return result;
+    }) });
+  }), { dsid: "123", clientId: "synthetic", clientBuildNumber: "synthetic", clientMasteringNumber: "synthetic", cloudKitURL: "https://p01-ckdatabasews.icloud.com/database/1/com.apple.reminders/production/private", remindersZoneOwner: owner });
+  await weeklyClient().modifyRecurringCompletion(weeklyFinal, async () => {});
+  for (const stale of [alarmId, ruleId, listId]) await assert.rejects(weeklyClient(stale).modifyRecurringCompletion(weeklyFinal, async () => {}), hasCode("CONFLICT"));
+  for (const drift of ["crypto", "parent"]) await assert.rejects(weeklyClient(drift).modifyRecurringCompletion(weeklyFinal, async () => {}), hasCode("WRITE_OUTCOME_UNKNOWN"));
+  assert.equal(weeklyPosts, 6);
+  const deleting = records(); deleting[0].raw.parent = { recordName: listId };
+  deleting[1].raw.parent = { recordName: deleting[0].recordName }; deleting[2].raw.parent = { recordName: alarmId }; deleting[3].raw.parent = { recordName: deleting[0].recordName };
+  deleting[0].fields.UrgentPresentationAlarmsAsData = { type: "ASSETID", value: { downloadURL: "https://synthetic.invalid/one", wrappingKey: "key", fileChecksum: "checksum", size: 1 } };
+  const deletionGraph = await loadSchedulingGraph(deleting[0], owner, lookup(deleting));
+  const occurrenceDelete = await planRecurringDeletion(deletionGraph, list, owner, "occurrence", undefined, plan.timestamp);
+  assert.equal(occurrenceDelete.operations.length, 7); assert.equal(occurrenceDelete.expected.length, 5); assert.equal(occurrenceDelete.ids.history, undefined);
+  assert.deepEqual(Object.keys(occurrenceDelete.active.fields).sort(), ["AlarmIDs", "DueDate", "LastModifiedDate", "ResolutionTokenMap"]);
+  assert.equal(occurrenceDelete.active.fields.DueDate.value, Date.parse("2027-01-17T09:00:00Z"));
+  const oldDeletionTokens = JSON.parse(String((deleting[0].fields.ResolutionTokenMap as { value: string }).value)).map;
+  const newDeletionTokens = JSON.parse(String(occurrenceDelete.active.fields.ResolutionTokenMap.value)).map;
+  assert.deepEqual(newDeletionTokens.completed, oldDeletionTokens.completed); assert.deepEqual(newDeletionTokens.completionDate, oldDeletionTokens.completionDate);
+  assert.equal(newDeletionTokens.dueDate.counter, oldDeletionTokens.dueDate.counter + 1);
+  assert.ok(occurrenceDelete.operations.filter(operation => operation.operationType === "create").every(operation => ["Alarm", "AlarmTrigger"].includes(operation.record.recordType)));
+  const futureDelete = await planRecurringDeletion(deletionGraph, list, owner, "all_future", undefined, plan.timestamp);
+  assert.equal(futureDelete.operations.length, 5); assert.deepEqual(Object.keys(futureDelete.ids), ["replicas"]); assert.deepEqual(futureDelete.retired, []);
+  assert.deepEqual(Object.keys(futureDelete.active.fields).sort(), ["Deleted", "LastModifiedDate", "List", "ResolutionTokenMap"]); assert.equal(futureDelete.active.parent, null);
+  assert.ok(futureDelete.operations.filter(operation => ["Alarm", "AlarmTrigger", "RecurrenceRule"].includes(operation.record.recordType)).every(operation => Object.keys(operation.record.fields).length === 1 && operation.record.fields.Deleted.value === 1));
+  const deletingRuleWithEnd = { ...deleting[3], fields: { ...deleting[3].fields, EndDate: { type: "TIMESTAMP", value: Date.parse("2027-01-17T09:00:00Z") } } };
+  const endedWeeklyDeletionGraph = await loadSchedulingGraph(deleting[0], owner, lookup([...deleting.slice(0, 3), deletingRuleWithEnd]));
+  const endedWeeklySkip = await planRecurringDeletion(endedWeeklyDeletionGraph, list, owner, "occurrence", undefined, plan.timestamp);
+  assert.equal(endedWeeklySkip.recipe, "timed_weekly_ended"); assert.equal(endedWeeklySkip.terminal, undefined); assert.equal(endedWeeklySkip.operations.length, 7);
+  assert.equal(endedWeeklySkip.active.fields.DueDate.value, Date.parse("2027-01-17T09:00:00Z"));
+  const sameDayRule = { ...deletingRuleWithEnd, fields: { ...deletingRuleWithEnd.fields, EndDate: { type: "TIMESTAMP", value: Date.parse("2027-01-10T05:26:40Z") } } };
+  const sameDayGraph = await loadSchedulingGraph(deleting[0], owner, lookup([...deleting.slice(0, 3), sameDayRule]));
+  const noMembers = { ...list, fields: { ...list.fields, ReminderIDs: { type: "STRING", value: "[]" } } };
+  const endedWeeklyFinal = await planRecurringDeletion(sameDayGraph, noMembers, owner, "occurrence", undefined, plan.timestamp);
+  assert.equal(endedWeeklyFinal.terminal, true); assert.equal(endedWeeklyFinal.operations.length, 5); assert.equal(endedWeeklyFinal.expected.length, 5);
+  assert.deepEqual(Object.keys(endedWeeklyFinal.ids), ["replicas"]); assert.deepEqual(endedWeeklyFinal.retired, []); assert.equal(endedWeeklyFinal.active.parent, null);
+  assert.deepEqual(Object.keys(endedWeeklyFinal.operations.find(operation => operation.record.recordType === "List")!.record.fields), ["ResolutionTokenMap"]);
+  const edgeRule = { ...deletingRuleWithEnd, fields: { ...deletingRuleWithEnd.fields, EndDate: { type: "TIMESTAMP", value: Date.parse("2027-01-17T05:26:40Z") } } };
+  const edgeGraph = await loadSchedulingGraph(deleting[0], owner, lookup([...deleting.slice(0, 3), edgeRule]));
+  await assert.rejects(planRecurringDeletion(edgeGraph, list, owner, "occurrence", undefined, plan.timestamp), error => hasCode("VALIDATION_ERROR")(error) && /all_future/.test((error as Error).message));
+  const edgeFuture = await planRecurringDeletion(edgeGraph, list, owner, "all_future", undefined, plan.timestamp);
+  assert.equal(edgeFuture.terminal, true); assert.equal(edgeFuture.operations.length, 5);
+  await assert.rejects(planRecurringDeletion(endedWeeklyDeletionGraph, list, owner, "occurrence", undefined, plan.timestamp, "Europe/London"), hasCode("UNSUPPORTED_FEATURE"));
+  const dstWeekly = structuredClone(deleting); dstWeekly[0].fields.DueDate = { type: "TIMESTAMP", value: Date.parse("2030-10-21T04:00:00Z") };
+  dstWeekly[2].fields.DateComponentsData = { type: "BYTES", value: b64(utf8(JSON.stringify(dateComponents("2030-10-21T04:00:00Z", "Europe/London")))) };
+  dstWeekly[3].fields.EndDate = { type: "TIMESTAMP", value: Date.parse("2030-10-28T06:26:20Z") };
+  const dstWeeklyDelete = await planRecurringDeletion(await loadSchedulingGraph(dstWeekly[0], owner, lookup(dstWeekly)), list, owner, "occurrence", undefined, plan.timestamp);
+  assert.equal(dstWeeklyDelete.active.fields.DueDate.value, Date.parse("2030-10-28T05:00:00Z"));
+  const pastRule = { ...sameDayRule, fields: { ...sameDayRule.fields, EndDate: { type: "TIMESTAMP", value: Date.parse("2027-01-09T23:59:59Z") } } };
+  await assert.rejects(planRecurringDeletion(await loadSchedulingGraph(deleting[0], owner, lookup([...deleting.slice(0, 3), pastRule])), list, owner, "all_future", undefined, plan.timestamp), hasCode("UNSUPPORTED_FEATURE"));
+  await assert.rejects(planRecurringDeletion(deletionGraph, list, owner, "all_future", occurrenceDelete.ids, plan.timestamp), hasCode("CONFLICT"));
+  let deletionPosts = 0;
+  const deletionClient = (recipe: typeof occurrenceDelete, variant?: string) => {
+    const state = new Map([...recipe.graph.records, recipe.list].map(record => [record.recordName, structuredClone(record)]));
+    return new CloudKitRemindersClient(new AppleHTTP(new CookieJar(), async (url, init) => {
+      if (new URL(String(url)).pathname.endsWith("/records/lookup")) return Response.json({ records: [state.get(recipe.active.recordName)] });
+      deletionPosts++; const payload = JSON.parse(String(init?.body)); assert.equal(payload.atomic, true); assert.equal(payload.operations.length, recipe.operations.length);
+      if ([ruleId, listId, alarmId].includes(variant ?? "")) return Response.json({ records: payload.operations.map((operation: { record: CloudKitRecord }) => ({ recordName: operation.record.recordName, serverErrorCode: operation.record.recordName === variant ? "CONFLICT" : "ATOMIC_ERROR" })) });
+      const receipts = payload.operations.map((operation: { operationType: string; record: CloudKitRecord & { parent?: { recordName: string | null } } }) => {
+        if (operation.operationType === "delete") { state.delete(operation.record.recordName); return { recordName: operation.record.recordName, deleted: true }; }
+        const before = state.get(operation.record.recordName), next = { ...before, ...operation.record, zoneID, raw: { ...before?.raw }, fields: { ...before?.fields, ...operation.record.fields }, recordChangeTag: "delete-confirmed" };
+        if (operation.record.parent?.recordName === null) { assert.deepEqual(operation.record.parent, { recordName: null }); delete next.parent; delete next.raw.parent; }
+        else if (operation.record.parent) next.raw.parent = next.parent;
+        else if (before?.raw.parent) next.parent = before.raw.parent as { recordName: string };
+        state.set(next.recordName, next);
+        if (variant === "crypto" && next.recordType === "Reminder") ((next.fields.UrgentPresentationAlarmsAsData as { value: Record<string, unknown> }).value).wrappingKey = "changed";
+        if (variant === "parent" && operation.operationType === "create" && next.recordType === "Alarm") next.parent = { recordName: "Reminder/OTHER" };
+        return operation.record.parent?.recordName === null ? { ...next, parent: before?.raw.parent } : next;
+      });
+      return Response.json({ records: receipts.reverse() });
+    }), { dsid: "123", clientId: "synthetic", clientBuildNumber: "synthetic", clientMasteringNumber: "synthetic", cloudKitURL: "https://p01-ckdatabasews.icloud.com/database/1/com.apple.reminders/production/private", remindersZoneOwner: owner });
+  };
+  await deletionClient(occurrenceDelete).modifyRecurringDeletion(occurrenceDelete, async () => {});
+  await deletionClient(futureDelete).modifyRecurringDeletion(futureDelete, async () => {});
+  for (const stale of [ruleId, listId, alarmId]) await assert.rejects(deletionClient(occurrenceDelete, stale).modifyRecurringDeletion(occurrenceDelete, async () => {}), hasCode("CONFLICT"));
+  for (const variant of ["crypto", "parent"]) await assert.rejects(deletionClient(occurrenceDelete, variant).modifyRecurringDeletion(occurrenceDelete, async () => {}), hasCode("WRITE_OUTCOME_UNKNOWN"));
+  await deletionClient(endedWeeklyFinal).modifyRecurringDeletion(endedWeeklyFinal, async () => {});
+  await deletionClient(edgeFuture).modifyRecurringDeletion(edgeFuture, async () => {});
+  assert.equal(deletionPosts, 9);
+  const dailyDeleteRoot = structuredClone(deleting[0]); dailyDeleteRoot.fields.AlarmIDs = { type: "UNKNOWN_LIST", value: [] }; dailyDeleteRoot.fields.AllDay = { type: "INT64", value: 1 };
+  dailyDeleteRoot.fields.DueDate = { type: "TIMESTAMP", value: Date.parse("2027-01-10T00:00:00Z") }; delete dailyDeleteRoot.fields.TimeZone;
+  const dailyDeleteRule = { ...deleting[3], fields: { ...deleting[3].fields, Frequency: { type: "INT64", value: 0 } } };
+  const dailyDeleteGraph = await loadSchedulingGraph(dailyDeleteRoot, owner, lookup([dailyDeleteRoot, dailyDeleteRule]));
+  const absentMembers = { ...list, fields: { ...list.fields, ReminderIDs: { type: "STRING", value: "[]" }, ResolutionTokenMap: { type: "STRING", value: JSON.stringify({ map: {
+    reminderIDsMergeableOrdering: { counter: 1, modificationTime: 1_700_000_000, replicaID: crypto.randomUUID() }, otherToken: { counter: 7, modificationTime: 1_700_000_000, replicaID: crypto.randomUUID() },
+  } }) } } };
+  const dailySkip = await planRecurringDeletion(dailyDeleteGraph, absentMembers, owner, "occurrence", undefined, Date.parse("2027-01-10T12:00:00Z"));
+  assert.equal(dailySkip.recipe, "all_day_daily"); assert.equal(dailySkip.operations.length, 3); assert.equal(dailySkip.expected.length, 3); assert.deepEqual(Object.keys(dailySkip.ids), ["replicas"]); assert.deepEqual(dailySkip.retired, []);
+  assert.deepEqual(Object.keys(dailySkip.active.fields).sort(), ["DueDate", "LastModifiedDate", "ResolutionTokenMap"]); assert.equal(dailySkip.active.fields.DueDate.value, Date.parse("2027-01-11T00:00:00Z"));
+  const dailyRetire = await planRecurringDeletion(dailyDeleteGraph, absentMembers, owner, "all_future", undefined, dailySkip.timestamp);
+  assert.equal(dailyRetire.expected.length, 3); assert.deepEqual(Object.keys(dailyRetire.ids), ["replicas"]);
+  const dailyListWrite = dailyRetire.operations.find(operation => operation.record.recordType === "List")!;
+  assert.deepEqual(Object.keys(dailyListWrite.record.fields), ["ResolutionTokenMap"]);
+  const oldOrdering = JSON.parse(String((absentMembers.fields.ResolutionTokenMap as { value: string }).value)).map, newOrdering = JSON.parse(String(dailyListWrite.record.fields.ResolutionTokenMap.value)).map;
+  assert.equal(newOrdering.reminderIDsMergeableOrdering.counter, 2); assert.deepEqual(newOrdering.otherToken, oldOrdering.otherToken);
+  const weeklyAbsentRetire = await planRecurringDeletion(deletionGraph, absentMembers, owner, "all_future", futureDelete.ids, futureDelete.timestamp);
+  assert.equal(Object.hasOwn(weeklyAbsentRetire, "recipe"), false); assert.deepEqual(weeklyAbsentRetire.operations.find(operation => operation.record.recordType === "List")!.record.fields, { Deleted: { type: "INT64", value: 0 } });
+  const dailyWithMember = await planRecurringDeletion(dailyDeleteGraph, list, owner, "all_future", undefined, dailySkip.timestamp);
+  assert.ok(Object.hasOwn(dailyWithMember.operations.find(operation => operation.record.recordType === "List")!.record.fields, "ReminderIDs"));
+  const endedDeleteRule = { ...dailyDeleteRule, fields: { ...dailyDeleteRule.fields, EndDate: { type: "TIMESTAMP", value: Date.parse("2027-01-11T00:00:00Z") } } };
+  const endedDeleteGraph = await loadSchedulingGraph(dailyDeleteRoot, owner, lookup([dailyDeleteRoot, endedDeleteRule]));
+  const endedSkip = await planRecurringDeletion(endedDeleteGraph, absentMembers, owner, "occurrence", undefined, dailySkip.timestamp);
+  assert.equal(endedSkip.recipe, "all_day_daily_ended"); assert.equal(endedSkip.terminal, undefined);
+  assert.equal(endedSkip.active.fields.DueDate.value, Date.parse("2027-01-11T00:00:00Z")); assert.equal(endedSkip.expected.length, 3);
+  const endedFinalRoot = { ...dailyDeleteRoot, fields: { ...dailyDeleteRoot.fields, ...endedSkip.active.fields } };
+  const endedFinalGraph = await loadSchedulingGraph(endedFinalRoot, owner, lookup([endedFinalRoot, endedDeleteRule]));
+  const finalDelete = await planRecurringDeletion(endedFinalGraph, absentMembers, owner, "occurrence", undefined, Date.parse("2027-01-11T12:00:00Z"));
+  assert.equal(finalDelete.terminal, true); assert.equal(finalDelete.scope, "occurrence"); assert.equal(finalDelete.active.parent, null);
+  assert.deepEqual(Object.keys(finalDelete.active.fields).sort(), ["Deleted", "LastModifiedDate", "List", "ResolutionTokenMap"]);
+  assert.equal(finalDelete.operations.length, 3); assert.deepEqual(finalDelete.retired, []); assert.deepEqual(Object.keys(finalDelete.ids), ["replicas"]);
+  assert.equal((await planRecurringDeletion(endedDeleteGraph, absentMembers, owner, "all_future", undefined, dailySkip.timestamp)).terminal, true);
+  await assert.rejects(planRecurringDeletion(endedFinalGraph, absentMembers, owner, "occurrence", undefined, dailySkip.timestamp, "America/Los_Angeles"), hasCode("UNSUPPORTED_FEATURE"));
+  const dstDeleteRoot = { ...dailyDeleteRoot, fields: { ...dailyDeleteRoot.fields, DueDate: { type: "TIMESTAMP", value: Date.parse("2030-10-26T00:00:00Z") } } };
+  const dstDeleteRule = { ...endedDeleteRule, fields: { ...endedDeleteRule.fields, EndDate: { type: "TIMESTAMP", value: Date.parse("2030-10-26T23:51:29Z") } } };
+  const dstDeleteGraph = await loadSchedulingGraph(dstDeleteRoot, owner, lookup([dstDeleteRoot, dstDeleteRule]));
+  await assert.rejects(planRecurringDeletion(dstDeleteGraph, absentMembers, owner, "occurrence", undefined, dailySkip.timestamp), hasCode("UNSUPPORTED_FEATURE"));
+  const dstDelete = await planRecurringDeletion(dstDeleteGraph, absentMembers, owner, "occurrence", undefined, dailySkip.timestamp, "Europe/London");
+  assert.equal(dstDelete.active.fields.DueDate.value, Date.parse("2030-10-27T00:00:00Z")); assert.equal(dstDelete.terminal, undefined);
+  assert.equal((await planRecurringDeletion(dstDeleteGraph, absentMembers, owner, "occurrence", undefined, dailySkip.timestamp, "UTC")).terminal, true);
+  await assert.rejects(planRecurringDeletion(dailyDeleteGraph, absentMembers, owner, "occurrence", undefined, dailySkip.timestamp, "Europe/London"), hasCode("UNSUPPORTED_FEATURE"));
+  const dailyTimedRoot = { ...dailyDeleteRoot, fields: { ...dailyDeleteRoot.fields, DueDate: { type: "TIMESTAMP", value: Date.parse("2027-01-10T01:00:00Z") } } };
+  await assert.rejects(planRecurringDeletion(await loadSchedulingGraph(dailyTimedRoot, owner, lookup([dailyTimedRoot, dailyDeleteRule])), absentMembers, owner, "all_future", undefined, dailySkip.timestamp), hasCode("UNSUPPORTED_FEATURE"));
+  const monthly = records(); monthly[0].fields.AlarmIDs = { type: "UNKNOWN_LIST", value: [] }; monthly[0].fields.AllDay = { type: "INT64", value: 1 };
+  monthly[0].fields.DueDate = { type: "TIMESTAMP", value: Date.parse("2027-01-31T00:00:00Z") }; delete monthly[0].fields.TimeZone;
+  monthly[3].fields.Frequency = { type: "INT64", value: 2 }; monthly[3].fields.DaysOfTheMonth = { type: "BYTES", value: b64(utf8("[28,29,30,31]")) };
+  monthly[3].fields.SetPositions = { type: "BYTES", value: b64(utf8("[-1]")) };
+  const monthlyGraph = await loadSchedulingGraph(monthly[0], owner, lookup(monthly));
+  assert.equal((await planRecurringCompletion(monthlyGraph, list, owner, ids, plan.timestamp)).active.fields.DueDate.value, Date.parse("2027-02-28T00:00:00Z"));
+  const monthlyDelete = await planRecurringDeletion(monthlyGraph, noMembers, owner, "occurrence", undefined, plan.timestamp);
+  assert.equal(monthlyDelete.recipe, "all_day_last_day_monthly"); assert.equal(monthlyDelete.active.fields.DueDate.value, Date.parse("2027-02-28T00:00:00Z"));
+  assert.equal(monthlyDelete.operations.length, 3); assert.equal(monthlyDelete.expected.length, 3); assert.deepEqual(monthlyDelete.retired, []); assert.deepEqual(Object.keys(monthlyDelete.ids), ["replicas"]);
+  assert.deepEqual(Object.keys(monthlyDelete.active.fields).sort(), ["DueDate", "LastModifiedDate", "ResolutionTokenMap"]);
+  const monthlyFuture = await planRecurringDeletion(monthlyGraph, noMembers, owner, "all_future", undefined, plan.timestamp);
+  assert.equal(monthlyFuture.active.parent, null); assert.equal(monthlyFuture.terminal, undefined);
+  assert.deepEqual(Object.keys(monthlyFuture.operations.find(operation => operation.record.recordType === "List")!.record.fields), ["ResolutionTokenMap"]);
+  assert.deepEqual(monthlyFuture.operations.find(operation => operation.record.recordType === "RecurrenceRule")!.record.fields, { Deleted: { type: "INT64", value: 1 } });
+  for (const [before, after] of [["2028-01-31", "2028-02-29"], ["2028-02-29", "2028-03-31"], ["2027-12-31", "2028-01-31"]]) {
+    const root = { ...monthly[0], fields: { ...monthly[0].fields, DueDate: { type: "TIMESTAMP", value: Date.parse(`${before}T00:00:00Z`) } } };
+    const graph = await loadSchedulingGraph(root, owner, lookup([root, monthly[3]]));
+    assert.equal((await planRecurringDeletion(graph, noMembers, owner, "occurrence", undefined, plan.timestamp)).active.fields.DueDate.value, Date.parse(`${after}T00:00:00Z`));
+  }
+  const wrongMonthlyAnchor = { ...monthly[0], fields: { ...monthly[0].fields, DueDate: { type: "TIMESTAMP", value: Date.parse("2027-01-30T00:00:00Z") } } };
+  for (const scope of ["occurrence", "all_future"] as const) await assert.rejects(planRecurringDeletion(await loadSchedulingGraph(wrongMonthlyAnchor, owner, lookup([wrongMonthlyAnchor, monthly[3]])), noMembers, owner, scope, undefined, plan.timestamp), hasCode("UNSUPPORTED_FEATURE"));
+  await assert.rejects(planRecurringDeletion(monthlyGraph, noMembers, owner, "occurrence", undefined, plan.timestamp, "UTC"), hasCode("UNSUPPORTED_FEATURE"));
+  const endedMonthlyRule = { ...monthly[3], fields: { ...monthly[3].fields, EndDate: { type: "TIMESTAMP", value: Date.parse("2027-03-31T00:00:00Z") } } };
+  await assert.rejects(planRecurringDeletion(await loadSchedulingGraph(monthly[0], owner, lookup([monthly[0], endedMonthlyRule])), noMembers, owner, "all_future", undefined, plan.timestamp), hasCode("UNSUPPORTED_FEATURE"));
+
+  const daily = records(); daily[0].fields.AlarmIDs = { type: "UNKNOWN_LIST", value: [] }; daily[0].fields.AllDay = { type: "INT64", value: 1 };
+  daily[0].fields.DueDate = { type: "TIMESTAMP", value: Date.parse("2027-01-11T00:00:00Z") }; delete daily[0].fields.TimeZone;
+  daily[3].fields.Frequency = { type: "INT64", value: 0 }; daily[3].fields.EndDate = { type: "TIMESTAMP", value: Date.parse("2027-01-12T00:00:00Z") };
+  const dailyGraph = await loadSchedulingGraph(daily[0], owner, lookup(daily));
+  const penultimate = await planRecurringCompletion(dailyGraph, list, owner, ids, plan.timestamp);
+  assert.equal(penultimate.mode, "advance"); assert.ok(penultimate.history); assert.ok(penultimate.membership);
+  assert.equal(penultimate.active.fields.DueDate.value, Date.parse("2027-01-12T00:00:00Z"));
+  const finalRoot = { ...daily[0], recordChangeTag: "final-before", fields: { ...daily[0].fields, ...penultimate.active.fields } };
+  const finalList = { ...list, fields: { ...list.fields, ...penultimate.membership.fields }, recordChangeTag: "final-list-before" };
+  const finalGraph = await loadSchedulingGraph(finalRoot, owner, lookup([finalRoot, daily[3]]));
+  const final = await planRecurringCompletion(finalGraph, finalList, owner, undefined, Date.parse("2027-01-12T12:00:00Z"));
+  const omittedZoneList = { ...finalList }; delete omittedZoneList.zoneID;
+  const reboundFinal = await planRecurringCompletion(finalGraph, omittedZoneList, owner, final.ids, final.timestamp);
+  assert.equal(reboundFinal.sourceFingerprint, final.sourceFingerprint); assert.deepEqual(reboundFinal.expected, final.expected);
+  assert.deepEqual(reboundFinal.guards.find(record => record.recordType === "List")?.zoneID, { zoneName: "Reminders", zoneType: "REGULAR_CUSTOM_ZONE", ownerRecordName: owner });
+  assert.equal(final.mode, "final"); assert.equal(final.history, undefined); assert.equal(final.membership, undefined);
+  assert.deepEqual(Object.keys(final.ids), ["replicas"]); assert.equal(final.expected.length, 3); assert.equal(final.operations.length, 1);
+  assert.deepEqual(final.guards.map(record => record.recordType), ["RecurrenceRule", "List"]);
+  assert.deepEqual(Object.keys(final.active.fields).sort(), ["Completed", "CompletionDate", "LastModifiedDate", "ResolutionTokenMap"]);
+  assert.deepEqual(JSON.parse(String(final.active.fields.ResolutionTokenMap.value)).map.dueDate, JSON.parse(String((finalRoot.fields.ResolutionTokenMap as { value: string }).value)).map.dueDate);
+  const reopenedRoot = { ...finalRoot, recordChangeTag: "reopen-before", fields: { ...finalRoot.fields, ...final.active.fields } };
+  const reopen = await planRecurringCompletion(await loadSchedulingGraph(reopenedRoot, owner, lookup([reopenedRoot, daily[3]])), finalList, owner, undefined, final.timestamp + 1000, "reopen");
+  assert.equal(reopen.mode, "reopen"); assert.equal(reopen.active.fields.Completed.value, 0); assert.equal(reopen.active.fields.CompletionDate.value, null);
+  assert.equal(reopen.history, undefined); assert.equal(reopen.operations.length, 1);
+  let terminalDispatches = 0;
+  const terminalClient = (stale?: string) => new CloudKitRemindersClient(new AppleHTTP(new CookieJar(), async (_, init) => {
+    terminalDispatches++;
+    const payload = JSON.parse(String(init?.body)); assert.equal(payload.atomic, true); assert.equal(payload.operations.length, 3);
+    assert.ok(payload.operations.every((operation: { operationType: string }) => operation.operationType === "update"));
+    if (stale) return Response.json({ records: payload.operations.map((operation: { record: { recordName: string } }) => ({ recordName: operation.record.recordName, serverErrorCode: operation.record.recordName === stale ? "CONFLICT" : "ATOMIC_ERROR" })) });
+    return Response.json({ records: payload.operations.map((operation: { record: CloudKitRecord }) => {
+      const before = [finalRoot, finalList, daily[3]].find(record => record.recordName === operation.record.recordName)!;
+      return { ...operation.record, fields: { ...before.fields, ...operation.record.fields }, recordChangeTag: `confirmed-${operation.record.recordName}`, zoneID };
+    }) });
+  }), { dsid: "123", clientId: "synthetic", clientBuildNumber: "synthetic", clientMasteringNumber: "synthetic", cloudKitURL: "https://p01-ckdatabasews.icloud.com/database/1/com.apple.reminders/production/private", remindersZoneOwner: owner });
+  await terminalClient().modifyRecurringCompletion(final, async () => {});
+  for (const stale of [ruleId, listId]) await assert.rejects(terminalClient(stale).modifyRecurringCompletion(final, async () => {}), hasCode("CONFLICT"));
+  await assert.rejects(terminalClient().modifyRecurringCompletion({ ...final, guards: final.guards.slice(0, 1) }, async () => {}), hasCode("VALIDATION_ERROR"));
+  assert.equal(terminalDispatches, 3);
+  for (const fields of [{ EndDate: { type: "TIMESTAMP", value: Date.parse("2027-01-12T09:00:00Z") } }, { OccurrenceCount: { type: "INT64", value: 2 } }]) {
+    const badRule = { ...daily[3], fields: { ...daily[3].fields, ...fields } };
+    const unsupported = await loadSchedulingGraph(finalRoot, owner, lookup([finalRoot, badRule]));
+    await assert.rejects(planRecurringCompletion(unsupported, finalList, owner, undefined, final.timestamp), hasCode("UNSUPPORTED_FEATURE"));
+  }
+  assert.equal(new Date(recurrenceEndCalendarLabel(Date.parse("2026-10-24T23:51:29Z"), "Europe/London")).toISOString(), "2026-10-25T00:00:00.000Z");
+  assert.equal(new Date(recurrenceEndCalendarLabel(Date.parse("2026-03-28T23:30:00Z"), "Europe/London")).toISOString(), "2026-03-28T00:00:00.000Z");
+  assert.equal(new Date(recurrenceEndCalendarLabel(Date.parse("2026-03-29T23:30:00Z"), "Europe/London")).toISOString(), "2026-03-30T00:00:00.000Z");
+  assert.equal(RecurrenceCalendarTimeZone.safeParse("+01:00").success, false); assert.equal(RecurrenceCalendarTimeZone.safeParse("Europe/Unknown").success, false);
+  const zonedRoot = { ...daily[0], fields: { ...daily[0].fields, DueDate: { type: "TIMESTAMP", value: Date.parse("2026-10-24T00:00:00Z") }, CreationDate: { type: "TIMESTAMP", value: Date.parse("2026-10-01T00:00:00Z") } } };
+  const zonedRule = { ...daily[3], fields: { ...daily[3].fields, EndDate: { type: "TIMESTAMP", value: Date.parse("2026-10-24T23:51:29Z") } } };
+  const zonedGraph = await loadSchedulingGraph(zonedRoot, owner, lookup([zonedRoot, zonedRule])), zonedTime = Date.parse("2026-10-24T12:00:00Z");
+  await assert.rejects(planRecurringCompletion(zonedGraph, list, owner, undefined, zonedTime), hasCode("UNSUPPORTED_FEATURE"));
+  const calendarAdvance = await planRecurringCompletion(zonedGraph, list, owner, undefined, zonedTime, "complete", "Europe/London");
+  assert.equal(calendarAdvance.mode, "advance"); assert.equal(calendarAdvance.active.fields.DueDate.value, Date.parse("2026-10-25T00:00:00Z"));
+  assert.equal(calendarAdvance.recurrenceCalendarTimeZone, "Europe/London"); assert.equal(calendarAdvance.active.fields.TimeZone, undefined);
+  const utcFinal = await planRecurringCompletion(zonedGraph, list, owner, undefined, zonedTime, "complete", "UTC");
+  assert.equal(utcFinal.mode, "final");
+  const calendarFinalRoot = { ...zonedRoot, fields: { ...zonedRoot.fields, ...calendarAdvance.active.fields } };
+  const calendarFinalGraph = await loadSchedulingGraph(calendarFinalRoot, owner, lookup([calendarFinalRoot, zonedRule]));
+  const calendarFinal = await planRecurringCompletion(calendarFinalGraph, list, owner, undefined, zonedTime + 86_400_000, "complete", "Europe/London");
+  assert.equal(calendarFinal.mode, "final"); assert.equal(calendarFinal.history, undefined);
+  await assert.rejects(planRecurringCompletion(calendarFinalGraph, list, owner, undefined, zonedTime, "complete", "UTC"), hasCode("UNSUPPORTED_FEATURE"));
+  const calendarCompletedRoot = { ...calendarFinalRoot, fields: { ...calendarFinalRoot.fields, ...calendarFinal.active.fields } };
+  const calendarReopenGraph = await loadSchedulingGraph(calendarCompletedRoot, owner, lookup([calendarCompletedRoot, zonedRule]));
+  assert.equal((await planRecurringCompletion(calendarReopenGraph, list, owner, undefined, zonedTime + 86_400_000, "reopen", "Europe/London")).mode, "reopen");
+  await assert.rejects(planRecurringCompletion(calendarReopenGraph, list, owner, undefined, zonedTime, "reopen", "UTC"), hasCode("UNSUPPORTED_FEATURE"));
+  const midnightZonedRule = { ...zonedRule, fields: { ...zonedRule.fields, EndDate: { type: "TIMESTAMP", value: Date.parse("2026-10-25T00:00:00Z") } } };
+  const midnightZonedGraph = await loadSchedulingGraph(zonedRoot, owner, lookup([zonedRoot, midnightZonedRule]));
+  assert.equal((await planRecurringCompletion(midnightZonedGraph, list, owner, undefined, zonedTime)).mode, "advance");
+  assert.equal((await planRecurringCompletion(midnightZonedGraph, list, owner, undefined, zonedTime, "complete", "America/New_York")).mode, "final");
+  await assert.rejects(planRecurringCompletion(graph, list, owner, undefined, plan.timestamp, "complete", "Europe/London"), hasCode("UNSUPPORTED_FEATURE"));
 });

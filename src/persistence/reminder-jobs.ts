@@ -197,13 +197,9 @@ export class ReminderJobRepository {
   }
   async start(job: JobRow) {
     const nonce = crypto.randomUUID();
-    const results = await this.db.batch([
-      this.db.prepare("UPDATE reminder_jobs SET state = 'queued', revision = revision + 1, mutation_id = ?, updated_at = ? WHERE owner_id = ? AND job_id = ? AND state = 'ready' AND revision = ? AND cancel_requested = 0 AND expires_at > ? AND lease_until <= ?")
-        .bind(nonce, Date.now(), this.owner, job.job_id, job.revision, Date.now(), Date.now()),
-      this.db.prepare(`INSERT INTO reminder_job_outbox (owner_id, job_id, revision) SELECT owner_id, job_id, revision FROM reminder_jobs WHERE owner_id = ? AND job_id = ? AND mutation_id = ?
-        ON CONFLICT(owner_id, job_id) DO UPDATE SET revision = excluded.revision, next_eligible_at = 0`).bind(this.owner, job.job_id, nonce),
-    ]);
-    if (!results[0].meta.changes) throw conflict("Start requires the reviewed, unexpired ready manifest.");
+    const result = await this.db.prepare("UPDATE reminder_jobs SET state = 'queued', revision = revision + 1, mutation_id = ?, updated_at = ? WHERE owner_id = ? AND job_id = ? AND state = 'ready' AND revision = ? AND cancel_requested = 0 AND expires_at > ? AND lease_until <= ?")
+      .bind(nonce, Date.now(), this.owner, job.job_id, job.revision, Date.now(), Date.now()).run();
+    if (!result.meta.changes) throw conflict("Start requires the reviewed, unexpired ready manifest.");
   }
   async cancel(job: JobRow) {
     await this.db.batch([
@@ -221,36 +217,6 @@ export class ReminderJobRepository {
     const current = await this.get(job.job_id), counts = await this.counts(current);
     const state = aggregateState(counts, !!current.cancel_requested);
     await this.transition(current, lease, state);
-    await this.syncOutbox(await this.get(job.job_id));
-  }
-  async syncOutbox(job: JobRow) {
-    await this.db.batch([
-      this.db.prepare(`INSERT INTO reminder_job_outbox (owner_id, job_id, revision, next_eligible_at)
-        SELECT owner_id, job_id, revision, next_eligible_at FROM reminder_jobs WHERE owner_id = ? AND job_id = ? AND state IN ('queued','running','waiting_retry')
-        ON CONFLICT(owner_id, job_id) DO UPDATE SET revision = excluded.revision, next_eligible_at = excluded.next_eligible_at`)
-        .bind(this.owner, job.job_id),
-      this.db.prepare("DELETE FROM reminder_job_outbox WHERE owner_id = ? AND job_id = ? AND NOT EXISTS (SELECT 1 FROM reminder_jobs WHERE owner_id = ? AND job_id = ? AND state IN ('queued','running','waiting_retry'))")
-        .bind(this.owner, job.job_id, this.owner, job.job_id),
-    ]);
-  }
-  async deliveryNotBefore(job: JobRow) {
-    const account = await this.db.prepare("SELECT lease_until, cooldown_until FROM reminder_job_accounts WHERE owner_id = ? AND account_scope = ?")
-      .bind(this.owner, job.account_scope).first<{ lease_until: number; cooldown_until: number }>();
-    return Math.max(job.next_eligible_at, job.lease_until, account?.lease_until ?? 0, account?.cooldown_until ?? 0);
-  }
-  async dueDeliveries() {
-    const result = await this.db.prepare(`SELECT o.job_id, j.revision FROM reminder_job_outbox o
-      JOIN reminder_jobs j ON j.owner_id = o.owner_id AND j.job_id = o.job_id
-      LEFT JOIN reminder_job_accounts a ON a.owner_id = j.owner_id AND a.account_scope = j.account_scope
-      WHERE o.owner_id = ? AND o.next_eligible_at <= ? AND j.next_eligible_at <= ? AND j.lease_until <= ?
-        AND COALESCE(a.lease_until, 0) <= ? AND COALESCE(a.cooldown_until, 0) <= ? AND j.state IN ('queued','running','waiting_retry')
-      ORDER BY j.created_at, j.job_id LIMIT ?`)
-      .bind(this.owner, Date.now(), Date.now(), Date.now(), Date.now(), Date.now(), JOB_LIMITS.activeJobs).all<{ job_id: string; revision: number }>();
-    return result.results;
-  }
-  async deferDelivery(jobId: string, revision: number, nextAt: number) {
-    await this.db.prepare("UPDATE reminder_job_outbox SET revision = ?, next_eligible_at = ? WHERE owner_id = ? AND job_id = ? AND revision <= ? AND EXISTS (SELECT 1 FROM reminder_jobs WHERE owner_id = ? AND job_id = ? AND revision = ?)")
-      .bind(revision, nextAt, this.owner, jobId, revision, this.owner, jobId, revision).run();
   }
   async purgeResolvedContent(now = Date.now()) {
     // Receipt keys remain reserved indefinitely. Unknown/in-flight content is
@@ -269,8 +235,6 @@ export class ReminderJobRepository {
         .bind(now, this.owner, now, now),
       this.db.prepare(`UPDATE reminder_job_items SET state = 'cancelled' WHERE owner_id = ? AND state IN ('pending','preparing') AND dispatch_phase <> 'intent'
         AND EXISTS (SELECT 1 FROM reminder_jobs j WHERE j.owner_id = reminder_job_items.owner_id AND j.job_id = reminder_job_items.job_id AND j.state = 'expired')`)
-        .bind(this.owner),
-      this.db.prepare(`DELETE FROM reminder_job_outbox WHERE owner_id = ? AND EXISTS (SELECT 1 FROM reminder_jobs j WHERE j.owner_id = reminder_job_outbox.owner_id AND j.job_id = reminder_job_outbox.job_id AND j.state = 'expired')`)
         .bind(this.owner),
     ]);
   }

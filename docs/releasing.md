@@ -69,9 +69,9 @@ Do not reset or recreate databases during upgrades.
 
 Release request-driven simple bulk creation independently of linked scheduling and deletion.
 Simple bulk creation is permanent once the additive schema and compatible readers are installed;
-no feature flag is required. Both targets default to request-driven
-execution; the standalone Queue adapter additionally requires exact private producer/consumer
-bindings, its dedicated outbox schedule and deployment verification. Sites must not set Queue mode.
+no feature flag is required. Both targets use request-driven execution exclusively.
+Standalone configuration rejects Queue bindings, cron schedules and retired delivery-mode
+variables. Verify authenticated continuations and preserved D1/session state when upgrading.
 The verified in-place timed absolute-alarm date recipe is permanent ready-account functionality,
 including active recurring occurrences; verify its shared API/MCP contracts on the target build.
 Simple bulk deletion is permanent with per-item single-delete checks and post-commit subtask reports.

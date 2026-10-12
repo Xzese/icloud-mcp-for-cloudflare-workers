@@ -29,17 +29,138 @@ explicitly supplied; incompatible all-day settings are rejected.
 An existing undated reminder can carry Apple's all-day marker; unrelated edits preserve it.
 
 The separate `complete_reminder`, `reopen_reminder` and `delete_reminder` tools accept an exact
-`listId`, `reminderId` and current `recordChangeTag`. Completion sets `Completed=1` and a current
+`listId`, `reminderId` and current `recordChangeTag`. Ordinary completion sets `Completed=1` and a current
 completion timestamp. Reopening sets `Completed=0` and clears that timestamp. Deletion sets
 `Deleted=1` through a normal version-checked update; it does not hard-delete the CloudKit record.
 No restore tool is provided. These tools preserve title, notes, dates and other omitted fields.
 
-State changes refuse recurring, alarmed and nested reminders, and parents whose children are
-observed in a bounded complete list inspection (including completed children).
-Each action sends exactly one version-checked record update; it never cascades.
-An incomplete/errorful or over-budget child inspection blocks the action. This check is **not**
-proof of commit-time protection against a newly added, unreferenced child. Bulk deletion uses the
-same per-item checks and additionally rescans after commit to report any remaining subtasks. Use Apple's app for completing, reopening or deleting parents and their subtasks.
+Completion and reopening support bounded ordinary one-level families without recurrence,
+including zero or one validated absolute-date Alarm/AlarmTrigger pair per member. Completing a root completes open children at one shared timestamp and preserves already
+completed children. Reopening a root reopens only children whose completion timestamp equals
+the root's previous timestamp. Independent child actions change only that child. All known
+family members, all date pairs and the List participate as mutations or exact-version guards in one atomic
+group, up to 32 records and 64 KiB. The response's optional `affectedRecords` lists changed
+reminders. See [native observations and concurrency limits](lifecycle-protocol.md).
+
+Ordinary standalone timed roots with exactly one native absolute-date Alarm/AlarmTrigger
+also support completion, reopening and recoverable deletion. The inspected root, exact pair
+and List participate in one atomic, version-checked group. Completion and reopening retain
+all date fields and both related identities. Deletion detaches the selected root, removes its
+List membership and changes only `Deleted` on the pair, retaining its native backlinks and
+intrinsic parents. Exact deletion readback verifies the detached receipt version. Recurrence,
+early/location alarms and other relationships require their own recipes. One-level
+nonrecurring families use the composite recipe described above. A lost
+acknowledgement returns uncertainty; the original stale arguments cannot dispatch again.
+Read the exact reminder and related records before considering a different action.
+
+Recurring completion has separate root-only recipes: interval-one timed weekly recurrence
+in an IANA zone, with zero or one absolute date alarm; all-day daily recurrence without a
+stored time zone; and the observed all-day last-day monthly rule. Calendar advancement
+preserves local time across clock changes. The active ID remains open at the next due date;
+`completedOccurrence` returns a fresh completed reminder at the previous date, without a
+recurrence link. History retains the original creation date and encoded title/notes documents.
+The List membership inserts history immediately before the active record. Alarmed weekly
+completion retires only the old exact Alarm/AlarmTrigger and creates separate pairs for the
+next active occurrence and the completed history, in the same atomic group.
+
+The encrypted session retains a bounded occurrence intent before dispatch: original request
+fingerprint, selected IDs/time, source/expected hashes and dispatch phase, without reminder
+bodies. Retrying the original ID/tag arguments after an uncertain acknowledgement reconciles
+those identities through exact reads and sends no second completion. A fresh tag represents
+a different occurrence and must follow review of the first outcome. At most 256 intents are
+retained; only confirmed oldest entries can be pruned. Unresolved entries are never evicted
+to permit replay. Session replacement clears this session-bound evidence. Other end conditions,
+overdue skipping, other patterns, recurring families, tags/attachments, early/location alarms
+and other recurring reopening/deletion patterns require separate recipes.
+
+Recurring deletion requires `recurringDeletionScope: "occurrence" | "all_future"`.
+Supported recipes are a childless open timed interval-one weekly root in its stored IANA
+zone with exactly one absolute-date pair, or an all-day interval-one daily or observed
+last-day monthly root at a midnight-UTC calendar label without a stored time zone or
+alarms. These require no count/exception pattern. Last-day monthly deletion requires
+the exact month-days `[28,29,30,31]` and set-position `[-1]` rule, a due date on the
+actual UTC month end and no end condition. Daily and timed weekly deletion may have an end condition
+as described below. Omission is
+refused for recurring targets, and the argument is refused for ordinary deletion.
+
+`occurrence` advances the same active ID to the next calendar due date, except for
+a final supported end-day occurrence, which retires as described below. Weekly deletion
+hard-retires only its exact old Alarm/AlarmTrigger and creates one fresh active pair.
+Daily and last-day monthly deletion create no pair or new record IDs. No recipe creates completed history;
+advancement preserves completion fields, Rule fields and earlier histories. `all_future`
+detaches and soft-deletes the active root and changes only `Deleted` on its exact current
+Rule and any supported pair, preserving their backlinks and intrinsic parents. Only the
+active List membership is removed when present. Daily, last-day monthly and ended weekly retirement also advance the List
+ordering token when the target is absent from its established membership, retaining that
+membership. Both scopes share bounded exact graph/List atomics.
+
+A deletion-specific operation/scope discriminator binds durable request fingerprints,
+immutable selected IDs/time, source/outcome hashes and dispatch phases. Existing completion
+intents retain their original format and fingerprint. Repeat the identical original
+ID/tag/scope to reconcile uncertainty through exact reads with zero further writes;
+a different scope cannot reuse that outcome. Detached-root confirmation requires an exact
+read at the receipt version. Strict verification retains asset encryption metadata and
+intrinsic relationships; only previously proven signed URL refresh is normalized.
+Ended all-day daily deletion uses the same inclusive calendar interpretation as
+completion. Omission of `recurrenceCalendarTimeZone` accepts only midnight-UTC
+EndDate instants; an explicit IANA zone interprets the stored instant as a local
+calendar date. Earlier occurrence deletion advances to the next daily label within
+that end; final occurrence deletion retires the root and Rule in place, retaining
+the due date and the original `occurrence` scope. All-future deletion also retires
+a valid ended active occurrence. An active date beyond its end is refused.
+The calendar argument is refused for ordinary, weekly, monthly and non-ended daily deletion.
+Retain the identical scope and zone with original arguments for reconciliation.
+New ended/terminal discriminators leave earlier deletion and completion layouts
+unchanged. Other recurring patterns remain active work.
+
+Ended timed weekly deletion interprets the end and due calendar days in the
+Reminder's stored IANA zone. On the end day, occurrence deletion retires the
+active graph, including when the raw end clock precedes the due time. Earlier
+occurrence deletion advances only when the next weekly instant fits within the
+stored end. The proved native zero-advance edge returns `VALIDATION_ERROR` before
+dispatch with guidance to request explicit `all_future` or review the end date;
+caller scope is never changed implicitly. All-future deletion retires that valid
+active graph directly. Ended weekly retirement changes only the current Rule/pair
+Deleted markers, retains their backlinks and due/end fields, and creates no new
+pair or history. The five-record recipe/terminal intent preserves earlier layouts.
+
+An all-day daily interval-one root without a stored time zone or alarms supports an inclusive
+end calendar date. Omitting `recurrenceCalendarTimeZone` retains the midnight-UTC end recipe
+and refuses nonmidnight instants. Supplying an explicit IANA zone interprets the raw `EndDate`
+instant as a Gregorian calendar date in that zone, including when the instant is midnight UTC.
+The all-day due date remains a UTC calendar label. The connector never infers this zone or
+writes it into the Reminder's stored `TimeZone`. This argument is accepted by completion, reopening and deletion of the supported
+ended daily recipe; other lifecycle recipes refuse it.
+
+Earlier occurrences advance with history. At the final calendar date, the same active record
+completes in place, retaining its due date and rule and returning no `completedOccurrence`.
+Reopening that ended active record clears completion and creates no history. Both operations
+retain their original ID/tag/action and explicit-zone intents and reconcile read-only. Keep
+the identical zone on uncertain retries; omission or a different zone cannot reuse that
+outcome. Existing requests without the argument retain their previous fingerprint and intent
+shape. Exact Rule and List guards preserve semantic fields while advancing guard versions.
+Other end/count variants remain separate recipes.
+
+Deletion uses the captured ordinary or absolute-date one-level family recipe. The selected root or child loses
+its List, subtask parent and intrinsic parent references and is removed from List membership.
+Direct child deletion also advances its root's modification timestamp; sibling contents remain
+unchanged under version guards. Direct dated-child deletion changes only `Deleted` on that
+child's pair; its root and sibling pairs retain their fields. Parent deletion retires every
+live family date pair by changing only `Deleted` and retaining backlinks/intrinsic parents.
+Parent deletion marks its children deleted while retaining their
+List/parent links, membership, completion state and tokens. The selected detached record is
+exactly reread at the receipt version before success. Its normalized `listId` is null;
+the connector does not invent its removed origin. Guard writes advance versions, so reread
+before a different operation.
+An incomplete/errorful or over-budget inspection blocks every lifecycle action. Known version
+guards protect against changes to those participants; they do not establish a universal lock
+against an unreferenced native child addition. Ordinary and subtask creation now append
+the stable identity to native List ordering in the same exact-version atomic group, serializing
+creation against empty-list deletion and making new IDs discoverable before query-index catch-up.
+Family and childless inspection resolve query/order identities exactly, so already committed
+membership or parent-reference changes cannot be hidden by stale query results. Bulk deletion retains its
+simple-only checks and post-commit subtask reporting; its final plan must contain only the
+approved childless root. Other recurring lifecycle and additional alarm graphs remain outstanding work.
 Moving lists, list management, attachments and tags are outside this interface. The bounded
 scheduling recipes below can create or retire a date-alarm pair, create, edit or remove known recurrence
 and early-reminder offsets, and create, edit or remove one location pair. Arbitrary alarm/rule edits are refused.
@@ -162,7 +283,10 @@ Any stale known participant rejects the group, without forced writes or automati
 Incomplete/changed confirmations remain `WRITE_OUTCOME_UNKNOWN`.
 
 These tools do not extend simple bulk creation: parent inputs in bulk manifests are rejected.
-They do not enable parent/child completion, deletion, schedule edits or descendant cascades.
+Ordinary parent/child completion and reopening use the separate lifecycle tools above;
+the separate deletion tool supports the bounded ordinary cascade, while deeper nesting remains
+excluded. Independent subtask
+scheduling uses the bounded linked recipes described above.
 A list scan and known-record guards do not establish general unreferenced-child race safety,
 so bulk deletion reports post-commit subtasks rather than claiming prevention.
 
@@ -195,8 +319,9 @@ open reminder, obtain its current tag through `get_reminders` and call `update_r
 }
 ```
 
-All mutation tools accept an optional `expectedGeneration` to bind a request to a previously read
-Apple session. The internal `POST /api/mutations` API requires it, plus the same owner and
+Most single-reminder mutation tools accept an optional `expectedGeneration` to bind a request
+to a previously read Apple session. Preparation, list appearance updates and job creation
+require it. The internal `POST /api/mutations` API requires it, plus the same owner and
 same-origin checks used by other state-changing API requests. Unknown fields are rejected.
 No raw CloudKit records, signed asset URLs, proof material or write payloads appear in MCP outputs.
 Use `get_reminder` with the exact list and reminder IDs to read completed or soft-deleted items
@@ -273,6 +398,8 @@ replace server permission checks or a client's user authorization for changes.
 
 See the MCP [tool contracts](https://modelcontextprotocol.io/specification/2025-11-25/server/tools)
 and [annotation definitions](https://modelcontextprotocol.io/specification/2025-11-25/schema#toolannotations).
+The [complete MCP/API reference](mcp-api.md) explains every tool's inputs, results and rationale,
+including the observed native recurring completion/history/final-occurrence distinctions.
 
 ## Local live acceptance
 

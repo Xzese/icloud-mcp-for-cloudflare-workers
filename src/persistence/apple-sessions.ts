@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { RecurrenceCalendarTimeZone } from "../reminders/recurrence-calendar.ts";
 import { AuthSnapshotSchema, type AuthSnapshot } from "../auth/apple/http.ts";
 import type { PcsCheckpoint } from "../auth/apple/pcs.ts";
 import { Envelopes, type Envelope, type EnvelopeContext } from "../crypto/envelopes.ts";
@@ -72,6 +73,27 @@ const AllOpenScanSchema = z.object({
 }).strict().refine(scan => scan.index <= scan.listIds.length, "The all-open scan list index is invalid.")
   .refine(scan => scan.lists.length === scan.listIds.length && scan.lists.every((list, index) => list.id === scan.listIds[index] && !list.deleted && !list.isGroup), "The all-open list selection is inconsistent.");
 export type AllOpenScan = z.infer<typeof AllOpenScanSchema>;
+const SearchScanSchema = z.object({
+  token: z.string().uuid(),
+  expiresAt: z.number().int().positive().safe(),
+  accountHash: z.string().regex(/^[a-f0-9]{64}$/),
+  filtersHash: z.string().regex(/^[a-f0-9]{64}$/),
+  inventoryHash: z.string().regex(/^[a-f0-9]{64}$/),
+  listIds: z.array(SavedListSchema.shape.id).max(1000).refine(ids => new Set(ids).size === ids.length),
+  index: z.number().int().min(0).max(1000),
+  cursor: z.string().min(1).max(8192).refine(value => !/[\u0000-\u001f\u007f]/.test(value)).nullable(),
+  seen: z.array(z.string().regex(/^[a-f0-9]{64}$/)).max(1000),
+  listPages: z.number().int().min(0).max(1000),
+  totalPages: z.number().int().min(0).max(10000),
+}).strict().refine(scan => scan.index <= scan.listIds.length, "The search scan list index is invalid.");
+export type SearchScan = z.infer<typeof SearchScanSchema>;
+const CategoryScanSchema = z.object({
+  token: z.string().uuid(), expiresAt: z.number().int().positive().safe(),
+  accountHash: z.string().regex(/^[a-f0-9]{64}$/), listId: SavedListSchema.shape.id,
+  limit: z.number().int().min(1).max(200), cursor: z.string().min(1).max(8192),
+  seen: z.array(z.string().regex(/^[a-f0-9]{64}$/)).max(1000), pages: z.number().int().min(1).max(1000),
+}).strict();
+export type CategoryScan = z.infer<typeof CategoryScanSchema>;
 // Compatibility is limited to recognized retired fields; unknown active fields
 // still fail strict validation. No credentials, login policy or fences change.
 function discardRetiredCatalogueState(value: unknown): unknown {
@@ -87,6 +109,53 @@ function discardRetiredCatalogueState(value: unknown): unknown {
   }
   return current;
 }
+export const RecurringIntentSchema = z.object({
+  requestFingerprint: z.string().regex(/^[a-f0-9]{64}$/), sourceFingerprint: z.string().regex(/^[a-f0-9]{64}$/),
+  timestamp: z.number().int().nonnegative().safe(), phase: z.enum(["prepared", "dispatched", "confirmed"]),
+  ids: z.object({ history: z.string().uuid().optional(), activeAlarm: z.string().uuid().optional(), activeTrigger: z.string().uuid().optional(),
+    historyAlarm: z.string().uuid().optional(), historyTrigger: z.string().uuid().optional(), replicas: z.array(z.string().uuid()).length(24) }).strict(),
+  expected: z.array(z.object({ id: z.string().max(255), type: z.enum(["Reminder", "List", "RecurrenceRule", "Alarm", "AlarmTrigger"]),
+    hash: z.string().regex(/^[a-f0-9]{64}$/) }).strict()).min(3).max(8),
+  retired: z.array(z.string().max(255)).max(2),
+  mode: z.enum(["final", "reopen"]).optional(),
+  recurrenceCalendarTimeZone: RecurrenceCalendarTimeZone.optional(),
+  intrinsicParentGuards: z.literal(true).optional(),
+  operation: z.literal("delete").optional(),
+  recurringDeletionScope: z.enum(["occurrence", "all_future"]).optional(),
+  recurringDeletionRecipe: z.enum(["all_day_daily", "all_day_daily_ended", "timed_weekly_ended", "all_day_last_day_monthly"]).optional(),
+  recurringDeletionTerminal: z.literal(true).optional(),
+}).strict().superRefine((intent, context) => {
+  if (intent.operation === "delete") {
+    const endedDaily = intent.recurringDeletionRecipe === "all_day_daily_ended";
+    const ended = endedDaily || intent.recurringDeletionRecipe === "timed_weekly_ended";
+    const unpaired = intent.recurringDeletionRecipe === "all_day_daily" || endedDaily || intent.recurringDeletionRecipe === "all_day_last_day_monthly";
+    const types = unpaired ? ["Reminder", "List", "RecurrenceRule"] : ["Reminder", "List", "RecurrenceRule", "Alarm", "AlarmTrigger"];
+    const occurrence = intent.recurringDeletionScope === "occurrence" && !unpaired && intent.recurringDeletionTerminal !== true;
+    if (!intent.recurringDeletionScope || intent.mode !== undefined || !endedDaily && intent.recurrenceCalendarTimeZone !== undefined || !ended && intent.recurringDeletionTerminal !== undefined ||
+      ended && intent.recurringDeletionScope === "all_future" && intent.recurringDeletionTerminal !== true || intent.intrinsicParentGuards !== true ||
+      intent.expected.length !== types.length || new Set(intent.expected.map(record => record.type)).size !== types.length || new Set(intent.expected.map(record => record.id)).size !== types.length ||
+      intent.expected.some(record => !types.includes(record.type) || !record.id.startsWith(`${record.type}/`)) ||
+      Object.keys(intent.ids).some(key => !["replicas", ...(occurrence ? ["activeAlarm", "activeTrigger"] : [])].includes(key)) ||
+      (occurrence ? !intent.ids.activeAlarm || !intent.ids.activeTrigger || intent.ids.activeAlarm === intent.ids.activeTrigger ||
+        !intent.expected.some(record => record.id === `Alarm/${intent.ids.activeAlarm}`) || !intent.expected.some(record => record.id === `AlarmTrigger/${intent.ids.activeTrigger}`) ||
+        intent.retired.length !== 2 || new Set(intent.retired).size !== 2 || !intent.retired.some(id => id.startsWith("Alarm/")) || !intent.retired.some(id => id.startsWith("AlarmTrigger/")) ||
+        intent.retired.some(id => intent.expected.some(record => record.id === id)) : intent.retired.length !== 0))
+      context.addIssue({ code: z.ZodIssueCode.custom, message: "Recurring deletion requires its explicit scope, exact recipe-specific outcome and disjoint retained identities." });
+    return;
+  }
+  if (intent.recurringDeletionScope !== undefined || intent.recurringDeletionRecipe !== undefined || intent.recurringDeletionTerminal !== undefined) context.addIssue({ code: z.ZodIssueCode.custom, message: "Deletion scope requires a deletion-specific intent." });
+  if (intent.mode === undefined) {
+    if (intent.intrinsicParentGuards || intent.expected.length < 4 || ["history", "activeAlarm", "activeTrigger", "historyAlarm", "historyTrigger"].some(key => !intent.ids[key as keyof typeof intent.ids]))
+      context.addIssue({ code: z.ZodIssueCode.custom, message: "Advancing recurrence requires its original retained record identities and complete graph." });
+  } else {
+    const types = intent.expected.length === 5 && intent.intrinsicParentGuards ? ["Reminder", "List", "RecurrenceRule", "Alarm", "AlarmTrigger"] : ["Reminder", "List", "RecurrenceRule"];
+    if (intent.expected.length !== types.length || intent.retired.length || Object.keys(intent.ids).some(key => key !== "replicas") ||
+      intent.intrinsicParentGuards && intent.recurrenceCalendarTimeZone !== undefined || new Set(intent.expected.map(record => record.type)).size !== types.length ||
+      new Set(intent.expected.map(record => record.id)).size !== types.length || intent.expected.some(record => !types.includes(record.type) || !record.id.startsWith(`${record.type}/`)))
+      context.addIssue({ code: z.ZodIssueCode.custom, message: "An in-place ended occurrence retains only its active, rule, List, optional guarded date pair and token identities." });
+  }
+});
+export type RecurringIntent = z.infer<typeof RecurringIntentSchema>;
 export const AppleSessionSchema = z.preprocess(discardRetiredCatalogueState, z.object({
   auth: AuthSnapshotSchema,
   connection: CloudKitConnectionSchema,
@@ -94,6 +163,11 @@ export const AppleSessionSchema = z.preprocess(discardRetiredCatalogueState, z.o
   login: LoginAssuranceSchema,
   renewal: RenewalCheckpointSchema.optional(),
   allOpenScan: AllOpenScanSchema.optional(),
+  searchScan: SearchScanSchema.optional(),
+  categoryScan: CategoryScanSchema.optional(),
+  recurringIntents: z.array(RecurringIntentSchema).max(256).refine(items => new Set(items.map(item => item.requestFingerprint)).size === items.length).optional(),
+  copyIntents: z.array(z.object({ id: z.string().uuid(), requestFingerprint: z.string().regex(/^[a-f0-9]{64}$/),
+    contentFingerprint: z.string().regex(/^[a-f0-9]{64}$/) }).strict()).max(128).optional(),
   savedLists: SavedListsSchema.optional(),
   // Optional metadata preserves version-1 encrypted list snapshots.
   directListSnapshot: z.object({ updatedAt: z.number().int().nonnegative().safe() }).strict().optional(),
@@ -105,6 +179,10 @@ export type AppleSession = {
   login: LoginAssurance;
   renewal?: RenewalCheckpoint;
   allOpenScan?: AllOpenScan;
+  searchScan?: SearchScan;
+  categoryScan?: CategoryScan;
+  recurringIntents?: RecurringIntent[];
+  copyIntents?: { id: string; requestFingerprint: string; contentFingerprint: string }[];
   savedLists?: SavedList[];
   directListSnapshot?: { updatedAt: number };
 };
@@ -422,6 +500,51 @@ export class AppleSessionRepository {
   async claimRenewal(expectedGeneration: number, expectedVersion: number) {
     const saved = await this.load();
     return saved.state === "READY" ? this.claimRead(expectedGeneration, expectedVersion) : this.claimResume(expectedGeneration, expectedVersion);
+  }
+
+  // Persist the copy identity before Apple dispatch without releasing or
+  // extending the current owner/generation lease. Only hashes, never reminder
+  // bodies, are retained. A lost acknowledgement can then reconcile that key.
+  async checkpointCopyIntent(fence: ResumeFence, intent: NonNullable<AppleSession["copyIntents"]>[number]) {
+    const saved = await this.load();
+    const intents = saved.session.copyIntents ?? [];
+    const existing = intents.find(item => item.id === intent.id);
+    if (existing && JSON.stringify(existing) !== JSON.stringify(intent)) throw new AppError("CONFLICT", "This copy key belongs to a different request.", 409);
+    if (!existing && intents.length >= 128) throw new AppError("UNSUPPORTED_FEATURE", "This session's retained copy identity budget is full.");
+    const session = await this.checkedSession({ ...saved.session, copyIntents: existing ? intents : [...intents, intent] });
+    const context: EnvelopeContext = { ownerId: this.owner, accountId: ACCOUNT, generation: fence.generation, recordId: RECORD, schemaVersion: 1 };
+    const envelope = JSON.stringify(await this.envelopes.encrypt(session, context));
+    const now = Date.now();
+    requireCurrentLogin(session.login, now);
+    const result = await this.db.prepare("UPDATE apple_session_state SET envelope = ?, updated_at = ? WHERE owner_id = ? AND account_id = ? AND generation = ? AND version = ? AND state = 'READY' AND resume_id = ? AND resume_expires_at > ? AND transaction_id IS NULL RETURNING version")
+      .bind(envelope, now, this.owner, ACCOUNT, fence.generation, fence.version, fence.resumeId, now + 10_000).first<{ version: number }>();
+    if (!result) throw new AppError("CONFLICT", "The Apple session changed before its copy identity could be saved. No write was sent.", 409);
+    return session.copyIntents!;
+  }
+
+  async checkpointRecurringIntent(fence: ResumeFence, intent: RecurringIntent) {
+    const saved = await this.load();
+    let intents = saved.session.recurringIntents ?? [];
+    const prior = intents.find(item => item.requestFingerprint === intent.requestFingerprint);
+    const immutable = (item: RecurringIntent) => JSON.stringify({ ...item, phase: undefined });
+    const phases = ["prepared", "dispatched", "confirmed"];
+    if (prior && (immutable(prior) !== immutable(intent) || phases.indexOf(intent.phase) < phases.indexOf(prior.phase))) {
+      throw new AppError("CONFLICT", "The retained occurrence identity or phase does not match this completion.", 409);
+    }
+    if (!prior && intents.length >= 256) {
+      const oldest = intents.filter(item => item.phase === "confirmed").sort((a, b) => a.timestamp - b.timestamp)[0];
+      if (!oldest) throw new AppError("UNSUPPORTED_FEATURE", "The unresolved recurring completion identity budget is full.");
+      intents = intents.filter(item => item.requestFingerprint !== oldest.requestFingerprint);
+    }
+    intents = [...intents.filter(item => item.requestFingerprint !== intent.requestFingerprint), intent];
+    const session = await this.checkedSession({ ...saved.session, recurringIntents: intents });
+    const context: EnvelopeContext = { ownerId: this.owner, accountId: ACCOUNT, generation: fence.generation, recordId: RECORD, schemaVersion: 1 };
+    const envelope = JSON.stringify(await this.envelopes.encrypt(session, context)), now = Date.now();
+    requireCurrentLogin(session.login, now);
+    const row = await this.db.prepare("UPDATE apple_session_state SET envelope = ?, updated_at = ? WHERE owner_id = ? AND account_id = ? AND generation = ? AND version = ? AND state = 'READY' AND resume_id = ? AND resume_expires_at > ? AND transaction_id IS NULL RETURNING version")
+      .bind(envelope, now, this.owner, ACCOUNT, fence.generation, fence.version, fence.resumeId, now + 10_000).first<{ version: number }>();
+    if (!row) throw new AppError("CONFLICT", "The Apple session changed before the occurrence identity checkpoint.", 409);
+    return session.recurringIntents!;
   }
 
   async commitResume(fence: ResumeFence, session: AppleSession, state: AppleSessionState, action?: ApprovalAction) {

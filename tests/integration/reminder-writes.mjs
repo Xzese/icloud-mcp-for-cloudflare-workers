@@ -16,6 +16,7 @@ import { dateComponents, dueDateNonce } from "../../src/reminders/linked-date.ts
 
 const root = resolve(fileURLToPath(new URL("../..", import.meta.url)));
 const listId = "List/WRITE-ACCEPTANCE";
+const searchListId = "List/SEARCH-FILTERS";
 const zoneOwner = "synthetic-private-owner";
 const reminderId = "Reminder/WRITE-EXISTING";
 const opaqueMetadata = "synthetic-private-apple-field";
@@ -27,11 +28,17 @@ const jsonResponse = (value, status = 200, headers = {}) => new Response(JSON.st
 
 function field(type, value) { return { type, value }; }
 
-function listRecord() {
+function listRecord(id = listId, reminderIds = []) {
   return {
-    recordName: listId, recordType: "List", recordChangeTag: "list-tag-1",
+    recordName: id, recordType: "List", recordChangeTag: "list-tag-1",
     zoneID: { zoneName: "Reminders", zoneType: "REGULAR_CUSTOM_ZONE", ownerRecordName: zoneOwner },
-    fields: { Name: field("STRING", "Synthetic acceptance list"), Deleted: field("INT64", 0), IsGroup: field("INT64", 0) },
+    fields: {
+      Name: field("STRING", "Synthetic acceptance list"), Deleted: field("INT64", 0), IsGroup: field("INT64", 0),
+      IsLinkedToAccount: field("INT64", 1), ReminderIDs: field("STRING", JSON.stringify(reminderIds)),
+      ResolutionTokenMap: field("STRING", JSON.stringify({ map: { reminderIDsMergeableOrdering: {
+        counter: 1, modificationTime: 800_000_000, replicaID: "3e6cb834-5b1c-4ce6-8c39-00e752121111",
+      } } })),
+    },
   };
 }
 
@@ -56,6 +63,61 @@ function reminderRecord(id, { recurrence = false, alarm = false } = {}) {
     zoneID: { zoneName: "Reminders", zoneType: "REGULAR_CUSTOM_ZONE", ownerRecordName: zoneOwner }, fields,
   };
 }
+
+const searchRelationIds = {
+  workA: "00000000-0000-4000-8000-000000000001", homeA: "00000000-0000-4000-8000-000000000002",
+  urlA: "00000000-0000-4000-8000-000000000003", workB: "00000000-0000-4000-8000-000000000004",
+  image: "00000000-0000-4000-8000-000000000005", homeDone: "00000000-0000-4000-8000-000000000006",
+  urlDone: "00000000-0000-4000-8000-000000000007", missing: "00000000-0000-4000-8000-000000000008",
+  unclassifiedUrl: "00000000-0000-4000-8000-000000000009", unclassifiedPng: "00000000-0000-4000-8000-00000000000a",
+};
+
+function searchReminderRecord(id, title, { completed = 0, notes = "", tags = [], attachments = [] } = {}) {
+  const record = reminderRecord(id);
+  record.fields.List = field("REFERENCE", { recordName: searchListId, action: "VALIDATE", zoneID: record.zoneID });
+  record.fields.TitleDocument = field("ENCRYPTED_BYTES", encodeDocument(title));
+  record.fields.NotesDocument = field("ENCRYPTED_BYTES", encodeDocument(notes));
+  record.fields.Completed = field("INT64", completed);
+  record.fields.HashtagIDs = field("STRING_LIST", tags);
+  record.fields.AttachmentIDs = field("STRING_LIST", attachments);
+  return record;
+}
+
+function searchHashtag(id, reminder, name) {
+  return { recordName: `Hashtag/${id}`, recordType: "Hashtag", recordChangeTag: `tag-Hashtag-${id}`,
+    zoneID: { zoneName: "Reminders", zoneType: "REGULAR_CUSTOM_ZONE", ownerRecordName: zoneOwner },
+    fields: { Name: { ...field("STRING", name), isEncrypted: true }, Type: field("INT64", 0), Imported: field("INT64", 0), Deleted: field("INT64", 0),
+      Reminder: field("REFERENCE", { recordName: reminder, action: "VALIDATE" }) } };
+}
+
+function searchAttachment(id, reminder, { url, image = false } = {}) {
+  return { recordName: `Attachment/${id}`, recordType: "Attachment", recordChangeTag: `tag-Attachment-${id}`,
+    zoneID: { zoneName: "Reminders", zoneType: "REGULAR_CUSTOM_ZONE", ownerRecordName: zoneOwner },
+    fields: { Type: field("STRING", image ? "Image" : "URL"), UTI: field("STRING", image ? "public.jpeg" : "public.url"),
+      ...(image ? {} : { URL: { ...field("STRING", url), isEncrypted: true } }), Imported: field("INT64", 0), Deleted: field("INT64", 0),
+      Reminder: field("REFERENCE", { recordName: reminder, action: "VALIDATE" }) } };
+}
+
+const searchFixtures = (() => {
+  const all = searchReminderRecord("Reminder/SEARCH-ALL", "ordinary title", { notes: "ordinary notes",
+    tags: [searchRelationIds.workA, searchRelationIds.homeA], attachments: [searchRelationIds.urlA] });
+  const work = searchReminderRecord("Reminder/SEARCH-WORK", "ordinary title", { tags: [searchRelationIds.workB] });
+  const untagged = searchReminderRecord("Reminder/SEARCH-UNTAGGED", "https://example.test/Path", {
+    notes: "https://example.test/Path", attachments: [searchRelationIds.image],
+  });
+  const done = searchReminderRecord("Reminder/SEARCH-DONE", "completed", { completed: 1,
+    tags: [searchRelationIds.homeDone], attachments: [searchRelationIds.urlDone] });
+  const records = [all, work, untagged, done];
+  const related = [
+    searchHashtag(searchRelationIds.workA, all.recordName, "work"), searchHashtag(searchRelationIds.homeA, all.recordName, "home"),
+    searchAttachment(searchRelationIds.urlA, all.recordName, { url: "https://example.test/Path" }),
+    searchHashtag(searchRelationIds.workB, work.recordName, "work"),
+    searchAttachment(searchRelationIds.image, untagged.recordName, { image: true }),
+    searchHashtag(searchRelationIds.homeDone, done.recordName, "home"),
+    searchAttachment(searchRelationIds.urlDone, done.recordName, { url: "https://other.test/done" }),
+  ];
+  return { records, related };
+})();
 
 function earlyPayloadField(reminderId, accountIdentifier, { unit = 1, count = -1, identifier = randomUUID().toUpperCase() } = {}) {
   const payload = {
@@ -104,11 +166,13 @@ export async function verifyReminderWrites(options) {
 
   const makeWorker = async ({ login = true, localEvidence = false } = {}) => {
     const state = {
-      records: new Map([[listId, listRecord()], [reminderId, reminderRecord(reminderId)],
+      records: new Map([[listId, listRecord(listId, [reminderId.slice("Reminder/".length)])], [reminderId, reminderRecord(reminderId)],
         ["Reminder/WRITE-RECURRING", reminderRecord("Reminder/WRITE-RECURRING", { recurrence: true })],
-        ["Reminder/WRITE-ALARMED", reminderRecord("Reminder/WRITE-ALARMED", { alarm: true })]]),
+        ["Reminder/WRITE-ALARMED", reminderRecord("Reminder/WRITE-ALARMED", { alarm: true })],
+        [searchListId, listRecord(searchListId)], ...searchFixtures.records.map(record => [record.recordName, record]),
+        ...searchFixtures.related.map(record => [record.recordName, record])]),
       omitLookupZoneIds: new Set(), foreignZoneIds: new Set(),
-      requests: [], modifies: [], nextModify: null, holdLookup: null, holdModify: null,
+      requests: [], modifies: [], pristineLists: new Set(), firstChildWritten: new Set(), nextModify: null, holdLookup: null, holdModify: null,
     };
     const bindings = {
       ...options.bindings,
@@ -118,16 +182,17 @@ export async function verifyReminderWrites(options) {
     };
     const outboundService = async request => {
       const url = new URL(request.url);
-      state.requests.push({ method: request.method, path: url.pathname });
       const body = request.method === "POST" ? await request.clone().json() : undefined;
+      state.requests.push({ method: request.method, path: url.pathname, ...(body ? { body } : {}) });
       if (url.pathname.endsWith("/records/query")) {
         if (body.query.recordType === "Lists") return jsonResponse({ records: [...state.records.values()].filter(record => record.recordType === "List") });
         assert.equal(body.query.recordType, "reminderList");
         const requestedList = body.query.filterBy.find(filter => filter.fieldName === "List").fieldValue.value.recordName;
         if (state.nextListQuery) { const response = state.nextListQuery; state.nextListQuery = null; return jsonResponse(response); }
         assert.ok(state.records.get(requestedList)?.recordType === "List");
+        state.onReminderListQuery?.();
         const includeCompleted = body.query.filterBy.find(filter => filter.fieldName === "includeCompleted").fieldValue.value === 1;
-        const records = [...state.records.values()].filter(record => record.recordType === "Reminder" && record.fields.List.value.recordName === requestedList && record.fields.Deleted.value === 0 && (includeCompleted || record.fields.Completed.value === 0));
+        const records = [...state.records.values()].filter(record => record.recordType === "Reminder" && record.fields.List?.value?.recordName === requestedList && record.fields.Deleted.value === 0 && (includeCompleted || record.fields.Completed.value === 0));
         return jsonResponse({ records: records.map(record => state.foreignZoneIds.has(record.recordName)
           ? { ...record, zoneID: { ...record.zoneID, ownerRecordName: "synthetic-foreign-owner" } } : record) });
       }
@@ -147,12 +212,292 @@ export async function verifyReminderWrites(options) {
             result = { ...result };
             delete result.zoneID;
           }
+          if (Array.isArray(body.desiredKeys)) result = { ...result, fields: Object.fromEntries(Object.entries(result.fields)
+            .filter(([key]) => body.desiredKeys.includes(key))) };
           return result;
         });
+        if (state.nextDeletionLookup && body.records.length === 1 && body.records[0].recordName === state.nextDeletionLookup.reminderId) {
+          const variant = state.nextDeletionLookup; state.nextDeletionLookup = null;
+          if (variant.mode === "family-delete-read-failure") return jsonResponse({ serverErrorCode: "SERVICE_UNAVAILABLE" }, 503);
+          if (variant.mode === "family-delete-read-tag-drift") records[0] = { ...records[0], recordChangeTag: `${records[0].recordChangeTag}-drift` };
+          if (variant.mode === "family-delete-read-field-drift") records[0] = { ...records[0], fields: { ...records[0].fields, Priority: field("INT64", 9) } };
+        }
         return jsonResponse({ records });
       }
       if (url.pathname.endsWith("/records/modify")) {
         const operation = body.operations[0];
+        const reminderCreate = body.operations.find(candidate => candidate.operationType === "create" && candidate.record.recordType === "Reminder");
+        const createParentListId = reminderCreate?.record.parent?.recordName;
+        const pristineFirstChild = typeof createParentListId === "string" && state.pristineLists.has(createParentListId) &&
+          !state.firstChildWritten.has(createParentListId);
+        const firstChildMembershipUpdate = body.operations[0]?.operationType === "update" &&
+          Object.hasOwn(body.operations[0].record.fields, "ReminderIDs") && Object.hasOwn(body.operations[0].record.fields, "ResolutionTokenMap");
+        const firstChildDeletionGuard = body.operations[0]?.record.fields.Deleted?.value === 0;
+        if (pristineFirstChild && (body.operations[0]?.record.recordType !== "List" || body.operations[0]?.record.recordName !== createParentListId ||
+          body.operations[0]?.record.recordChangeTag !== state.records.get(createParentListId)?.recordChangeTag ||
+          (!firstChildMembershipUpdate && !firstChildDeletionGuard) || body.operations[1] !== reminderCreate)) {
+          return jsonResponse({ serverErrorCode: "BAD_REQUEST" }, 400);
+        }
+        const recurringDeletionScope = body.operations.length === 7 && operation.record.fields.DueDate && !operation.record.fields.Completed &&
+          body.operations.filter(candidate => candidate.operationType === "create").every(candidate => ["Alarm", "AlarmTrigger"].includes(candidate.record.recordType)) &&
+          body.operations.some(candidate => candidate.operationType === "delete") ? "occurrence" :
+          [3, 5].includes(body.operations.length) && operation.record.fields.Deleted?.value === 1 && operation.record.parent?.recordName === null &&
+            body.operations.some(candidate => candidate.record.recordType === "RecurrenceRule" && candidate.record.fields.Deleted?.value === 1) ? "all_future" :
+            body.operations.length === 3 && operation.record.fields.DueDate && !operation.record.fields.Completed &&
+              new Set(body.operations.map(candidate => candidate.record.recordType)).size === 3 && body.operations.every(candidate => candidate.operationType === "update" && ["Reminder", "List", "RecurrenceRule"].includes(candidate.record.recordType)) ? "occurrence" : null;
+        if (recurringDeletionScope) {
+          assert.equal(body.atomic, true); state.modifies.push({ recurringDeletion: true, scope: recurringDeletionScope, operationCount: body.operations.length });
+          const action = state.nextModify; state.nextModify = null;
+          const racedType = action === "recurring-delete-rule-race" ? "RecurrenceRule" : action === "recurring-delete-list-race" ? "List" : action === "recurring-delete-alarm-race" ? "Alarm" : null;
+          if (racedType) { const raced = body.operations.find(candidate => candidate.record.recordType === racedType && candidate.operationType !== "create"), before = state.records.get(raced.record.recordName); state.records.set(before.recordName, { ...before, recordChangeTag: `${before.recordChangeTag}-concurrent` }); }
+          const stale = body.operations.find(candidate => candidate.operationType === "create" ? state.records.has(candidate.record.recordName) : candidate.record.recordChangeTag !== state.records.get(candidate.record.recordName)?.recordChangeTag);
+          if (stale) return jsonResponse({ records: body.operations.map(candidate => ({ recordName: candidate.record.recordName, serverErrorCode: candidate === stale ? "CONFLICT" : "ATOMIC_ERROR" })) });
+          const records = body.operations.map(candidate => {
+            if (candidate.operationType === "delete") { state.records.delete(candidate.record.recordName); return { recordName: candidate.record.recordName, deleted: true }; }
+            const before = state.records.get(candidate.record.recordName), next = { ...before, ...candidate.record, fields: { ...before?.fields, ...candidate.record.fields },
+              zoneID: { zoneName: "Reminders", ownerRecordName: zoneOwner }, recordChangeTag: `recurring-delete-${state.modifies.length}-${candidate.record.recordName}` };
+            if (candidate.record.parent?.recordName === null) delete next.parent;
+            else if (next.parent) next.parent = { ...next.parent, zoneID: { zoneName: "Reminders", zoneType: "REGULAR_CUSTOM_ZONE", ownerRecordName: zoneOwner } };
+            if (candidate.operationType === "create") {
+              const key = next.recordType === "Alarm" ? "Reminder" : "Alarm";
+              next.fields[key] = { ...next.fields[key], value: { ...next.fields[key].value, zoneID: { zoneName: "Reminders", zoneType: "REGULAR_CUSTOM_ZONE", ownerRecordName: zoneOwner } } };
+            }
+            if (action === "recurring-delete-crypto-drift" && next.recordType === "Reminder") next.fields.UrgentPresentationAlarmsAsData.value.wrappingKey = "changed";
+            if (action === "recurring-delete-parent-drift" && candidate.operationType === "create" && next.recordType === "Alarm") next.parent = { recordName: "Reminder/OTHER" };
+            state.records.set(next.recordName, next); return candidate.record.parent?.recordName === null ? { ...next, parent: before.parent } : next;
+          });
+          if (action === "committed-500") return jsonResponse({ serverErrorCode: "SERVICE_UNAVAILABLE" }, 500);
+          return jsonResponse({ records: records.reverse() });
+        }
+        const dateAlarmLifecycle = body.operations.length === 4 && body.operations.every(candidate => candidate.operationType === "update") &&
+          new Set(body.operations.map(candidate => candidate.record.recordType)).size === 4 &&
+          body.operations.every(candidate => ["Reminder", "Alarm", "AlarmTrigger", "List"].includes(candidate.record.recordType)) &&
+          (operation.record.fields.Completed !== undefined || operation.record.fields.Deleted?.value === 1);
+        const scheduledFamilyLifecycle = body.operations.length > 4 && body.operations.every(candidate => candidate.operationType === "update" && ["Reminder", "Alarm", "AlarmTrigger", "List"].includes(candidate.record.recordType)) &&
+          new Set(body.operations.map(candidate => candidate.record.recordType)).size === 4 && body.operations.filter(candidate => candidate.record.recordType === "Reminder").length > 1 &&
+          (operation.record.fields.Completed !== undefined || operation.record.fields.Deleted?.value === 1);
+        if (dateAlarmLifecycle || scheduledFamilyLifecycle) {
+          assert.equal(body.atomic, true);
+          state.modifies.push({ dateAlarmLifecycle: true, scheduledFamilyLifecycle, operationCount: body.operations.length, recordName: operation.record.recordName });
+          const action = state.nextModify; state.nextModify = null;
+          const raced = ["date-alarm-alarm-race", "scheduled-pair-race"].includes(action) ? body.operations.find(candidate => candidate.record.recordType === "Alarm") :
+             ["date-alarm-list-race", "scheduled-list-race"].includes(action) ? body.operations.find(candidate => candidate.record.recordType === "List") :
+              action === "scheduled-member-race" ? body.operations.find(candidate => candidate.record.recordType === "Reminder" && candidate.record.recordName !== operation.record.recordName) : null;
+          if (raced) { const before = state.records.get(raced.record.recordName); state.records.set(before.recordName, { ...before, recordChangeTag: `${before.recordChangeTag}-concurrent` }); }
+          const stale = body.operations.find(candidate => candidate.record.recordChangeTag !== state.records.get(candidate.record.recordName)?.recordChangeTag);
+          if (stale) return jsonResponse({ records: body.operations.map(candidate => ({ recordName: candidate.record.recordName, serverErrorCode: candidate === stale ? "CONFLICT" : "ATOMIC_ERROR" })) });
+          const records = body.operations.map(candidate => {
+            const before = state.records.get(candidate.record.recordName), next = { ...before, ...candidate.record, fields: { ...before.fields, ...candidate.record.fields },
+              zoneID: { zoneName: "Reminders", ownerRecordName: zoneOwner }, recordChangeTag: `${before.recordChangeTag}-date-lifecycle-${state.modifies.length}` };
+            if (candidate.record.parent?.recordName === null) { assert.deepEqual(candidate.record.parent, { recordName: null }); delete next.parent; }
+            state.records.set(next.recordName, next);
+            if (candidate.record.parent?.recordName === null) return { ...next, parent: before.parent };
+            return next;
+          });
+          if (action === "scheduled-crypto-drift") {
+            const root = records.find(record => record.recordType === "Reminder"); root.fields.UrgentPresentationAlarmsAsData.value.wrappingKey = "changed";
+          }
+          if (action === "scheduled-parent-drift") {
+            const sibling = records.find(record => record.recordType === "Reminder" && record.recordName !== operation.record.recordName); sibling.parent = { recordName: "List/OTHER" };
+          }
+          if (action === "date-alarm-parent-drift") {
+            const index = records.findIndex(record => record.recordType === "Alarm"); records[index] = { ...records[index], parent: { recordName: "Reminder/OTHER" } };
+          }
+          if (action === "committed-500") return jsonResponse({ serverErrorCode: "SERVICE_UNAVAILABLE" }, 500);
+          return jsonResponse({ records: records.reverse() });
+        }
+        const inPlaceRecurring = [0, 1].includes(operation.record.fields.Completed?.value) && !Object.hasOwn(operation.record.fields, "DueDate") &&
+          [3, 5].includes(body.operations.length) && new Set(body.operations.map(candidate => candidate.record.recordType)).size === body.operations.length &&
+          body.operations.every(candidate => candidate.operationType === "update" && ["Reminder", "List", "RecurrenceRule", "Alarm", "AlarmTrigger"].includes(candidate.record.recordType));
+        if (inPlaceRecurring || operation.record.fields.Completed?.value === 0 && body.operations.some(candidate => candidate.operationType === "create" && candidate.record.recordType === "Reminder" && candidate.record.fields.Completed?.value === 1)) {
+          assert.equal(body.atomic, true); assert.ok(inPlaceRecurring ? [3, 5].includes(body.operations.length) : [4, 10].includes(body.operations.length));
+          state.modifies.push({ recurringCompletion: true, inPlaceRecurring, operationCount: body.operations.length,
+            historyId: body.operations.find(candidate => candidate.operationType === "create" && candidate.record.recordType === "Reminder")?.record.recordName });
+          const action = state.nextModify; state.nextModify = null;
+          const raced = action === "recurring-rule-race" ? body.operations.find(candidate => candidate.record.recordType === "RecurrenceRule") :
+            action === "recurring-list-race" ? body.operations.find(candidate => candidate.record.recordType === "List") :
+              action === "recurring-alarm-race" ? body.operations.find(candidate => candidate.record.recordType === "Alarm") : null;
+          if (raced) { const source = state.records.get(raced.record.recordName); state.records.set(source.recordName, { ...source, recordChangeTag: `${source.recordChangeTag}-concurrent` }); }
+          const stale = body.operations.find(candidate => candidate.operationType === "create" ? state.records.has(candidate.record.recordName) : candidate.record.recordChangeTag !== state.records.get(candidate.record.recordName)?.recordChangeTag);
+          if (stale) return jsonResponse({ records: body.operations.map(candidate => ({ recordName: candidate.record.recordName, serverErrorCode: candidate === stale ? "CONFLICT" : "ATOMIC_ERROR" })) });
+          const records = body.operations.map(candidate => {
+            if (candidate.operationType === "delete") { state.records.delete(candidate.record.recordName); return { recordName: candidate.record.recordName, deleted: true }; }
+            const source = state.records.get(candidate.record.recordName);
+            const next = { ...source, ...candidate.record, fields: { ...source?.fields, ...candidate.record.fields }, zoneID: { zoneName: "Reminders", ownerRecordName: zoneOwner }, recordChangeTag: `recurring-${state.modifies.length}-${candidate.record.recordName}` };
+            if (candidate.operationType === "create" && ["Alarm", "AlarmTrigger"].includes(next.recordType)) {
+              const key = next.recordType === "Alarm" ? "Reminder" : "Alarm";
+              next.fields[key] = { ...next.fields[key], value: { ...next.fields[key].value, zoneID: {
+                zoneName: "Reminders", zoneType: "REGULAR_CUSTOM_ZONE", ownerRecordName: action === "recurring-related-reference-foreign" ? "synthetic-foreign-owner" : zoneOwner,
+              } } };
+            }
+            if (next.parent) next.parent = { ...next.parent, zoneID: { zoneName: "Reminders", zoneType: "REGULAR_CUSTOM_ZONE", ownerRecordName: zoneOwner } };
+            const invalidParentTarget = action?.startsWith("recurring-history-parent-") ? candidate.operationType === "create" && candidate.record.recordType === "Reminder" :
+              action?.startsWith("recurring-active-parent-") ? candidate.record.recordName === operation.record.recordName : false;
+            if (invalidParentTarget) {
+              if (action.endsWith("missing")) delete next.parent;
+              else if (action.endsWith("foreign")) next.parent.zoneID.ownerRecordName = "synthetic-foreign-owner";
+              else next.parent = { recordName: "List/OTHER-LIST" };
+            }
+            state.records.set(next.recordName, next); return next;
+          });
+          if (action === "recurring-retained-parent-drift") {
+            const alarm = records.find(record => record.recordType === "Alarm"); alarm.parent = { recordName: "Reminder/OTHER" };
+          }
+          if (action === "recurring-retained-crypto-drift") {
+            const root = records.find(record => record.recordType === "Reminder");
+            root.fields.UrgentPresentationAlarmsAsData.value.wrappingKey = "changed-synthetic-key";
+          }
+          if (action === "committed-500") return jsonResponse({ serverErrorCode: "SERVICE_UNAVAILABLE" }, 500);
+          return jsonResponse({ records: records.reverse() });
+        }
+        const creationListUpdate = reminderCreate && body.operations.find(candidate => candidate.operationType === "update" &&
+          candidate.record.recordType === "List" && candidate.record.recordName === createParentListId && Object.hasOwn(candidate.record.fields, "ReminderIDs"));
+        if (reminderCreate && creationListUpdate && body.operations.length <= 3 &&
+          body.operations.every(candidate => ["List", "Reminder"].includes(candidate.record.recordType))) {
+          assert.equal(body.atomic, true);
+          assert.equal(body.operations[0], creationListUpdate, "The List ordering update must precede Reminder creation.");
+          assert.equal(body.operations[1], reminderCreate, "The List ordering update must immediately precede Reminder creation.");
+          assert.deepEqual(Object.keys(creationListUpdate.record.fields).sort(), ["ReminderIDs", "ResolutionTokenMap"]);
+          const listBefore = state.records.get(createParentListId);
+          assert.ok(listBefore && listBefore.recordType === "List");
+          assert.equal(creationListUpdate.record.recordChangeTag, listBefore.recordChangeTag);
+          const previousMembers = JSON.parse(listBefore.fields.ReminderIDs.value);
+          assert.deepEqual(JSON.parse(creationListUpdate.record.fields.ReminderIDs.value),
+            [...previousMembers, reminderCreate.record.recordName.slice("Reminder/".length)], "Creation appends without changing native List ordering.");
+          const previousTokens = JSON.parse(listBefore.fields.ResolutionTokenMap.value).map;
+          const nextTokens = JSON.parse(creationListUpdate.record.fields.ResolutionTokenMap.value).map;
+          assert.deepEqual(Object.keys(nextTokens).sort(), Object.keys(previousTokens).sort());
+          assert.equal(nextTokens.reminderIDsMergeableOrdering.counter, previousTokens.reminderIDsMergeableOrdering.counter + 1);
+          assert.equal(nextTokens.reminderIDsMergeableOrdering.replicaID, previousTokens.reminderIDsMergeableOrdering.replicaID);
+          for (const [fieldName, token] of Object.entries(previousTokens)) if (fieldName !== "reminderIDsMergeableOrdering") assert.deepEqual(nextTokens[fieldName], token);
+          const subtaskParentId = reminderCreate.record.fields.ParentReminder?.value?.recordName;
+          const parentGuard = subtaskParentId && body.operations.find(candidate => candidate.operationType === "update" &&
+            candidate.record.recordType === "Reminder" && candidate.record.recordName === subtaskParentId);
+          if (subtaskParentId) {
+            assert.equal(body.operations.length, 3, "A subtask create must atomically guard its current parent.");
+            assert.equal(parentGuard, body.operations[2]);
+            assert.deepEqual(parentGuard.record.fields, { Deleted: field("INT64", 0) });
+          } else assert.equal(body.operations.length, 2, "A root create changes only its List ordering and new Reminder.");
+          if (pristineFirstChild) {
+            assert.equal(body.operations[0].record.recordName, createParentListId);
+            assert.equal(body.operations[1], reminderCreate, "A pristine List's membership must be committed before its first Reminder.");
+          }
+          state.modifies.push({ operationType: "create", recordName: reminderCreate.record.recordName,
+            recordChangeTag: reminderCreate.record.recordChangeTag, fields: Object.keys(reminderCreate.record.fields).sort(),
+            atomicCreationGroup: true, operationCount: body.operations.length });
+          const action = state.nextModify; state.nextModify = null;
+          if (action === "redirect-307") return new Response(null, { status: 307, headers: { location: request.url } });
+          if (action === "record-conflict") return jsonResponse({ records: body.operations.map(candidate => ({
+            recordName: candidate.record.recordName, serverErrorCode: candidate === reminderCreate ? "CONFLICT" : "ATOMIC_ERROR",
+          })) });
+          if (action === "family-list-race") {
+            state.records.set(listBefore.recordName, { ...listBefore, recordChangeTag: `concurrent-${listBefore.recordChangeTag}` });
+          }
+          if (action === "parent-race") {
+            assert.ok(parentGuard, "Subtask creation retains its exact parent Reminder guard.");
+            const parent = state.records.get(parentGuard.record.recordName);
+            state.records.set(parent.recordName, { ...parent, recordChangeTag: `concurrent-${parent.recordChangeTag}` });
+          }
+          const stale = body.operations.find(candidate => candidate.operationType === "create" ? state.records.has(candidate.record.recordName) :
+            candidate.record.recordChangeTag !== state.records.get(candidate.record.recordName)?.recordChangeTag);
+          if (stale) return jsonResponse({ records: body.operations.map(candidate => ({
+            recordName: candidate.record.recordName, serverErrorCode: candidate === stale ? "CONFLICT" : "ATOMIC_ERROR",
+          })) });
+          const records = body.operations.map(candidate => {
+            const current = state.records.get(candidate.record.recordName);
+            const next = candidate.operationType === "create"
+              ? { ...candidate.record, zoneID: { zoneName: "Reminders", zoneType: "REGULAR_CUSTOM_ZONE", ownerRecordName: zoneOwner } }
+              : { ...current, fields: { ...current.fields, ...candidate.record.fields } };
+            next.recordChangeTag = `creation-${state.modifies.length}-${next.recordName}`;
+            state.records.set(next.recordName, next);
+            return next;
+          });
+          if (pristineFirstChild) state.firstChildWritten.add(createParentListId);
+          if (state.holdModify) {
+            const held = state.holdModify; state.holdModify = null; held.reached(); await held.releasePromise;
+          }
+          if (action === "committed-500") return jsonResponse({ serverErrorCode: "SERVICE_UNAVAILABLE" }, 500);
+          if (action === "committed-network-drop") throw new Error("Synthetic response lost after atomic List and Reminder creation.");
+          if (action === "missing-parent-confirmation") return jsonResponse({ records: records.slice(0, 1) });
+          return jsonResponse({ records: records.reverse() });
+        }
+        const ordinaryListGuard = body.operations.some(candidate => candidate.record.recordType === "List" &&
+          Object.keys(candidate.record.fields).length === 1 && candidate.record.fields.Deleted?.value === 0);
+        const nativeDelete = operation.record.fields.Deleted?.value === 1 && operation.record.fields.List?.value === null &&
+          operation.record.parent?.recordName === null;
+        const reminderOperation = reminderCreate ?? operation;
+        if ((ordinaryListGuard || nativeDelete) && reminderOperation.record.recordType === "Reminder" &&
+          (!Object.hasOwn(reminderOperation.record.fields, "ParentReminder") || nativeDelete) &&
+          body.operations.every(candidate => candidate.record.recordType === "Reminder" || candidate.record.recordType === "List" && Object.keys(candidate.record.fields).length <= 2)) {
+          assert.equal(body.atomic, true);
+          if (nativeDelete) assert.deepEqual(reminderOperation.record.parent, { recordName: null });
+          if (pristineFirstChild) {
+            assert.equal(body.operations[0].record.recordName, createParentListId);
+            assert.equal(body.operations[1], reminderCreate, "A pristine List guard must immediately precede its first Reminder creation.");
+          }
+          assert.ok(body.operations.length <= 32);
+          state.modifies.push({ operationType: reminderOperation.operationType, recordName: reminderOperation.record.recordName,
+            recordChangeTag: reminderOperation.record.recordChangeTag, fields: Object.keys(reminderOperation.record.fields).sort(),
+            atomicLifecycleGroup: true, operationCount: body.operations.length });
+          const action = state.nextModify; state.nextModify = null;
+          if (action === "redirect-307") return new Response(null, { status: 307, headers: { location: request.url } });
+          if (action?.startsWith("family-") && action.endsWith("-race")) {
+            const raced = action === "family-list-race" ? body.operations.find(candidate => candidate.record.recordType === "List") :
+              action === "family-parent-race" ? body.operations.find(candidate => candidate.record.recordName.endsWith("FAMILY-PARENT")) :
+              body.operations.find(candidate => candidate.record.recordName.endsWith("FAMILY-CHILD"));
+            const current = state.records.get(raced.record.recordName);
+            state.records.set(current.recordName, { ...current, recordChangeTag: `concurrent-${current.recordChangeTag}` });
+          }
+          const stale = action === "record-conflict" ? operation : body.operations.find(candidate =>
+            candidate.operationType === "create" ? state.records.has(candidate.record.recordName) :
+              candidate.record.recordChangeTag !== state.records.get(candidate.record.recordName)?.recordChangeTag);
+          if (stale) return jsonResponse({ records: body.operations.map(candidate => ({ recordName: candidate.record.recordName,
+            serverErrorCode: candidate === stale ? "CONFLICT" : "ATOMIC_ERROR" })) });
+          const records = body.operations.map(candidate => {
+            const current = state.records.get(candidate.record.recordName);
+            const next = candidate.operationType === "create" ? { ...candidate.record,
+              zoneID: { zoneName: "Reminders", zoneType: "REGULAR_CUSTOM_ZONE", ownerRecordName: zoneOwner } } :
+              { ...current, fields: { ...current.fields, ...candidate.record.fields } };
+            if (candidate.operationType === "create" || candidate.record.parent?.recordName === null) delete next.parent;
+            next.recordChangeTag = `tag-${candidate.operationType === "create" ? "created" : "updated"}-${state.modifies.length}-${next.recordName}`;
+            state.records.set(next.recordName, next);
+            return next;
+          });
+          if (pristineFirstChild) state.firstChildWritten.add(createParentListId);
+          if (state.holdModify) {
+            const held = state.holdModify; state.holdModify = null; held.reached(); await held.releasePromise;
+          }
+          if (action === "committed-500") return jsonResponse({ serverErrorCode: "SERVICE_UNAVAILABLE" }, 500);
+          if (action === "committed-network-drop") throw new Error("Synthetic response lost after atomic family commit.");
+          if (action === "changed-resolution-tokens") records[0] = { ...records[0], fields: { ...records[0].fields,
+            ResolutionTokenMap: field("STRING", JSON.stringify({ map: {} })) } };
+          const introducedRelationship = {
+            "family-added-parent": { ParentReminder: field("REFERENCE", { recordName: "Reminder/UNEXPECTED-PARENT", action: "VALIDATE" }) },
+            "family-added-alarm": { AlarmIDs: field("STRING_LIST", ["Alarm/UNEXPECTED"]) },
+            "family-added-recurrence": { RecurrenceRuleIDs: field("STRING_LIST", ["RecurrenceRule/UNEXPECTED"]) },
+            "family-added-unknown-relationship": { FutureChildren: field("STRING_LIST", ["Reminder/UNEXPECTED"]) },
+            "family-added-empty-relationships": { ParentReminder: field("REFERENCE", null), AlarmIDs: field("UNKNOWN_LIST", []),
+              RecurrenceRuleIDs: field("STRING_LIST", []), UrgentPresentationAlarmsAsData: field("ASSETID", {
+                downloadURL: "https://synthetic.invalid/presentation", fileChecksum: "synthetic-checksum", wrappingKey: "synthetic-key", size: 10,
+              }) },
+          }[action];
+          if (introducedRelationship) records[0] = { ...records[0], fields: { ...records[0].fields, ...introducedRelationship } };
+          if (action === "family-changed-guard-intrinsic-parent") {
+            const index = records.findIndex(record => record.recordName === "Reminder/FAMILY-CHILD");
+            assert.ok(index >= 0);
+            records[index] = { ...records[index], parent: { recordName: "List/UNEXPECTED" } };
+          }
+          if (nativeDelete && action?.startsWith("family-delete-read-")) {
+            const emptyCollections = Object.fromEntries(["AlarmIDs", "HashtagIDs", "RecurrenceRuleIDs", "AssignmentIDs", "AttachmentIDs"]
+              .map(name => [name, field("UNKNOWN_LIST", [])]));
+            if (action === "family-delete-read-hashtag-introduction") emptyCollections.HashtagIDs = field("STRING_LIST", ["Hashtag/UNEXPECTED"]);
+            const detached = { ...records[0], fields: { ...records[0].fields, ...emptyCollections } };
+            state.records.set(detached.recordName, detached);
+            records[0] = { ...detached, parent: { recordName: listId } };
+            state.nextDeletionLookup = { reminderId: detached.recordName, mode: action };
+          }
+          return jsonResponse({ records: records.reverse() });
+        }
         if (body.operations.length > 1) {
           assert.equal(body.atomic, true);
           if (body.operations.some(candidate => candidate.record.recordType === "Alarm" && Object.hasOwn(candidate.record.fields, "DueDateResolutionTokenAsNonce"))) {
@@ -182,13 +527,29 @@ export async function verifyReminderWrites(options) {
               { ...record, fields: { ...record.fields, Foreign: field("STRING", "unexpected") } } : record) });
             return jsonResponse({ records: records.reverse() });
           }
-          if (Object.hasOwn(operation.record.fields, "ParentReminder")) {
-            assert.ok(body.operations.length === 2 || body.operations.length === 3);
+          const parentOperation = body.operations.find(candidate => Object.hasOwn(candidate.record.fields, "ParentReminder"));
+          if (parentOperation) {
+            assert.equal(parentOperation.operationType, "update", "Creation is handled with its atomic List membership update above.");
+            const listGuard = body.operations.find(candidate => candidate.operationType === "update" && candidate.record.recordType === "List");
+            assert.ok(listGuard, "A parent change must guard the full current List version.");
+            assert.deepEqual(listGuard.record.fields, { Deleted: field("INT64", 0) });
+            assert.equal(listGuard.record.recordChangeTag, state.records.get(listGuard.record.recordName)?.recordChangeTag);
+            const previousParent = state.records.get(parentOperation.record.recordName).fields.ParentReminder?.value?.recordName ?? null;
+            const nextParent = parentOperation.record.fields.ParentReminder.value?.recordName ?? null;
+            const expectedParentIds = [...new Set([previousParent, nextParent].filter(Boolean))].sort();
+            const parentGuards = body.operations.filter(candidate => candidate.operationType === "update" && candidate.record.recordType === "Reminder" &&
+              candidate.record.recordName !== parentOperation.record.recordName);
+            assert.deepEqual(parentGuards.map(candidate => candidate.record.recordName).sort(), expectedParentIds,
+              "A parent change guards each affected old and new root version.");
+            for (const guard of parentGuards) assert.deepEqual(guard.record.fields, { Deleted: field("INT64", 0) });
+            assert.equal(body.operations.length, 2 + expectedParentIds.length, "A parent change atomically includes its target, List and affected roots.");
             state.modifies.push({ atomicSubtaskGroup: true, operationCount: body.operations.length });
             const action = state.nextModify;
             state.nextModify = null;
             if (action === "parent-race") {
-              const parent = state.records.get(body.operations[1].record.recordName);
+              const parentGuard = parentGuards[0];
+              assert.ok(parentGuard, "A parent change must retain its exact affected root Reminder guard.");
+              const parent = state.records.get(parentGuard.record.recordName);
               state.records.set(parent.recordName, { ...parent, recordChangeTag: `concurrent-${parent.recordChangeTag}` });
             }
             const stale = body.operations.find(candidate => candidate.operationType === "create" ? state.records.has(candidate.record.recordName) :
@@ -196,11 +557,10 @@ export async function verifyReminderWrites(options) {
             if (stale) return jsonResponse({ records: body.operations.map(candidate => ({
               recordName: candidate.record.recordName, serverErrorCode: candidate === stale ? "CONFLICT" : "ATOMIC_ERROR",
             })) });
-            const records = body.operations.map((candidate, index) => {
-              if (index > 0) {
-                assert.equal(candidate.operationType, "update");
-                assert.deepEqual(candidate.record.fields, { Deleted: field("INT64", 0) });
-              }
+            const records = body.operations.map(candidate => {
+              const versionGuard = candidate !== parentOperation;
+              if (versionGuard) assert.deepEqual(candidate.record.fields, { Deleted: field("INT64", 0) });
+              else assert.equal(candidate, parentOperation);
               const current = state.records.get(candidate.record.recordName);
               const next = candidate.operationType === "create" ? { ...candidate.record, zoneID: { zoneName: "Reminders", ownerRecordName: zoneOwner } } :
                 { ...current, fields: { ...current.fields, ...candidate.record.fields } };
@@ -238,6 +598,45 @@ export async function verifyReminderWrites(options) {
             });
             return jsonResponse({ records: records.reverse() });
           }
+          if (body.operations.some(candidate => ["Attachment", "Hashtag"].includes(candidate.record.recordType))) {
+            assert.equal(body.atomic, true);
+            state.modifies.push({ atomicOrganizationGroup: true, operationCount: body.operations.length });
+            const action = state.nextModify; state.nextModify = null;
+            if (action === "related-version-race") {
+              const guard = body.operations.find(candidate => ["Attachment", "Hashtag"].includes(candidate.record.recordType) &&
+                candidate.operationType === "update" && Object.keys(candidate.record.fields).length === 1 &&
+                candidate.record.fields.Deleted?.type === "INT64" && candidate.record.fields.Deleted.value === 0);
+              assert.ok(guard, "Organization replacement must guard a retained related record.");
+              const current = state.records.get(guard.record.recordName);
+              state.records.set(current.recordName, { ...current, recordChangeTag: `concurrent-${current.recordChangeTag}` });
+            }
+            if (action === "transfer-list-race") {
+              const listWrites = body.operations.filter(candidate => candidate.record.recordType === "List" &&
+                Object.hasOwn(candidate.record.fields, "ReminderIDs"));
+              const guard = listWrites.at(-1);
+              assert.ok(guard, "A move must atomically write its destination List membership.");
+              const current = state.records.get(guard.record.recordName);
+              state.records.set(current.recordName, { ...current, recordChangeTag: `concurrent-${current.recordChangeTag}` });
+            }
+            const stale = body.operations.find(candidate => candidate.operationType === "create" ? state.records.has(candidate.record.recordName) :
+              candidate.record.recordChangeTag !== state.records.get(candidate.record.recordName)?.recordChangeTag);
+            if (stale) return jsonResponse({ records: body.operations.map(candidate => ({
+              recordName: candidate.record.recordName, serverErrorCode: candidate === stale ? "CONFLICT" : "ATOMIC_ERROR",
+            })) });
+            const records = body.operations.map(candidate => {
+              const current = state.records.get(candidate.record.recordName);
+              const next = candidate.operationType === "create"
+                ? { ...candidate.record, zoneID: { zoneName: "Reminders", zoneType: "REGULAR_CUSTOM_ZONE", ownerRecordName: zoneOwner } }
+                : { ...current, fields: { ...current.fields, ...candidate.record.fields } };
+              if (Object.hasOwn(candidate.record, "parent")) next.parent = candidate.record.parent;
+              next.recordChangeTag = `organization-updated-${state.modifies.length}-${next.recordName}`;
+              state.records.set(next.recordName, next);
+              return next;
+            });
+            if (action === "committed-500") return jsonResponse({ serverErrorCode: "SERVICE_UNAVAILABLE" }, 500);
+            if (action === "committed-network-drop") throw new Error("Synthetic response lost after atomic organization commit.");
+            return jsonResponse({ records: records.reverse() });
+          }
           assert.equal(localEvidence, true);
           assert.ok(body.operations.length === 2 || body.operations.length === 4);
           state.modifies.push({ atomicGuardGroup: true, operationCount: body.operations.length });
@@ -270,6 +669,11 @@ export async function verifyReminderWrites(options) {
           : { ...current, fields: { ...current.fields, ...operation.record.fields }, recordChangeTag: `tag-updated-${state.modifies.length}` };
         delete next.parent;
         state.records.set(next.recordName, next);
+        if (operation.operationType === "create" && operation.record.recordType === "List") state.pristineLists.add(next.recordName);
+        if (["reorder-color-json", "reorder-list-json-receipt"].includes(action) && operation.record.recordType === "List" && next.fields.Color?.type === "STRING") {
+          const parsed = JSON.parse(next.fields.Color.value);
+          next.fields.Color = { ...next.fields.Color, value: JSON.stringify(Object.fromEntries(Object.entries(parsed).reverse())) };
+        }
         if (state.holdModify) {
           const held = state.holdModify;
           state.holdModify = null;
@@ -278,7 +682,18 @@ export async function verifyReminderWrites(options) {
         }
         if (action === "committed-500") return jsonResponse({ serverErrorCode: "SERVICE_UNAVAILABLE" }, 500);
         if (action === "committed-network-drop") throw new Error("Synthetic response lost after commit.");
+        if (action === "reorder-list-json-receipt" && operation.record.recordType === "List") {
+          const parsed = JSON.parse(next.fields.ResolutionTokenMap.value);
+          const map = Object.fromEntries(Object.entries(parsed.map).reverse());
+          const prettyTokens = field("STRING", JSON.stringify({ ...parsed, map }, null, 2));
+          return jsonResponse({ records: [{ ...next, fields: { ...next.fields, ResolutionTokenMap: prettyTokens } }] });
+        }
         if (action === "changed-resolution-tokens") return jsonResponse({ records: [{ ...next, fields: { ...next.fields, ResolutionTokenMap: field("STRING", JSON.stringify({ map: {} })) } }] });
+        if (["signed-asset-url-drift", "signed-asset-checksum-drift", "signed-asset-wrapping-drift"].includes(action)) {
+          const asset = next.fields.UrgentPresentationAlarmsAsData;
+          const key = action === "signed-asset-url-drift" ? "downloadURL" : action === "signed-asset-checksum-drift" ? "fileChecksum" : "wrappingKey";
+          return jsonResponse({ records: [{ ...next, fields: { ...next.fields, UrgentPresentationAlarmsAsData: { ...asset, value: { ...asset.value, [key]: "changed" } } } }] });
+        }
         return jsonResponse({ records: [next] });
       }
       return jsonResponse({ serverErrorCode: "UNEXPECTED_SYNTHETIC_REQUEST" }, 500);
@@ -371,7 +786,7 @@ export async function verifyReminderWrites(options) {
 
     const toolsReply = await mcp("tools/list", {});
     const tools = toolsReply.result.tools;
-    assert.deepEqual(tools.map(tool => tool.name).sort(), ["complete_reminder", "connection_status", "create_reminder", "create_subtask", "set_reminder_parent", "delete_reminder", "get_all_open_reminders", "get_reminder", "get_reminder_lists", "get_reminder_list", "create_reminder_list", "rename_reminder_list", "delete_reminder_list", "get_reminders", "reopen_reminder", "update_reminder", "prepare_reminder_update", ...JOB_TOOLS].sort());
+    assert.deepEqual(tools.map(tool => tool.name).sort(), ["complete_reminder", "connection_status", "create_reminder", "create_subtask", "set_reminder_parent", "delete_reminder", "get_all_open_reminders", "get_reminder", "get_reminder_organization", "get_reminder_lists", "get_reminder_list", "get_reminder_list_appearance", "update_reminder_list_appearance", "get_shopping_categories", "set_reminder_category", "create_reminder_list", "rename_reminder_list", "delete_reminder_list", "get_reminders", "search_reminders", "reopen_reminder", "update_reminder", "prepare_reminder_update", "set_reminder_url", "set_reminder_tags", "move_reminder", "copy_reminder", ...JOB_TOOLS].sort());
     const createTool = tools.find(tool => tool.name === "create_reminder");
     const updateTool = tools.find(tool => tool.name === "update_reminder");
     assert.deepEqual({ readOnly: createTool.annotations.readOnlyHint, destructive: createTool.annotations.destructiveHint, idempotent: createTool.annotations.idempotentHint }, { readOnly: false, destructive: false, idempotent: true });
@@ -380,10 +795,102 @@ export async function verifyReminderWrites(options) {
       const annotations = tools.find(tool => tool.name === name).annotations;
       assert.deepEqual([annotations.readOnlyHint, annotations.destructiveHint, annotations.idempotentHint], [false, true, true]);
     }
+    for (const name of ["complete_reminder", "reopen_reminder", "delete_reminder"]) assert.ok(tools.find(tool => tool.name === name).inputSchema.properties.recurrenceCalendarTimeZone.description.length > 0);
     for (const tool of tools) for (const parameter of Object.values(tool.inputSchema.properties ?? {})) {
       assert.ok(parameter.description?.length > 0, `${tool.name} must describe each parameter in tools/list.`);
     }
     for (const parameter of Object.values(updateTool.inputSchema.properties.changes.properties)) assert.ok(parameter.description?.length > 0);
+    const search = async args => mcp("tools/call", { name: "search_reminders", arguments: { expectedGeneration: generation, listId: searchListId, ...args } });
+    const allTags = await search({ status: "all", tags: ["work", "home"] });
+    assert.equal(allTags.result.isError, undefined, JSON.stringify(allTags.result));
+    assert.deepEqual(allTags.result.structuredContent.records.map(record => record.id), ["Reminder/SEARCH-ALL"]);
+    assert.ok(!JSON.stringify(allTags.result).includes("https://example.test/Path") && !JSON.stringify(allTags.result).includes("work"));
+    const tagLookup = state.requests.filter(request => request.path.endsWith("/records/lookup")).at(-1);
+    assert.deepEqual(tagLookup.body.records.map(record => record.recordName), [
+      `Hashtag/${searchRelationIds.workA}`, `Hashtag/${searchRelationIds.homeA}`,
+      `Hashtag/${searchRelationIds.workB}`, `Hashtag/${searchRelationIds.homeDone}`,
+    ], "Tag-only search batches only selected tag relationships.");
+
+    const anyTags = await search({ status: "all", tags: ["work", "home"], tagMatch: "any" });
+    assert.deepEqual(anyTags.result.structuredContent.records.map(record => record.id), ["Reminder/SEARCH-ALL", "Reminder/SEARCH-WORK", "Reminder/SEARCH-DONE"]);
+    const untagged = await search({ status: "all", hasTags: false });
+    assert.deepEqual(untagged.result.structuredContent.records.map(record => record.id), ["Reminder/SEARCH-UNTAGGED"]);
+    const urlMatch = await search({ status: "all", urlText: "EXAMPLE.TEST/path" });
+    assert.deepEqual(urlMatch.result.structuredContent.records.map(record => record.id), ["Reminder/SEARCH-ALL"], "URL text ignores title, notes and image attachments.");
+    const urlLookup = state.requests.filter(request => request.path.endsWith("/records/lookup")).at(-1);
+    assert.deepEqual(urlLookup.body.records.map(record => record.recordName), [
+      `Attachment/${searchRelationIds.urlA}`, `Attachment/${searchRelationIds.image}`, `Attachment/${searchRelationIds.urlDone}`,
+    ], "URL-only search does not fetch tags.");
+    const noURL = await search({ status: "all", hasUrl: false });
+    assert.deepEqual(noURL.result.structuredContent.records.map(record => record.id), ["Reminder/SEARCH-WORK", "Reminder/SEARCH-UNTAGGED"]);
+    const completedOrganizationSearch = await search({ status: "completed", tags: ["home"], hasUrl: true });
+    assert.deepEqual(completedOrganizationSearch.result.structuredContent.records.map(record => record.id), ["Reminder/SEARCH-DONE"]);
+
+    const unclassifiedURLReminder = searchReminderRecord("Reminder/SEARCH-UNCLASSIFIED-URL", "unclassified URL", { attachments: [searchRelationIds.unclassifiedUrl] });
+    const unclassifiedURLAttachment = searchAttachment(searchRelationIds.unclassifiedUrl, unclassifiedURLReminder.recordName, { url: "https://example.test/unclassified", image: true });
+    delete unclassifiedURLAttachment.fields.Type; delete unclassifiedURLAttachment.fields.UTI;
+    unclassifiedURLAttachment.fields.URL = { ...field("STRING", "https://example.test/unclassified"), isEncrypted: true };
+    state.records.set(unclassifiedURLReminder.recordName, unclassifiedURLReminder);
+    state.records.set(unclassifiedURLAttachment.recordName, unclassifiedURLAttachment);
+    state.nextListQuery = { records: [], continuationMarker: "search-unclassified-url-next" };
+    const unclassifiedURLFirst = await search({ status: "all", urlText: "example.test/unclassified" });
+    const unclassifiedURLToken = unclassifiedURLFirst.result.structuredContent.continuation;
+    state.nextListQuery = { records: [unclassifiedURLReminder] };
+    const unclassifiedURL = await search({ status: "all", urlText: "example.test/unclassified", continuation: unclassifiedURLToken });
+    assert.equal(unclassifiedURL.result.structuredContent.error.code, "UNSUPPORTED_FEATURE");
+    unclassifiedURLAttachment.fields.Type = field("STRING", "URL");
+    unclassifiedURLAttachment.fields.UTI = field("STRING", "public.url");
+    state.records.set(unclassifiedURLAttachment.recordName, unclassifiedURLAttachment);
+    state.nextListQuery = { records: [unclassifiedURLReminder] };
+    const classifiedURLRetry = await search({ status: "all", urlText: "example.test/unclassified", continuation: unclassifiedURLToken });
+    assert.deepEqual(classifiedURLRetry.result.structuredContent.records.map(record => record.id), [unclassifiedURLReminder.recordName], "Repairing URL classification lets the same MCP continuation return its match.");
+
+    const unclassifiedPNGReminder = searchReminderRecord("Reminder/SEARCH-UNCLASSIFIED-PNG", "unclassified image", { attachments: [searchRelationIds.unclassifiedPng] });
+    const unclassifiedPNGAttachment = searchAttachment(searchRelationIds.unclassifiedPng, unclassifiedPNGReminder.recordName, { image: true });
+    delete unclassifiedPNGAttachment.fields.Type; delete unclassifiedPNGAttachment.fields.UTI;
+    state.records.set(unclassifiedPNGReminder.recordName, unclassifiedPNGReminder);
+    state.records.set(unclassifiedPNGAttachment.recordName, unclassifiedPNGAttachment);
+    state.nextListQuery = { records: [], continuationMarker: "search-unclassified-png-next" };
+    const unclassifiedPNGFirst = await search({ status: "all", hasUrl: false });
+    const unclassifiedPNGToken = unclassifiedPNGFirst.result.structuredContent.continuation;
+    state.nextListQuery = { records: [unclassifiedPNGReminder] };
+    const unclassifiedPNG = await search({ status: "all", hasUrl: false, continuation: unclassifiedPNGToken });
+    assert.equal(unclassifiedPNG.result.structuredContent.error.code, "UNSUPPORTED_FEATURE");
+    unclassifiedPNGAttachment.fields.Type = field("STRING", "Image");
+    unclassifiedPNGAttachment.fields.UTI = field("STRING", "public.png");
+    state.records.set(unclassifiedPNGAttachment.recordName, unclassifiedPNGAttachment);
+    state.nextListQuery = { records: [unclassifiedPNGReminder] };
+    const classifiedPNGRetry = await search({ status: "all", hasUrl: false, continuation: unclassifiedPNGToken });
+    assert.deepEqual(classifiedPNGRetry.result.structuredContent.records.map(record => record.id), [unclassifiedPNGReminder.recordName], "Observed PNG classification lets the same MCP continuation prove there is no URL.");
+
+    state.nextListQuery = { records: [searchFixtures.records[0]], continuationMarker: "search-filter-next" };
+    const searchFirst = await search({ status: "all", tags: ["work"] });
+    const searchToken = searchFirst.result.structuredContent.continuation;
+    assert.ok(searchToken);
+    const queriesBeforeChangedFilters = state.requests.filter(request => request.path.endsWith("/records/query")).length;
+    const changedHydrationFilters = await search({ status: "all", tags: ["home"], continuation: searchToken });
+    assert.equal(changedHydrationFilters.result.structuredContent.error.code, "CONFLICT");
+    assert.equal(state.requests.filter(request => request.path.endsWith("/records/query")).length, queriesBeforeChangedFilters);
+    state.nextListQuery = { records: [searchFixtures.records[1]] };
+    const searchLater = await search({ status: "all", tags: ["work"], continuation: searchToken });
+    assert.deepEqual(searchLater.result.structuredContent.records.map(record => record.id), ["Reminder/SEARCH-WORK"]);
+
+    state.nextListQuery = { records: [], continuationMarker: "search-relation-error-next" };
+    const relationErrorFirst = await search({ status: "all", tags: ["missing-value"] });
+    const relationErrorToken = relationErrorFirst.result.structuredContent.continuation;
+    const missingReminder = searchReminderRecord("Reminder/SEARCH-MISSING", "missing relation", { tags: [searchRelationIds.missing] });
+    state.records.set(missingReminder.recordName, missingReminder);
+    state.nextListQuery = { records: [missingReminder] };
+    const missingRelation = await search({ status: "all", tags: ["missing-value"], continuation: relationErrorToken });
+    assert.equal(missingRelation.result.structuredContent.error.code, "CONFLICT");
+    state.records.set(`Hashtag/${searchRelationIds.missing}`, searchHashtag(searchRelationIds.missing, missingReminder.recordName, "missing-value"));
+    state.nextListQuery = { records: [missingReminder] };
+    const relationRetry = await search({ status: "all", tags: ["missing-value"], continuation: relationErrorToken });
+    assert.deepEqual(relationRetry.result.structuredContent.records.map(record => record.id), ["Reminder/SEARCH-MISSING"]);
+    state.records.delete(searchListId);
+    for (const record of [...searchFixtures.records, ...searchFixtures.related, missingReminder, unclassifiedURLReminder, unclassifiedURLAttachment,
+      unclassifiedPNGReminder, unclassifiedPNGAttachment]) state.records.delete(record.recordName);
+
     const status = await mcp("tools/call", { name: "connection_status", arguments: {} });
     assert.equal(status.result.structuredContent.generation, generation);
     state.records.get(listId).fields.Name.value = "S".repeat(257);
@@ -396,6 +903,12 @@ export async function verifyReminderWrites(options) {
     assert.ok(state.requests.every(request => !request.path.endsWith("/changes/zone")), "The mutation journey discovers lists without history scanning.");
 
     const createKey = "46cf8eef-6cab-4aa2-a725-219769337d8b";
+    const listBeforeCreate = state.records.get(listId);
+    listBeforeCreate.fields.SyntheticFutureListField = field("STRING", "preserve-this-list-field");
+    const tokenMapBeforeCreate = JSON.parse(listBeforeCreate.fields.ResolutionTokenMap.value);
+    tokenMapBeforeCreate.map.syntheticUnrelatedToken = { counter: 2, modificationTime: 757_382_399, replicaID: "4e6cb834-5b1c-4ce6-8c39-00e752121111" };
+    listBeforeCreate.fields.ResolutionTokenMap = field("STRING", JSON.stringify(tokenMapBeforeCreate));
+    const listFieldsBeforeCreate = structuredClone(listBeforeCreate.fields);
     const createArgs = { listId, idempotencyKey: createKey, title: "Café 🧭 — 東京", notes: "Keep this note 🌿", priority: 1, flagged: true };
     const created = await mcp("tools/call", { name: "create_reminder", arguments: createArgs });
     assert.equal(created.result.isError, undefined, JSON.stringify(created.result.structuredContent));
@@ -405,6 +918,16 @@ export async function verifyReminderWrites(options) {
     assert.equal(created.result.structuredContent.replayed, false);
     assert.equal(state.modifies.length, 1);
     assert.equal(state.modifies[0].recordName, `Reminder/${createKey.toUpperCase()}`);
+    assert.equal(state.modifies[0].atomicCreationGroup, true); assert.equal(state.modifies[0].operationCount, 2);
+    assert.deepEqual(JSON.parse(state.records.get(listId).fields.ReminderIDs.value),
+      [...JSON.parse(listFieldsBeforeCreate.ReminderIDs.value), createKey.toUpperCase()], "Creation appends after existing List members.");
+    const tokensAfterCreate = JSON.parse(state.records.get(listId).fields.ResolutionTokenMap.value).map;
+    const tokensBeforeCreate = JSON.parse(listFieldsBeforeCreate.ResolutionTokenMap.value).map;
+    assert.deepEqual(Object.keys(tokensAfterCreate).sort(), Object.keys(tokensBeforeCreate).sort());
+    assert.equal(tokensAfterCreate.reminderIDsMergeableOrdering.counter, tokensBeforeCreate.reminderIDsMergeableOrdering.counter + 1);
+    assert.deepEqual(tokensAfterCreate.syntheticUnrelatedToken, tokensBeforeCreate.syntheticUnrelatedToken);
+    assert.equal(state.records.get(listId).fields.SyntheticFutureListField.value, "preserve-this-list-field");
+    assert.equal(state.records.get(listId).fields.Name.value, listFieldsBeforeCreate.Name.value);
     assert.ok(!JSON.stringify(created).includes(opaqueMetadata));
     assert.ok(!JSON.stringify(created).includes("synthetic-private-owner"));
     const validateCreate = new AjvJsonSchemaValidator().getValidator(createTool.outputSchema);
@@ -425,6 +948,8 @@ export async function verifyReminderWrites(options) {
 
     // API writes require a pinned generation. A title-only edit keeps notes and Apple-owned fields.
     const beforeEdit = state.records.get(reminderId);
+    beforeEdit.fields.UrgentPresentationAlarmsAsData = field("ASSETID", { downloadURL: "https://synthetic.invalid/old", wrappingKey: "synthetic-key", fileChecksum: "synthetic-checksum", size: 10 });
+    state.nextModify = "signed-asset-url-drift";
     const oldTag = beforeEdit.recordChangeTag;
     const editBody = { action: "update", listId, reminderId, recordChangeTag: oldTag, changes: { title: "Edited through API ✨" }, expectedGeneration: generation };
     const editedResponse = await request("/api/mutations", { method: "POST", body: editBody });
@@ -511,6 +1036,7 @@ export async function verifyReminderWrites(options) {
     const deleteReply = await mcp("tools/call", { name: "delete_reminder", arguments: deleteTarget });
     assert.equal(deleteReply.result.structuredContent.record.deleted, true);
     assert.equal(deleteReply.result.structuredContent.record.completed, true);
+    assert.equal(deleteReply.result.structuredContent.record.listId, null);
     await repeatLifecycle("delete_reminder", deleteTarget);
     const deletedLookup = await mcp("tools/call", { name: "get_reminder", arguments: { listId, reminderId: lifecycleId } });
     assert.equal(deletedLookup.result.structuredContent.record.deleted, true);
@@ -518,22 +1044,916 @@ export async function verifyReminderWrites(options) {
     assert.deepEqual(missingLookup.result.structuredContent, { generation, record: null, missing: true });
     state.records.set("List/READ-OTHER", { ...listRecord(), recordName: "List/READ-OTHER" });
     const wrongList = await mcp("tools/call", { name: "get_reminder", arguments: { listId: "List/READ-OTHER", reminderId: lifecycleId } });
-    assert.equal(wrongList.result.structuredContent.error.code, "FORBIDDEN");
+    assert.equal(wrongList.result.structuredContent.record.listId, null, "Detached deleted records do not invent a relationship to an independently authorized requested List.");
     state.records.delete("List/READ-OTHER");
-    assert.deepEqual(state.modifies.at(-1).fields, ["Deleted", "LastModifiedDate", "ResolutionTokenMap"]);
+    assert.deepEqual(state.modifies.at(-1).fields, ["Deleted", "LastModifiedDate", "List", "ResolutionTokenMap"]);
     assert.equal(state.modifies.at(-1).operationType, "update");
     const beforeLifecycleRefusal = state.modifies.length;
     for (const id of ["Reminder/WRITE-RECURRING", "Reminder/WRITE-ALARMED"]) {
       const refused = await mcp("tools/call", { name: "complete_reminder", arguments: { listId, reminderId: id, recordChangeTag: state.records.get(id).recordChangeTag } });
-      assert.equal(refused.result.structuredContent.error.code, "UNSUPPORTED_FEATURE");
+      assert.equal(refused.result.structuredContent.error.code, id.endsWith("WRITE-ALARMED") ? "CONFLICT" : "UNSUPPORTED_FEATURE");
     }
     const child = reminderRecord("Reminder/WRITE-SUBTASK");
     child.fields.ParentReminder = field("REFERENCE", { recordName: reminderId, action: "VALIDATE" });
     state.records.set(child.recordName, child);
+    const deeper = reminderRecord("Reminder/WRITE-DEEP");
+    deeper.fields.ParentReminder = field("REFERENCE", { recordName: child.recordName, action: "VALIDATE" });
+    state.records.set(deeper.recordName, deeper);
     const nestedRefused = await mcp("tools/call", { name: "delete_reminder", arguments: { listId, reminderId: child.recordName, recordChangeTag: child.recordChangeTag } });
     assert.equal(nestedRefused.result.structuredContent.error.code, "UNSUPPORTED_FEATURE");
     state.records.delete(child.recordName);
+    state.records.delete(deeper.recordName);
     assert.equal(state.modifies.length, beforeLifecycleRefusal);
+
+    // One mixed family journey exercises the public lifecycle API and atomic dependency races.
+    const familyParent = reminderRecord("Reminder/FAMILY-PARENT");
+    const familyChild = reminderRecord("Reminder/FAMILY-CHILD");
+    const independentChild = reminderRecord("Reminder/FAMILY-INDEPENDENT");
+    for (const child of [familyChild, independentChild]) child.fields.ParentReminder = field("REFERENCE", { recordName: familyParent.recordName, action: "VALIDATE" });
+    const earlierCompletion = Date.parse("2028-01-02T03:04:05.000Z");
+    independentChild.fields.Completed = field("INT64", 1);
+    independentChild.fields.CompletionDate = field("TIMESTAMP", earlierCompletion);
+    for (const record of [familyParent, familyChild, independentChild]) state.records.set(record.recordName, record);
+    const familyList = state.records.get(listId);
+    const previousMembership = JSON.parse(familyList.fields.ReminderIDs.value);
+    const familyMembers = [familyParent, familyChild, independentChild].map(record => record.recordName.slice("Reminder/".length));
+    familyList.fields.ReminderIDs = field("STRING", JSON.stringify([...previousMembership, ...familyMembers]));
+    const familyTarget = id => ({ listId, reminderId: id, recordChangeTag: state.records.get(id).recordChangeTag });
+    for (const race of ["family-child-race", "family-list-race"]) {
+      state.nextModify = race;
+      const before = state.modifies.length;
+      const rejected = await mcp("tools/call", { name: "complete_reminder", arguments: familyTarget(familyParent.recordName) });
+      assert.equal(rejected.result.structuredContent.error.code, "CONFLICT");
+      assert.equal(state.modifies.length, before + 1);
+      assert.equal(state.records.get(familyParent.recordName).fields.Completed.value, 0);
+      assert.equal(state.records.get(familyChild.recordName).fields.Completed.value, 0);
+    }
+    const beforeLaggingFamilyRead = state.requests.length;
+    state.nextListQuery = { records: [familyParent, independentChild] };
+    const familyComplete = await mcp("tools/call", { name: "complete_reminder", arguments: familyTarget(familyParent.recordName) });
+    assert.deepEqual(familyComplete.result.structuredContent.affectedRecords.map(record => record.id), [familyParent.recordName, familyChild.recordName]);
+    const familyReadRequests = state.requests.slice(beforeLaggingFamilyRead);
+    const exactFamilyLookupIds = familyReadRequests.filter(request => request.path.endsWith("/records/lookup"))
+      .flatMap(request => request.body.records.map(record => record.recordName));
+    assert.ok(exactFamilyLookupIds.includes(familyChild.recordName), "Exact List membership resolves a committed child omitted by the lagging compound query.");
+    assert.deepEqual(JSON.parse(familyList.fields.ReminderIDs.value), [...previousMembership, ...familyMembers], "Family completion preserves native List ordering.");
+    const familyCompletion = state.records.get(familyParent.recordName).fields.CompletionDate.value;
+    assert.equal(state.records.get(familyChild.recordName).fields.CompletionDate.value, familyCompletion);
+    assert.equal(state.records.get(independentChild.recordName).fields.CompletionDate.value, earlierCompletion);
+    assert.equal(state.records.get(familyChild.recordName).fields.ParentReminder.value.recordName, familyParent.recordName);
+    assert.equal(state.records.get(familyChild.recordName).fields.TitleDocument.value, familyChild.fields.TitleDocument.value);
+    state.nextModify = "family-parent-race";
+    const childParentRace = await mcp("tools/call", { name: "reopen_reminder", arguments: familyTarget(familyChild.recordName) });
+    assert.equal(childParentRace.result.structuredContent.error.code, "CONFLICT");
+    assert.equal(state.records.get(familyChild.recordName).fields.Completed.value, 1);
+    const childReopened = await mcp("tools/call", { name: "reopen_reminder", arguments: familyTarget(familyChild.recordName) });
+    assert.deepEqual(childReopened.result.structuredContent.affectedRecords.map(record => record.id), [familyChild.recordName]);
+    assert.equal(state.records.get(familyParent.recordName).fields.Completed.value, 1);
+    const childCompleted = await mcp("tools/call", { name: "complete_reminder", arguments: familyTarget(familyChild.recordName) });
+    assert.equal(childCompleted.result.structuredContent.record.completed, true);
+    assert.equal(state.records.get(familyParent.recordName).fields.CompletionDate.value, familyCompletion);
+    // Independent re-completion receives another timestamp and is preserved by root reopening.
+    const independentChildCompletion = state.records.get(familyChild.recordName).fields.CompletionDate.value;
+    assert.notEqual(independentChildCompletion, familyCompletion);
+    const reopenedFamily = await mcp("tools/call", { name: "reopen_reminder", arguments: familyTarget(familyParent.recordName) });
+    assert.deepEqual(reopenedFamily.result.structuredContent.affectedRecords.map(record => record.id), [familyParent.recordName]);
+    assert.equal(state.records.get(familyChild.recordName).fields.CompletionDate.value, independentChildCompletion);
+    assert.equal(state.records.get(independentChild.recordName).fields.CompletionDate.value, earlierCompletion);
+    await mcp("tools/call", { name: "reopen_reminder", arguments: familyTarget(familyChild.recordName) });
+    await mcp("tools/call", { name: "complete_reminder", arguments: familyTarget(familyParent.recordName) });
+    const selectiveReopen = await mcp("tools/call", { name: "reopen_reminder", arguments: familyTarget(familyParent.recordName) });
+    assert.deepEqual(selectiveReopen.result.structuredContent.affectedRecords.map(record => record.id), [familyParent.recordName, familyChild.recordName]);
+    assert.equal(selectiveReopen.result.structuredContent.record.completed, false);
+    const beforeIncompleteFamily = state.modifies.length;
+    state.nextListQuery = { records: [{ recordName: familyChild.recordName, serverErrorCode: "UNKNOWN_ERROR" }] };
+    const incompleteFamily = await mcp("tools/call", { name: "complete_reminder", arguments: familyTarget(familyParent.recordName) });
+    assert.equal(incompleteFamily.result.structuredContent.error.code, "UNSUPPORTED_FEATURE");
+    assert.equal(state.modifies.length, beforeIncompleteFamily);
+    for (const mode of ["family-added-parent", "family-added-alarm", "family-added-recurrence", "family-added-unknown-relationship"]) {
+      state.nextModify = mode;
+      const before = state.modifies.length, submitted = familyTarget(familyParent.recordName);
+      const uncertain = await mcp("tools/call", { name: "complete_reminder", arguments: submitted });
+      assert.equal(uncertain.result.structuredContent.error.code, "WRITE_OUTCOME_UNKNOWN");
+      assert.equal(state.modifies.length, before + 1, "Unexpected receipt relationships must never cause another dispatch.");
+      const repeated = await mcp("tools/call", { name: "complete_reminder", arguments: submitted });
+      assert.equal(repeated.result.structuredContent.error.code, "CONFLICT");
+      assert.equal(state.modifies.length, before + 1);
+      const observed = await mcp("tools/call", { name: "get_reminder", arguments: { listId, reminderId: familyParent.recordName } });
+      assert.equal(observed.result.structuredContent.record.completed, true);
+      await mcp("tools/call", { name: "reopen_reminder", arguments: familyTarget(familyParent.recordName) });
+    }
+    state.nextModify = "family-added-empty-relationships";
+    const emptyRelationships = await mcp("tools/call", { name: "complete_reminder", arguments: familyTarget(familyParent.recordName) });
+    assert.equal(emptyRelationships.result.isError, undefined, JSON.stringify(emptyRelationships.result));
+    assert.equal(emptyRelationships.result.structuredContent.record.parentReminderId, null);
+    assert.deepEqual(emptyRelationships.result.structuredContent.record.alarmIds, []);
+    assert.deepEqual(emptyRelationships.result.structuredContent.record.recurrenceRuleIds, []);
+    await mcp("tools/call", { name: "reopen_reminder", arguments: familyTarget(familyParent.recordName) });
+    // Native deletion detaches the direct target and removes only its membership;
+    // descendants in a root cascade retain their links and completion/token history.
+    const independentBeforeDelete = structuredClone(state.records.get(independentChild.recordName));
+    for (const race of ["family-parent-race", "family-child-race", "family-list-race"]) {
+      state.nextModify = race;
+      const before = state.modifies.length;
+      const rejected = await mcp("tools/call", { name: "delete_reminder", arguments: familyTarget(independentChild.recordName) });
+      assert.equal(rejected.result.structuredContent.error.code, "CONFLICT");
+      assert.equal(state.modifies.length, before + 1);
+      assert.equal(state.records.get(independentChild.recordName).fields.Deleted.value, 0);
+    }
+    for (const mode of ["family-delete-read-tag-drift", "family-delete-read-field-drift", "family-delete-read-failure", "family-delete-read-hashtag-introduction"]) {
+      const id = `Reminder/${mode.toUpperCase()}`, probe = reminderRecord(id);
+      probe.parent = { recordName: listId };
+      probe.fields.ParentReminder = field("REFERENCE", { recordName: familyParent.recordName, action: "VALIDATE" });
+      if (mode === "family-delete-read-hashtag-introduction") probe.fields.HashtagIDs = field("UNKNOWN_LIST", []);
+      state.records.set(id, probe);
+      const submitted = familyTarget(id), before = state.modifies.length;
+      state.nextModify = mode;
+      const unknown = await mcp("tools/call", { name: "delete_reminder", arguments: submitted });
+      assert.equal(unknown.result.structuredContent.error.code, "WRITE_OUTCOME_UNKNOWN");
+      assert.equal(state.modifies.length, before + 1);
+      const repeated = await mcp("tools/call", { name: "delete_reminder", arguments: submitted });
+      assert.equal(repeated.result.structuredContent.error.code, "CONFLICT");
+      assert.equal(state.modifies.length, before + 1);
+      if (mode === "family-delete-read-hashtag-introduction") {
+        const observed = await mcp("tools/call", { name: "get_reminder", arguments: { listId, reminderId: id } });
+        assert.deepEqual(observed.result.structuredContent.record.hashtagIds, ["Hashtag/UNEXPECTED"], "The otherwise matching exact reread retains the introduced relationship, so success must still be refused.");
+      }
+      state.records.delete(id);
+    }
+    const guardReceiptTargetId = "Reminder/FAMILY-GUARD-RECEIPT-TARGET";
+    const guardReceiptTarget = reminderRecord(guardReceiptTargetId);
+    guardReceiptTarget.fields.ParentReminder = field("REFERENCE", { recordName: familyParent.recordName, action: "VALIDATE" });
+    state.records.set(guardReceiptTargetId, guardReceiptTarget);
+    state.records.get(listId).fields.ReminderIDs = field("STRING", JSON.stringify([...JSON.parse(state.records.get(listId).fields.ReminderIDs.value), guardReceiptTargetId]));
+    const submittedGuardDelete = familyTarget(guardReceiptTargetId), beforeGuardReceipt = state.modifies.length;
+    state.nextModify = "family-changed-guard-intrinsic-parent";
+    const guardReceiptUnknown = await mcp("tools/call", { name: "delete_reminder", arguments: submittedGuardDelete });
+    assert.equal(guardReceiptUnknown.result.structuredContent.error.code, "WRITE_OUTCOME_UNKNOWN");
+    assert.equal(state.modifies.length, beforeGuardReceipt + 1);
+    const guardReceiptRead = await mcp("tools/call", { name: "get_reminder", arguments: { listId, reminderId: guardReceiptTargetId } });
+    assert.equal(guardReceiptRead.result.structuredContent.record.deleted, true);
+    const guardReceiptRepeat = await mcp("tools/call", { name: "delete_reminder", arguments: submittedGuardDelete });
+    assert.equal(guardReceiptRepeat.result.structuredContent.error.code, "CONFLICT");
+    assert.equal(state.modifies.length, beforeGuardReceipt + 1, "Changed guard parent receipts must never cause another dispatch.");
+    state.records.delete(guardReceiptTargetId);
+    state.records.get(independentChild.recordName).parent = { recordName: listId };
+    state.nextModify = "family-delete-read-settled";
+    const directDeleted = await mcp("tools/call", { name: "delete_reminder", arguments: familyTarget(independentChild.recordName) });
+    assert.equal(directDeleted.result.isError, undefined, JSON.stringify(directDeleted.result));
+    assert.equal(directDeleted.result.structuredContent.record.listId, null);
+    assert.equal(directDeleted.result.structuredContent.record.parentReminderId, null);
+    assert.equal(directDeleted.result.structuredContent.record.completed, true);
+    assert.equal(state.records.get(independentChild.recordName).fields.CompletionDate.value, earlierCompletion);
+    const tokensBeforeDirect = JSON.parse(independentBeforeDelete.fields.ResolutionTokenMap.value).map;
+    const tokensAfterDirect = JSON.parse(state.records.get(independentChild.recordName).fields.ResolutionTokenMap.value).map;
+    for (const token of ["completed", "completionDate", "deleted"]) assert.deepEqual(tokensAfterDirect[token], tokensBeforeDirect[token]);
+    assert.deepEqual(JSON.parse(state.records.get(listId).fields.ReminderIDs.value), [...previousMembership, familyParent.recordName.slice("Reminder/".length), familyChild.recordName.slice("Reminder/".length)]);
+    await mcp("tools/call", { name: "complete_reminder", arguments: familyTarget(familyChild.recordName) });
+    const cascadeChildBefore = structuredClone(state.records.get(familyChild.recordName));
+    state.nextModify = "family-child-race";
+    const staleCascade = await mcp("tools/call", { name: "delete_reminder", arguments: familyTarget(familyParent.recordName) });
+    assert.equal(staleCascade.result.structuredContent.error.code, "CONFLICT");
+    assert.equal(state.records.get(familyParent.recordName).fields.Deleted.value, 0);
+    const submittedDelete = familyTarget(familyParent.recordName), beforeLostDelete = state.modifies.length;
+    state.nextModify = "committed-network-drop";
+    const unknownDelete = await mcp("tools/call", { name: "delete_reminder", arguments: submittedDelete });
+    assert.equal(unknownDelete.result.structuredContent.error.code, "WRITE_OUTCOME_UNKNOWN");
+    assert.equal(state.modifies.length, beforeLostDelete + 1);
+    const detachedRead = await mcp("tools/call", { name: "get_reminder", arguments: { listId, reminderId: familyParent.recordName } });
+    assert.equal(detachedRead.result.structuredContent.missing, false);
+    assert.equal(detachedRead.result.structuredContent.record.listId, null);
+    assert.equal(detachedRead.result.structuredContent.record.deleted, true);
+    const cascadedRead = await mcp("tools/call", { name: "get_reminder", arguments: { listId, reminderId: familyChild.recordName } });
+    assert.equal(cascadedRead.result.structuredContent.record.deleted, true);
+    assert.equal(cascadedRead.result.structuredContent.record.listId, listId);
+    assert.equal(cascadedRead.result.structuredContent.record.parentReminderId, familyParent.recordName);
+    for (const key of ["Completed", "CompletionDate", "LastModifiedDate", "ResolutionTokenMap"]) assert.deepEqual(state.records.get(familyChild.recordName).fields[key], cascadeChildBefore.fields[key]);
+    assert.deepEqual(JSON.parse(state.records.get(listId).fields.ReminderIDs.value), [...previousMembership, familyChild.recordName.slice("Reminder/".length)]);
+    const repeatDeleted = await mcp("tools/call", { name: "delete_reminder", arguments: submittedDelete });
+    assert.equal(repeatDeleted.result.structuredContent.error.code, "CONFLICT");
+    assert.equal(state.modifies.length, beforeLostDelete + 1, "Read-only deletion reconciliation and stale replay must never dispatch again.");
+    for (const record of [familyParent, familyChild, independentChild]) state.records.delete(record.recordName);
+    state.records.get(listId).fields.ReminderIDs = field("STRING", JSON.stringify(previousMembership));
+
+    const seedScheduledFamily = (suffix, rootAlarm = true, thirdAlarm = false) => {
+      const root = reminderRecord(`Reminder/SCHEDULED-${suffix}-PARENT`), child = reminderRecord(`Reminder/SCHEDULED-${suffix}-CHILD`), independent = reminderRecord(`Reminder/SCHEDULED-${suffix}-INDEPENDENT`);
+      root.parent = child.parent = independent.parent = { recordName: listId };
+      for (const record of [child, independent]) record.fields.ParentReminder = field("REFERENCE", { recordName: root.recordName, action: "VALIDATE" });
+      independent.fields.Completed = field("INT64", 1); independent.fields.CompletionDate = field("TIMESTAMP", earlierCompletion);
+      const pairs = [];
+      const datedMembers = [...(rootAlarm ? [[root, "2030-10-19T08:00:00Z"]] : []), [child, "2030-10-20T09:00:00Z"], ...(thirdAlarm ? [[independent, "2030-10-21T10:00:00Z"]] : [])];
+      for (const [record, due] of datedMembers) {
+        record.fields.DueDate = field("TIMESTAMP", Date.parse(due)); record.fields.TimeZone = field("STRING", "Europe/London"); record.fields.AllDay = field("INT64", 0);
+        record.fields.UrgentPresentationAlarmsAsData = field("ASSETID", { downloadURL: "https://synthetic.invalid/one", wrappingKey: "synthetic-key", fileChecksum: "checksum", size: 1 });
+        const tokens = JSON.parse(record.fields.ResolutionTokenMap.value); tokens.map.dueDate = { counter: 1, modificationTime: 1_700_000_000, replicaID: randomUUID() }; record.fields.ResolutionTokenMap = field("STRING", JSON.stringify(tokens));
+        const alarmId = `Alarm/${randomUUID().toUpperCase()}`, triggerId = `AlarmTrigger/${randomUUID().toUpperCase()}`; record.fields.AlarmIDs = field("STRING_LIST", [alarmId]);
+        pairs.push({ recordName: alarmId, recordType: "Alarm", recordChangeTag: `tag-${alarmId}`, zoneID: record.zoneID, parent: { recordName: record.recordName }, fields: {
+          AlarmUID: field("STRING", alarmId.slice(6)), TriggerID: field("STRING", triggerId.slice(13)), DueDateResolutionTokenAsNonce: field("DOUBLE", dueDateNonce(record.fields.ResolutionTokenMap.value)),
+          Reminder: field("REFERENCE", { recordName: record.recordName, action: "VALIDATE", zoneID: record.zoneID }), Imported: field("INT64", 0), Deleted: field("INT64", 0),
+        } }, { recordName: triggerId, recordType: "AlarmTrigger", recordChangeTag: `tag-${triggerId}`, zoneID: record.zoneID, parent: { recordName: alarmId }, fields: {
+          DateComponentsData: field("BYTES", Buffer.from(JSON.stringify(dateComponents(due, "Europe/London"))).toString("base64")), Type: field("STRING", "Date"),
+          Alarm: field("REFERENCE", { recordName: alarmId, action: "VALIDATE", zoneID: record.zoneID }), Imported: field("INT64", 0), Deleted: field("INT64", 0),
+        } });
+      }
+      for (const record of [root, child, independent, ...pairs]) state.records.set(record.recordName, record);
+      const list = state.records.get(listId); list.fields.ReminderIDs = field("STRING", JSON.stringify([...JSON.parse(list.fields.ReminderIDs.value), root.recordName, child.recordName, independent.recordName]));
+      return { root, child, independent, pairs, args: record => ({ listId, reminderId: record.recordName, recordChangeTag: state.records.get(record.recordName).recordChangeTag, expectedGeneration: generation }) };
+    };
+    const scheduled = seedScheduledFamily("JOURNEY"), beforeScheduled = state.modifies.length;
+    for (const race of ["scheduled-member-race", "scheduled-pair-race", "scheduled-list-race"]) {
+      const before = state.modifies.length; state.nextModify = race;
+      const rejected = await mcp("tools/call", { name: "complete_reminder", arguments: scheduled.args(scheduled.root) });
+      assert.equal(rejected.result.structuredContent.error.code, "CONFLICT"); assert.equal(state.modifies.length, before + 1);
+      assert.equal(state.records.get(scheduled.root.recordName).fields.Completed.value, 0); assert.equal(state.modifies.at(-1).operationCount, 8);
+    }
+    state.nextListQuery = { records: [{ recordName: scheduled.child.recordName, serverErrorCode: "UNKNOWN_ERROR" }] };
+    const incompleteScheduled = await mcp("tools/call", { name: "complete_reminder", arguments: scheduled.args(scheduled.root) });
+    assert.equal(incompleteScheduled.result.structuredContent.error.code, "UNSUPPORTED_FEATURE"); assert.equal(state.modifies.length, beforeScheduled + 3);
+    state.foreignZoneIds.add(scheduled.pairs[0].recordName);
+    const foreignScheduledPair = await mcp("tools/call", { name: "complete_reminder", arguments: scheduled.args(scheduled.root) });
+    assert.equal(foreignScheduledPair.result.isError, true); assert.equal(state.modifies.length, beforeScheduled + 3); state.foreignZoneIds.delete(scheduled.pairs[0].recordName);
+    const scheduledSource = state.records.get(scheduled.root.recordName);
+    scheduledSource.fields.UnknownScheduledRelationship = field("REFERENCE", { recordName: scheduled.child.recordName, action: "VALIDATE" });
+    const unknownScheduledGraph = await mcp("tools/call", { name: "complete_reminder", arguments: scheduled.args(scheduled.root) });
+    assert.equal(unknownScheduledGraph.result.structuredContent.error.code, "UNSUPPORTED_FEATURE"); assert.equal(state.modifies.length, beforeScheduled + 3); delete scheduledSource.fields.UnknownScheduledRelationship;
+    const extraScheduled = Array.from({ length: 10 }, (_, index) => {
+      const record = structuredClone(scheduled.child); record.recordName = `Reminder/SCHEDULED-EXTRA-${index}`; record.fields.AlarmIDs = field("STRING_LIST", [`Alarm/${randomUUID().toUpperCase()}`]); state.records.set(record.recordName, record); return record;
+    });
+    const oversizedScheduled = await mcp("tools/call", { name: "complete_reminder", arguments: scheduled.args(scheduled.root) });
+    assert.equal(oversizedScheduled.result.structuredContent.error.code, "UNSUPPORTED_FEATURE"); assert.equal(state.modifies.length, beforeScheduled + 3);
+    for (const record of extraScheduled) state.records.delete(record.recordName);
+    const pairFields = scheduled.pairs.map(record => structuredClone(state.records.get(record.recordName).fields));
+    const scheduledCompleted = await mcp("tools/call", { name: "complete_reminder", arguments: scheduled.args(scheduled.root) });
+    assert.equal(scheduledCompleted.result.isError, undefined, JSON.stringify(scheduledCompleted.result));
+    assert.deepEqual(scheduledCompleted.result.structuredContent.affectedRecords.map(record => record.id), [scheduled.root.recordName, scheduled.child.recordName]);
+    const scheduledTimestamp = state.records.get(scheduled.root.recordName).fields.CompletionDate.value;
+    assert.equal(state.records.get(scheduled.child.recordName).fields.CompletionDate.value, scheduledTimestamp); assert.equal(state.records.get(scheduled.independent.recordName).fields.CompletionDate.value, earlierCompletion);
+    const scheduledReopened = await mcp("tools/call", { name: "reopen_reminder", arguments: scheduled.args(scheduled.root) });
+    assert.equal(scheduledReopened.result.isError, undefined, JSON.stringify(scheduledReopened.result));
+    assert.deepEqual(scheduledReopened.result.structuredContent.affectedRecords.map(record => record.id), [scheduled.root.recordName, scheduled.child.recordName]);
+    await mcp("tools/call", { name: "complete_reminder", arguments: scheduled.args(scheduled.root) });
+    const independentDatedReopen = await mcp("tools/call", { name: "reopen_reminder", arguments: scheduled.args(scheduled.child) });
+    assert.equal(independentDatedReopen.result.isError, undefined, JSON.stringify(independentDatedReopen.result));
+    assert.deepEqual(independentDatedReopen.result.structuredContent.affectedRecords.map(record => record.id), [scheduled.child.recordName]); assert.equal(state.records.get(scheduled.root.recordName).fields.Completed.value, 1);
+    const childLostArgs = scheduled.args(scheduled.child), beforeChildLost = state.modifies.length; state.nextModify = "committed-500";
+    const scheduledChildLost = await mcp("tools/call", { name: "complete_reminder", arguments: childLostArgs });
+    assert.equal(scheduledChildLost.result.structuredContent.error.code, "WRITE_OUTCOME_UNKNOWN"); assert.equal(state.modifies.length, beforeChildLost + 1);
+    const readScheduledChild = await mcp("tools/call", { name: "get_reminder", arguments: { listId, reminderId: scheduled.child.recordName } });
+    assert.equal(readScheduledChild.result.structuredContent.record.completed, true);
+    const originalScheduledRetry = await mcp("tools/call", { name: "complete_reminder", arguments: childLostArgs });
+    assert.equal(originalScheduledRetry.result.structuredContent.error.code, "CONFLICT"); assert.equal(state.modifies.length, beforeChildLost + 1);
+    const selectiveScheduled = await mcp("tools/call", { name: "reopen_reminder", arguments: scheduled.args(scheduled.root) });
+    assert.deepEqual(selectiveScheduled.result.structuredContent.affectedRecords.map(record => record.id), [scheduled.root.recordName]); assert.equal(state.records.get(scheduled.child.recordName).fields.Completed.value, 1);
+    for (const mode of ["scheduled-crypto-drift", "scheduled-parent-drift"]) {
+      const probe = seedScheduledFamily(mode), before = state.modifies.length, args = probe.args(probe.root); state.nextModify = mode;
+      const changedReceipt = await mcp("tools/call", { name: "complete_reminder", arguments: args });
+      assert.equal(changedReceipt.result.structuredContent.error.code, "WRITE_OUTCOME_UNKNOWN"); assert.equal(state.modifies.length, before + 1);
+      const originalRetry = await mcp("tools/call", { name: "complete_reminder", arguments: args });
+      assert.equal(originalRetry.result.structuredContent.error.code, "CONFLICT"); assert.equal(state.modifies.length, before + 1);
+    }
+    assert.deepEqual(scheduled.pairs.map(record => state.records.get(record.recordName).fields), pairFields);
+    const directScheduled = seedScheduledFamily("DIRECT", true, true), directArgs = directScheduled.args(directScheduled.child), beforeDirect = state.modifies.length;
+    const beforeDirectRoot = structuredClone(state.records.get(directScheduled.root.recordName)), beforeDirectSibling = structuredClone(state.records.get(directScheduled.independent.recordName));
+    const beforeDirectPairs = directScheduled.pairs.map(record => structuredClone(state.records.get(record.recordName)));
+    state.nextModify = "committed-500";
+    const directScheduledLost = await mcp("tools/call", { name: "delete_reminder", arguments: directArgs });
+    assert.equal(directScheduledLost.result.structuredContent.error.code, "WRITE_OUTCOME_UNKNOWN"); assert.equal(state.modifies.length, beforeDirect + 1); assert.equal(state.modifies.at(-1).operationCount, 10);
+    const deletedDatedChild = await mcp("tools/call", { name: "get_reminder", arguments: { listId, reminderId: directScheduled.child.recordName } });
+    assert.equal(deletedDatedChild.result.structuredContent.record.deleted, true); assert.equal(deletedDatedChild.result.structuredContent.record.listId, null); assert.equal(deletedDatedChild.result.structuredContent.record.parentReminderId, null);
+    const originalDirectRetry = await mcp("tools/call", { name: "delete_reminder", arguments: directArgs });
+    assert.equal(originalDirectRetry.result.structuredContent.error.code, "CONFLICT"); assert.equal(state.modifies.length, beforeDirect + 1);
+    const afterDirectRoot = state.records.get(directScheduled.root.recordName);
+    assert.deepEqual(Object.fromEntries(Object.entries(afterDirectRoot.fields).filter(([key]) => !["LastModifiedDate", "ResolutionTokenMap"].includes(key))), Object.fromEntries(Object.entries(beforeDirectRoot.fields).filter(([key]) => !["LastModifiedDate", "ResolutionTokenMap"].includes(key))));
+    assert.deepEqual(state.records.get(directScheduled.independent.recordName).fields, beforeDirectSibling.fields);
+    for (const pair of beforeDirectPairs) {
+      const selectedPair = pair.recordType === "Alarm" ? pair.fields.Reminder.value.recordName === directScheduled.child.recordName :
+        beforeDirectPairs.find(alarm => alarm.recordName === pair.fields.Alarm.value.recordName).fields.Reminder.value.recordName === directScheduled.child.recordName;
+      assert.deepEqual(state.records.get(pair.recordName).fields, { ...pair.fields, Deleted: field("INT64", selectedPair ? 1 : 0) });
+      assert.deepEqual(state.records.get(pair.recordName).parent, pair.parent);
+    }
+    const undatedDeleteFamily = seedScheduledFamily("UNDATED-DELETE"), undatedPairFields = undatedDeleteFamily.pairs.map(record => structuredClone(record.fields));
+    const deleteUndatedSibling = await mcp("tools/call", { name: "delete_reminder", arguments: undatedDeleteFamily.args(undatedDeleteFamily.independent) });
+    assert.equal(deleteUndatedSibling.result.isError, undefined, JSON.stringify(deleteUndatedSibling.result));
+    assert.deepEqual(deleteUndatedSibling.result.structuredContent.affectedRecords.map(record => record.id), [undatedDeleteFamily.independent.recordName, undatedDeleteFamily.root.recordName]);
+    assert.deepEqual(undatedDeleteFamily.pairs.map(record => state.records.get(record.recordName).fields), undatedPairFields);
+    const confirmedDatedChildDelete = await mcp("tools/call", { name: "delete_reminder", arguments: undatedDeleteFamily.args(undatedDeleteFamily.child) });
+    assert.equal(confirmedDatedChildDelete.result.isError, undefined, JSON.stringify(confirmedDatedChildDelete.result));
+    assert.equal(confirmedDatedChildDelete.result.structuredContent.record.listId, null); assert.equal(confirmedDatedChildDelete.result.structuredContent.record.parentReminderId, null);
+    assert.deepEqual(confirmedDatedChildDelete.result.structuredContent.affectedRecords.map(record => record.id), [undatedDeleteFamily.child.recordName, undatedDeleteFamily.root.recordName]);
+
+    state.omitLookupZoneIds.add(listId);
+    const deletedScheduled = await mcp("tools/call", { name: "delete_reminder", arguments: scheduled.args(scheduled.root) });
+    assert.equal(deletedScheduled.result.isError, undefined, JSON.stringify(deletedScheduled.result)); assert.equal(deletedScheduled.result.structuredContent.record.listId, null);
+    assert.deepEqual(deletedScheduled.result.structuredContent.affectedRecords.map(record => record.id), [scheduled.root.recordName, scheduled.child.recordName, scheduled.independent.recordName]);
+    for (const record of [scheduled.child, scheduled.independent]) {
+      const deleted = state.records.get(record.recordName); assert.equal(deleted.fields.Deleted.value, 1); assert.equal(deleted.fields.List.value.recordName, listId); assert.equal(deleted.fields.ParentReminder.value.recordName, scheduled.root.recordName); assert.equal(deleted.parent.recordName, listId);
+    }
+    for (const [index, pair] of scheduled.pairs.entries()) assert.deepEqual(state.records.get(pair.recordName).fields, { ...pairFields[index], Deleted: field("INT64", 1) });
+    const scheduledMembers = JSON.parse(state.records.get(listId).fields.ReminderIDs.value); assert.equal(scheduledMembers.includes(scheduled.root.recordName), false); assert.equal(scheduledMembers.includes(scheduled.child.recordName), true);
+    state.omitLookupZoneIds.delete(listId);
+    const unalarmedScheduled = seedScheduledFamily("UNALARMED-ROOT", false);
+    const unalarmedParentComplete = await mcp("tools/call", { name: "complete_reminder", arguments: unalarmedScheduled.args(unalarmedScheduled.root) });
+    assert.equal(unalarmedParentComplete.result.isError, undefined, JSON.stringify(unalarmedParentComplete.result)); assert.equal(state.modifies.at(-1).operationCount, 6);
+    const unalarmedParentDelete = await mcp("tools/call", { name: "delete_reminder", arguments: unalarmedScheduled.args(unalarmedScheduled.root) });
+    assert.equal(unalarmedParentDelete.result.isError, undefined, JSON.stringify(unalarmedParentDelete.result));
+
+    const createListRaceArgs = { listId, idempotencyKey: randomUUID(), title: "List race" };
+    state.nextModify = "family-list-race";
+    const listRaceCreate = await mcp("tools/call", { name: "create_reminder", arguments: createListRaceArgs });
+    assert.equal(listRaceCreate.result.structuredContent.error.code, "CONFLICT");
+    assert.equal(state.records.has(`Reminder/${createListRaceArgs.idempotencyKey.toUpperCase()}`), false);
+
+    const recurringId = "Reminder/RECURRING-ACTIVE", recurrenceId = "RecurrenceRule/RECURRING-ACTIVE";
+    const recurring = reminderRecord(recurringId);
+    recurring.parent = { recordName: listId };
+    recurring.fields.RecurrenceRuleIDs = field("STRING_LIST", [recurrenceId]); recurring.fields.TitleDocument.type = "ENCRYPTED_BYTES";
+    const recurringAlarmId = `Alarm/${randomUUID().toUpperCase()}`, recurringTriggerId = `AlarmTrigger/${randomUUID().toUpperCase()}`;
+    recurring.fields.AlarmIDs = field("STRING_LIST", [recurringAlarmId]);
+    recurring.fields.ResolutionTokenMap = field("STRING", JSON.stringify({ map: { dueDate: { counter: 1, modificationTime: 1_600_000_000, replicaID: randomUUID().toUpperCase() } } }));
+    state.records.set(recurringId, recurring);
+    state.records.set(recurringAlarmId, { recordName: recurringAlarmId, recordType: "Alarm", recordChangeTag: "recurring-alarm-before", zoneID: recurring.zoneID, fields: {
+      AlarmUID: field("STRING", recurringAlarmId.slice(6)), TriggerID: field("STRING", recurringTriggerId.slice(13)),
+      DueDateResolutionTokenAsNonce: field("DOUBLE", dueDateNonce(recurring.fields.ResolutionTokenMap.value)), Imported: field("INT64", 0), Deleted: field("INT64", 0),
+      Reminder: field("REFERENCE", { recordName: recurringId, action: "VALIDATE", zoneID: recurring.zoneID }),
+    } });
+    state.records.set(recurringTriggerId, { recordName: recurringTriggerId, recordType: "AlarmTrigger", recordChangeTag: "recurring-trigger-before", zoneID: recurring.zoneID, fields: {
+      DateComponentsData: field("BYTES", Buffer.from(JSON.stringify(dateComponents("2030-03-04T09:15:00.000Z", "Europe/London"))).toString("base64")),
+      Type: field("STRING", "Date"), Imported: field("INT64", 0), Deleted: field("INT64", 0),
+      Alarm: field("REFERENCE", { recordName: recurringAlarmId, action: "VALIDATE", zoneID: recurring.zoneID }),
+    } });
+    state.records.set(recurrenceId, { recordName: recurrenceId, recordType: "RecurrenceRule", recordChangeTag: "recurring-rule-before", zoneID: recurring.zoneID, fields: {
+      Frequency: field("INT64", 1), Interval: field("INT64", 1), OccurrenceCount: field("INT64", 0), FirstDayOfTheWeek: field("INT64", 0),
+      Imported: field("INT64", 0), Deleted: field("INT64", 0), Reminder: field("REFERENCE", { recordName: recurringId, action: "VALIDATE" }),
+    } });
+    const submittedOccurrence = { listId, reminderId: recurringId, recordChangeTag: recurring.recordChangeTag, expectedGeneration: generation };
+    const beforeOccurrence = state.modifies.length;
+    state.nextModify = "committed-500";
+    const unknownOccurrence = await mcp("tools/call", { name: "complete_reminder", arguments: submittedOccurrence });
+    assert.equal(unknownOccurrence.result.structuredContent.error.code, "WRITE_OUTCOME_UNKNOWN");
+    assert.equal(state.modifies.length, beforeOccurrence + 1);
+    const historyId = state.modifies.at(-1).historyId;
+    assert.equal(state.records.get(historyId).fields.TitleDocument.value, recurring.fields.TitleDocument.value);
+    assert.equal(state.records.get(historyId).fields.CreationDate.value, recurring.fields.CreationDate.value);
+    const reconciledOccurrence = await mcp("tools/call", { name: "complete_reminder", arguments: submittedOccurrence });
+    assert.equal(reconciledOccurrence.result.isError, undefined, JSON.stringify(reconciledOccurrence.result));
+    assert.equal(reconciledOccurrence.result.structuredContent.replayed, true);
+    assert.equal(reconciledOccurrence.result.structuredContent.record.completed, false);
+    assert.equal(reconciledOccurrence.result.structuredContent.completedOccurrence.id, historyId);
+    assert.equal(reconciledOccurrence.result.structuredContent.completedOccurrence.completed, true);
+    assert.equal(reconciledOccurrence.result.structuredContent.record.dueDate, "2030-03-11T09:15:00.000Z");
+    assert.equal(state.modifies.length, beforeOccurrence + 1);
+    await mcp("tools/call", { name: "complete_reminder", arguments: submittedOccurrence });
+    assert.equal(state.modifies.length, beforeOccurrence + 1);
+    assert.equal(state.records.has(recurringAlarmId), false); assert.equal(state.records.has(recurringTriggerId), false);
+    const nextOccurrenceResponse = await mcp("tools/call", { name: "complete_reminder", arguments: { ...submittedOccurrence, recordChangeTag: state.records.get(recurringId).recordChangeTag } });
+    assert.equal(nextOccurrenceResponse.result.isError, undefined, JSON.stringify(nextOccurrenceResponse.result));
+    const nextOccurrence = nextOccurrenceResponse.result.structuredContent;
+    assert.equal(nextOccurrence.record.dueDate, "2030-03-18T09:15:00.000Z");
+    assert.equal(nextOccurrence.completedOccurrence.completed, true);
+    const foreignReferenceArgs = { ...submittedOccurrence, recordChangeTag: state.records.get(recurringId).recordChangeTag };
+    const beforeForeignReference = state.modifies.length;
+    state.nextModify = "recurring-related-reference-foreign";
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const invalidRelatedReference = await mcp("tools/call", { name: "complete_reminder", arguments: foreignReferenceArgs });
+      assert.equal(invalidRelatedReference.result.structuredContent.error.code, "WRITE_OUTCOME_UNKNOWN");
+      assert.equal(state.modifies.length, beforeForeignReference + 1, "Foreign related references never cause recurring redispatch.");
+    }
+
+    for (const mode of ["recurring-history-parent-missing", "recurring-history-parent-wrong", "recurring-history-parent-foreign", "recurring-active-parent-missing", "recurring-active-parent-wrong"]) {
+      const id = `Reminder/${mode.toUpperCase()}`, rule = `RecurrenceRule/${mode.toUpperCase()}`;
+      const active = reminderRecord(id); active.parent = { recordName: listId };
+      active.fields.RecurrenceRuleIDs = field("STRING_LIST", [rule]);
+      state.records.set(id, active);
+      state.records.set(rule, { ...state.records.get(recurrenceId), recordName: rule, recordChangeTag: `tag-${rule}`,
+        fields: { ...state.records.get(recurrenceId).fields, Reminder: field("REFERENCE", { recordName: id, action: "VALIDATE" }) } });
+      const args = { listId, reminderId: id, recordChangeTag: active.recordChangeTag, expectedGeneration: generation };
+      const before = state.modifies.length;
+      state.nextModify = mode;
+      const invalidReceipt = await mcp("tools/call", { name: "complete_reminder", arguments: args });
+      assert.equal(invalidReceipt.result.structuredContent.error.code, "WRITE_OUTCOME_UNKNOWN", mode);
+      assert.equal(state.modifies.length, before + 1);
+      const invalidReplay = await mcp("tools/call", { name: "complete_reminder", arguments: args });
+      assert.equal(invalidReplay.result.structuredContent.error.code, "WRITE_OUTCOME_UNKNOWN", mode);
+      assert.equal(state.modifies.length, before + 1, "Invalid intrinsic parents must never cause recurring redispatch.");
+    }
+
+    const seedEndedWeekly = (suffix, dueDate = "2030-10-28T09:15:00Z") => {
+      const id = `Reminder/ENDED-WEEKLY-${suffix}`, ruleId = `RecurrenceRule/ENDED-WEEKLY-${suffix}`;
+      const alarmId = `Alarm/${randomUUID().toUpperCase()}`, triggerId = `AlarmTrigger/${randomUUID().toUpperCase()}`;
+      const active = structuredClone(recurring); active.recordName = id; active.recordChangeTag = `tag-${id}`;
+      active.fields.DueDate = field("TIMESTAMP", Date.parse(dueDate)); active.fields.RecurrenceRuleIDs = field("STRING_LIST", [ruleId]); active.fields.AlarmIDs = field("STRING_LIST", [alarmId]);
+      active.fields.UrgentPresentationAlarmsAsData = field("ASSETID", { downloadURL: "https://synthetic.invalid/one", fileChecksum: "synthetic-checksum", wrappingKey: "synthetic-key", referenceChecksum: "reference", size: 1 });
+      const alarm = { recordName: alarmId, recordType: "Alarm", recordChangeTag: `tag-${alarmId}`, zoneID: active.zoneID, parent: { recordName: id }, fields: {
+        AlarmUID: field("STRING", alarmId.slice(6)), TriggerID: field("STRING", triggerId.slice(13)), DueDateResolutionTokenAsNonce: field("DOUBLE", dueDateNonce(active.fields.ResolutionTokenMap.value)),
+        Imported: field("INT64", 0), Deleted: field("INT64", 0), Reminder: field("REFERENCE", { recordName: id, action: "VALIDATE", zoneID: active.zoneID }),
+      } };
+      const trigger = { recordName: triggerId, recordType: "AlarmTrigger", recordChangeTag: `tag-${triggerId}`, zoneID: active.zoneID, parent: { recordName: alarmId }, fields: {
+        DateComponentsData: field("BYTES", Buffer.from(JSON.stringify(dateComponents(dueDate, "Europe/London"))).toString("base64")),
+        Type: field("STRING", "Date"), Imported: field("INT64", 0), Deleted: field("INT64", 0), Alarm: field("REFERENCE", { recordName: alarmId, action: "VALIDATE", zoneID: active.zoneID }),
+      } };
+      const rule = { ...structuredClone(state.records.get(recurrenceId)), recordName: ruleId, recordChangeTag: `tag-${ruleId}`, parent: { recordName: id }, fields: {
+        ...state.records.get(recurrenceId).fields, EndDate: field("TIMESTAMP", Date.parse("2030-10-28T09:15:00Z")), Reminder: field("REFERENCE", { recordName: id, action: "VALIDATE", zoneID: active.zoneID }),
+      } };
+      for (const record of [active, alarm, trigger, rule]) state.records.set(record.recordName, record);
+      const list = state.records.get(listId); list.fields.ReminderIDs = field("STRING", JSON.stringify([...JSON.parse(list.fields.ReminderIDs.value), id]));
+      return { active, rule, alarm, trigger, args: { listId, reminderId: id, recordChangeTag: active.recordChangeTag, expectedGeneration: generation } };
+    };
+    for (const mode of ["recurring-rule-race", "recurring-list-race", "recurring-alarm-race", "recurring-retained-parent-drift", "recurring-retained-crypto-drift"]) {
+      const { active, args } = seedEndedWeekly(mode), before = state.modifies.length;
+      state.nextModify = mode;
+      const invalidFinal = await mcp("tools/call", { name: "complete_reminder", arguments: args });
+      assert.equal(invalidFinal.result.structuredContent.error.code, mode.endsWith("-race") ? "CONFLICT" : "WRITE_OUTCOME_UNKNOWN", mode);
+      assert.equal(state.modifies.length, before + 1); assert.equal(state.modifies.at(-1).operationCount, 5); assert.equal(state.modifies.at(-1).historyId, undefined);
+      assert.equal(state.records.get(active.recordName).fields.Completed.value, mode.endsWith("-race") ? 0 : 1);
+      const invalidReplay = await mcp("tools/call", { name: "complete_reminder", arguments: args });
+      assert.equal(invalidReplay.result.structuredContent.error.code, "WRITE_OUTCOME_UNKNOWN", mode); assert.equal(state.modifies.length, before + 1);
+    }
+    const weeklyJourney = seedEndedWeekly("JOURNEY", "2030-10-21T08:15:00Z"), beforeWeeklyEnd = state.modifies.length;
+    for (const end of ["2030-10-29T09:15:00Z", "2030-10-28T08:15:00Z"]) {
+      weeklyJourney.rule.fields.EndDate = field("TIMESTAMP", Date.parse(end));
+      const unsupported = await mcp("tools/call", { name: "complete_reminder", arguments: weeklyJourney.args });
+      assert.equal(unsupported.result.structuredContent.error.code, "UNSUPPORTED_FEATURE"); assert.equal(state.modifies.length, beforeWeeklyEnd);
+    }
+    weeklyJourney.rule.fields.EndDate = field("TIMESTAMP", Date.parse("2030-10-28T09:15:00Z"));
+    const weeklyZoneArg = await mcp("tools/call", { name: "complete_reminder", arguments: { ...weeklyJourney.args, recurrenceCalendarTimeZone: "Europe/London" } });
+    assert.equal(weeklyZoneArg.result.structuredContent.error.code, "UNSUPPORTED_FEATURE"); assert.equal(state.modifies.length, beforeWeeklyEnd);
+    const weeklyNonce = weeklyJourney.alarm.fields.DueDateResolutionTokenAsNonce.value;
+    weeklyJourney.alarm.fields.DueDateResolutionTokenAsNonce.value = weeklyNonce + 1;
+    const badWeeklyNonce = await mcp("tools/call", { name: "complete_reminder", arguments: weeklyJourney.args });
+    assert.equal(badWeeklyNonce.result.structuredContent.error.code, "CONFLICT"); assert.equal(state.modifies.length, beforeWeeklyEnd);
+    weeklyJourney.alarm.fields.DueDateResolutionTokenAsNonce.value = weeklyNonce;
+    const weeklyPenultimate = await mcp("tools/call", { name: "complete_reminder", arguments: weeklyJourney.args });
+    assert.equal(weeklyPenultimate.result.isError, undefined, JSON.stringify(weeklyPenultimate.result));
+    assert.equal(weeklyPenultimate.result.structuredContent.record.dueDate, "2030-10-28T09:15:00.000Z");
+    assert.equal(weeklyPenultimate.result.structuredContent.completedOccurrence.dueDate, "2030-10-21T08:15:00.000Z");
+    assert.equal(state.records.has(weeklyJourney.alarm.recordName), false); assert.equal(state.records.has(weeklyJourney.trigger.recordName), false);
+    const weeklyCurrent = state.records.get(weeklyJourney.active.recordName), retainedAlarm = state.records.get(`Alarm/${weeklyCurrent.fields.AlarmIDs.value[0].replace(/^Alarm\//, "")}`);
+    const retainedTrigger = state.records.get(`AlarmTrigger/${retainedAlarm.fields.TriggerID.value}`);
+    retainedAlarm.parent = { recordName: weeklyCurrent.recordName }; retainedTrigger.parent = { recordName: retainedAlarm.recordName };
+    const retainedFields = [retainedAlarm, retainedTrigger, weeklyJourney.rule, state.records.get(listId)].map(record => structuredClone(record.fields));
+    const weeklyFinalArgs = { ...weeklyJourney.args, recordChangeTag: weeklyCurrent.recordChangeTag }, keysBeforeWeeklyFinal = [...state.records.keys()].sort();
+    state.foreignZoneIds.add(retainedAlarm.recordName);
+    const foreignRetainedAlarm = await mcp("tools/call", { name: "complete_reminder", arguments: weeklyFinalArgs });
+    assert.equal(foreignRetainedAlarm.result.isError, true); assert.equal(state.modifies.length, beforeWeeklyEnd + 1);
+    state.foreignZoneIds.delete(retainedAlarm.recordName); state.omitLookupZoneIds.add(listId);
+    state.nextModify = "committed-500";
+    const lostWeeklyFinal = await mcp("tools/call", { name: "complete_reminder", arguments: weeklyFinalArgs });
+    assert.equal(lostWeeklyFinal.result.structuredContent.error.code, "WRITE_OUTCOME_UNKNOWN"); assert.equal(state.modifies.length, beforeWeeklyEnd + 2);
+    const weeklyFinalRead = await mcp("tools/call", { name: "complete_reminder", arguments: weeklyFinalArgs });
+    assert.equal(weeklyFinalRead.result.isError, undefined, JSON.stringify(weeklyFinalRead.result));
+    assert.equal(weeklyFinalRead.result.structuredContent.replayed, true); assert.equal(weeklyFinalRead.result.structuredContent.record.completed, true);
+    assert.equal(weeklyFinalRead.result.structuredContent.record.dueDate, "2030-10-28T09:15:00.000Z"); assert.equal(weeklyFinalRead.result.structuredContent.completedOccurrence, undefined);
+    assert.equal(weeklyFinalRead.result.structuredContent.affectedRecords.length, 1); assert.equal(state.modifies.length, beforeWeeklyEnd + 2);
+    assert.deepEqual([...state.records.keys()].sort(), keysBeforeWeeklyFinal);
+    const weeklyReopenArgs = { ...weeklyFinalArgs, recordChangeTag: state.records.get(weeklyCurrent.recordName).recordChangeTag };
+    const weeklyReopened = await mcp("tools/call", { name: "reopen_reminder", arguments: weeklyReopenArgs });
+    assert.equal(weeklyReopened.result.isError, undefined, JSON.stringify(weeklyReopened.result));
+    assert.equal(weeklyReopened.result.structuredContent.record.completed, false); assert.equal(weeklyReopened.result.structuredContent.record.completedDate, null);
+    assert.equal(weeklyReopened.result.structuredContent.completedOccurrence, undefined); assert.equal(state.modifies.length, beforeWeeklyEnd + 3);
+    assert.deepEqual([...state.records.keys()].sort(), keysBeforeWeeklyFinal);
+    assert.deepEqual([retainedAlarm, retainedTrigger, weeklyJourney.rule, state.records.get(listId)].map(record => state.records.get(record.recordName).fields), retainedFields);
+    const replayWeeklyReopen = await mcp("tools/call", { name: "reopen_reminder", arguments: weeklyReopenArgs });
+    assert.equal(replayWeeklyReopen.result.structuredContent.replayed, true); assert.equal(state.modifies.length, beforeWeeklyEnd + 3);
+    state.omitLookupZoneIds.delete(listId);
+
+    const beforeRecurringDeleteJourney = new Set(state.records.keys());
+    const seedRecurringDelete = suffix => { const fixture = seedEndedWeekly(`DELETE-${suffix}`, "2030-10-21T08:15:00Z"); delete fixture.rule.fields.EndDate; return fixture; };
+    for (const mode of ["recurring-delete-rule-race", "recurring-delete-list-race", "recurring-delete-alarm-race", "recurring-delete-crypto-drift", "recurring-delete-parent-drift"]) {
+      const fixture = seedRecurringDelete(mode), args = { ...fixture.args, recurringDeletionScope: "occurrence" }, before = state.modifies.length;
+      state.nextModify = mode;
+      const rejected = await mcp("tools/call", { name: "delete_reminder", arguments: args });
+      assert.equal(rejected.result.structuredContent.error.code, mode.endsWith("-race") ? "CONFLICT" : "WRITE_OUTCOME_UNKNOWN", mode); assert.equal(state.modifies.length, before + 1);
+      const reconciled = await mcp("tools/call", { name: "delete_reminder", arguments: args });
+      assert.equal(reconciled.result.structuredContent.error.code, "WRITE_OUTCOME_UNKNOWN", mode); assert.equal(state.modifies.length, before + 1, "Scoped uncertain deletion never redispatches.");
+    }
+    const deleteFixture = seedRecurringDelete("JOURNEY"), deleteBase = deleteFixture.args, beforeRecurringDelete = state.modifies.length;
+    const missingDeleteScope = await mcp("tools/call", { name: "delete_reminder", arguments: deleteBase });
+    assert.equal(missingDeleteScope.result.structuredContent.error.code, "VALIDATION_ERROR"); assert.equal(state.modifies.length, beforeRecurringDelete);
+    const ordinaryScopeRecord = reminderRecord("Reminder/DELETE-SCOPE-ORDINARY"); state.records.set(ordinaryScopeRecord.recordName, ordinaryScopeRecord);
+    const ordinaryScope = await mcp("tools/call", { name: "delete_reminder", arguments: { listId, reminderId: ordinaryScopeRecord.recordName, recordChangeTag: ordinaryScopeRecord.recordChangeTag, recurringDeletionScope: "all_future" } });
+    assert.equal(ordinaryScope.result.structuredContent.error.code, "VALIDATION_ERROR"); assert.equal(state.modifies.length, beforeRecurringDelete);
+    const unsupportedCalendar = await mcp("tools/call", { name: "delete_reminder", arguments: { ...deleteBase, recurringDeletionScope: "occurrence", recurrenceCalendarTimeZone: "Europe/London" } });
+    assert.equal(unsupportedCalendar.result.structuredContent.error.code, "UNSUPPORTED_FEATURE"); assert.equal(state.modifies.length, beforeRecurringDelete);
+    const retainedHistory = reminderRecord("Reminder/RECURRING-DELETE-PRIOR-HISTORY"); retainedHistory.fields.Completed = field("INT64", 1); retainedHistory.fields.CompletionDate = field("TIMESTAMP", Date.parse("2030-10-14T10:00:00Z"));
+    state.records.set(retainedHistory.recordName, retainedHistory);
+    const priorHistorySnapshot = structuredClone(retainedHistory), memberList = state.records.get(listId); memberList.fields.ReminderIDs = field("STRING", JSON.stringify([...JSON.parse(memberList.fields.ReminderIDs.value), retainedHistory.recordName]));
+    const occurrenceDeleteArgs = { ...deleteBase, recurringDeletionScope: "occurrence" }, beforeOccurrenceKeys = new Set(state.records.keys());
+    state.nextModify = "committed-500";
+    const lostOccurrenceDelete = await mcp("tools/call", { name: "delete_reminder", arguments: occurrenceDeleteArgs });
+    assert.equal(lostOccurrenceDelete.result.structuredContent.error.code, "WRITE_OUTCOME_UNKNOWN"); assert.equal(state.modifies.length, beforeRecurringDelete + 1);
+    const newPairIds = [...state.records.keys()].filter(id => !beforeOccurrenceKeys.has(id)); assert.equal(newPairIds.length, 2); assert.ok(newPairIds.every(id => /^(Alarm|AlarmTrigger)\//.test(id)));
+    assert.equal(state.records.has(deleteFixture.alarm.recordName), false); assert.equal(state.records.has(deleteFixture.trigger.recordName), false);
+    const otherScopeOldTag = await mcp("tools/call", { name: "delete_reminder", arguments: { ...deleteBase, recurringDeletionScope: "all_future" } });
+    assert.equal(otherScopeOldTag.result.structuredContent.error.code, "CONFLICT"); assert.equal(state.modifies.length, beforeRecurringDelete + 1);
+    const completeOldTag = await mcp("tools/call", { name: "complete_reminder", arguments: deleteBase });
+    assert.equal(completeOldTag.result.structuredContent.error.code, "CONFLICT"); assert.equal(state.modifies.length, beforeRecurringDelete + 1);
+    const occurrenceDeleteReplay = await mcp("tools/call", { name: "delete_reminder", arguments: occurrenceDeleteArgs });
+    assert.equal(occurrenceDeleteReplay.result.isError, undefined, JSON.stringify(occurrenceDeleteReplay.result)); assert.equal(occurrenceDeleteReplay.result.structuredContent.replayed, true);
+    assert.equal(occurrenceDeleteReplay.result.structuredContent.record.dueDate, "2030-10-28T09:15:00.000Z"); assert.equal(occurrenceDeleteReplay.result.structuredContent.record.completed, false); assert.equal(occurrenceDeleteReplay.result.structuredContent.record.deleted, false);
+    assert.equal(state.modifies.length, beforeRecurringDelete + 1); assert.deepEqual(state.records.get(retainedHistory.recordName), priorHistorySnapshot);
+    const activeBeforeFuture = structuredClone(state.records.get(deleteFixture.active.recordName));
+    const activeAlarmBeforeFuture = state.records.get(`Alarm/${activeBeforeFuture.fields.AlarmIDs.value[0].replace(/^Alarm\//, "")}`), triggerBeforeFuture = state.records.get(`AlarmTrigger/${activeAlarmBeforeFuture.fields.TriggerID.value}`);
+    const retainedFutureRecords = [activeAlarmBeforeFuture, triggerBeforeFuture, state.records.get(deleteFixture.rule.recordName)].map(record => structuredClone(record));
+    const futureDeleteArgs = { ...deleteBase, recordChangeTag: activeBeforeFuture.recordChangeTag, recurringDeletionScope: "all_future" };
+    state.omitLookupZoneIds.add(listId); state.nextModify = "committed-500";
+    const lostFutureDelete = await mcp("tools/call", { name: "delete_reminder", arguments: futureDeleteArgs });
+    assert.equal(lostFutureDelete.result.structuredContent.error.code, "WRITE_OUTCOME_UNKNOWN"); assert.equal(state.modifies.length, beforeRecurringDelete + 2);
+    const futureDeleteReplay = await mcp("tools/call", { name: "delete_reminder", arguments: futureDeleteArgs });
+    assert.equal(futureDeleteReplay.result.isError, undefined, JSON.stringify(futureDeleteReplay.result)); assert.equal(futureDeleteReplay.result.structuredContent.replayed, true);
+    assert.equal(futureDeleteReplay.result.structuredContent.record.deleted, true); assert.equal(futureDeleteReplay.result.structuredContent.record.listId, null); assert.equal(futureDeleteReplay.result.structuredContent.record.dueDate, "2030-10-28T09:15:00.000Z");
+    assert.equal(state.modifies.length, beforeRecurringDelete + 2); assert.deepEqual(state.records.get(retainedHistory.recordName), priorHistorySnapshot);
+    assert.equal(state.records.get(deleteFixture.active.recordName).parent, undefined);
+    for (const before of retainedFutureRecords) { assert.deepEqual(state.records.get(before.recordName).fields, { ...before.fields, Deleted: field("INT64", 1) }); assert.deepEqual(state.records.get(before.recordName).parent, before.parent); }
+    assert.equal(JSON.parse(state.records.get(listId).fields.ReminderIDs.value).includes(deleteFixture.active.recordName), false);
+    const changedConfirmedOccurrence = await mcp("tools/call", { name: "delete_reminder", arguments: occurrenceDeleteArgs });
+    assert.equal(changedConfirmedOccurrence.result.structuredContent.error.code, "CONFLICT"); assert.equal(state.modifies.length, beforeRecurringDelete + 2);
+    state.omitLookupZoneIds.delete(listId);
+    const normalFutureFixture = seedRecurringDelete("NORMAL-FUTURE"), normalFutureArgs = { ...normalFutureFixture.args, recurringDeletionScope: "all_future" };
+    const normalFutureDelete = await mcp("tools/call", { name: "delete_reminder", arguments: normalFutureArgs });
+    assert.equal(normalFutureDelete.result.isError, undefined, JSON.stringify(normalFutureDelete.result)); assert.equal(normalFutureDelete.result.structuredContent.record.listId, null);
+    const normalFutureReplay = await mcp("tools/call", { name: "delete_reminder", arguments: normalFutureArgs }); assert.equal(normalFutureReplay.result.structuredContent.replayed, true);
+    const endedWeeklyDelete = seedEndedWeekly("DELETE-ENDED-JOURNEY", "2030-10-21T04:00:00Z");
+    endedWeeklyDelete.rule.fields.EndDate = field("TIMESTAMP", Date.parse("2030-10-28T06:26:20Z"));
+    const endedWeeklyBefore = state.modifies.length, endedWeeklyArgs = { ...endedWeeklyDelete.args, recurringDeletionScope: "occurrence" };
+    const endedWeeklyRuleFields = structuredClone(endedWeeklyDelete.rule.fields);
+    const weeklyCalendarRefused = await mcp("tools/call", { name: "delete_reminder", arguments: { ...endedWeeklyArgs, recurrenceCalendarTimeZone: "Europe/London" } });
+    assert.equal(weeklyCalendarRefused.result.structuredContent.error.code, "UNSUPPORTED_FEATURE"); assert.equal(state.modifies.length, endedWeeklyBefore);
+    const endedWeeklyAdvance = await mcp("tools/call", { name: "delete_reminder", arguments: endedWeeklyArgs });
+    assert.equal(endedWeeklyAdvance.result.isError, undefined, JSON.stringify(endedWeeklyAdvance.result)); assert.equal(endedWeeklyAdvance.result.structuredContent.record.dueDate, "2030-10-28T05:00:00.000Z");
+    assert.equal(endedWeeklyAdvance.result.structuredContent.record.completed, false); assert.equal(state.modifies.at(-1).operationCount, 7);
+    assert.deepEqual(state.records.get(endedWeeklyDelete.rule.recordName).fields, endedWeeklyRuleFields);
+    const endedWeeklyAdvanceReplay = await mcp("tools/call", { name: "delete_reminder", arguments: endedWeeklyArgs });
+    assert.equal(endedWeeklyAdvanceReplay.result.structuredContent.replayed, true); assert.equal(state.modifies.length, endedWeeklyBefore + 1);
+    const endedWeeklyRootBeforeFinal = state.records.get(endedWeeklyDelete.active.recordName), endedWeeklyAlarm = state.records.get(`Alarm/${endedWeeklyRootBeforeFinal.fields.AlarmIDs.value[0].replace(/^Alarm\//, "")}`);
+    const endedWeeklyPairBeforeFinal = [endedWeeklyAlarm, state.records.get(`AlarmTrigger/${endedWeeklyAlarm.fields.TriggerID.value}`), state.records.get(endedWeeklyDelete.rule.recordName)].map(record => structuredClone(record));
+    const endedWeeklyFinalArgs = { ...endedWeeklyArgs, recordChangeTag: endedWeeklyRootBeforeFinal.recordChangeTag }, endedWeeklyKeys = [...state.records.keys()].sort();
+    const finalMemberList = state.records.get(listId); finalMemberList.fields.ReminderIDs = field("STRING", JSON.stringify(JSON.parse(finalMemberList.fields.ReminderIDs.value).filter(id => id !== endedWeeklyDelete.active.recordName)));
+    const endedWeeklyMembership = finalMemberList.fields.ReminderIDs.value, endedWeeklyOrdering = JSON.parse(finalMemberList.fields.ResolutionTokenMap.value).map.reminderIDsMergeableOrdering.counter;
+    state.nextModify = "committed-500";
+    const endedWeeklyFinalLost = await mcp("tools/call", { name: "delete_reminder", arguments: endedWeeklyFinalArgs });
+    assert.equal(endedWeeklyFinalLost.result.structuredContent.error.code, "WRITE_OUTCOME_UNKNOWN"); assert.equal(state.modifies.length, endedWeeklyBefore + 2); assert.equal(state.modifies.at(-1).operationCount, 5);
+    const endedWeeklyFinalReplay = await mcp("tools/call", { name: "delete_reminder", arguments: endedWeeklyFinalArgs });
+    assert.equal(endedWeeklyFinalReplay.result.isError, undefined, JSON.stringify(endedWeeklyFinalReplay.result)); assert.equal(endedWeeklyFinalReplay.result.structuredContent.replayed, true);
+    assert.equal(endedWeeklyFinalReplay.result.structuredContent.record.listId, null); assert.equal(endedWeeklyFinalReplay.result.structuredContent.record.dueDate, "2030-10-28T05:00:00.000Z");
+    assert.deepEqual([...state.records.keys()].sort(), endedWeeklyKeys); assert.equal(state.modifies.length, endedWeeklyBefore + 2);
+    for (const before of endedWeeklyPairBeforeFinal) { assert.deepEqual(state.records.get(before.recordName).fields, { ...before.fields, Deleted: field("INT64", 1) }); assert.deepEqual(state.records.get(before.recordName).parent, before.parent); }
+    assert.equal(state.records.get(listId).fields.ReminderIDs.value, endedWeeklyMembership);
+    assert.equal(JSON.parse(state.records.get(listId).fields.ResolutionTokenMap.value).map.reminderIDsMergeableOrdering.counter, endedWeeklyOrdering + 1);
+    const endedWeeklyChangedScope = await mcp("tools/call", { name: "delete_reminder", arguments: { ...endedWeeklyFinalArgs, recurringDeletionScope: "all_future" } });
+    assert.equal(endedWeeklyChangedScope.result.structuredContent.error.code, "CONFLICT"); assert.equal(state.modifies.length, endedWeeklyBefore + 2);
+    const noAdvanceWeekly = seedEndedWeekly("DELETE-ENDED-EDGE", "2030-10-21T08:15:00Z"); noAdvanceWeekly.rule.fields.EndDate = field("TIMESTAMP", Date.parse("2030-10-28T06:15:53Z"));
+    const noAdvanceArgs = { ...noAdvanceWeekly.args, recurringDeletionScope: "occurrence" };
+    const noAdvance = await mcp("tools/call", { name: "delete_reminder", arguments: noAdvanceArgs });
+    assert.equal(noAdvance.result.structuredContent.error.code, "VALIDATION_ERROR"); assert.match(noAdvance.result.structuredContent.error.message, /all_future/); assert.equal(state.modifies.length, endedWeeklyBefore + 2);
+    assert.equal(state.records.get(noAdvanceWeekly.active.recordName).recordChangeTag, noAdvanceWeekly.args.recordChangeTag);
+    const noAdvanceFuture = await mcp("tools/call", { name: "delete_reminder", arguments: { ...noAdvanceArgs, recurringDeletionScope: "all_future" } });
+    assert.equal(noAdvanceFuture.result.isError, undefined, JSON.stringify(noAdvanceFuture.result)); assert.equal(noAdvanceFuture.result.structuredContent.record.listId, null); assert.equal(state.modifies.length, endedWeeklyBefore + 3);
+    const sameDayWeekly = seedEndedWeekly("DELETE-ENDED-SAMEDAY", "2030-10-21T08:15:00Z"); sameDayWeekly.rule.fields.EndDate = field("TIMESTAMP", Date.parse("2030-10-21T05:26:40Z"));
+    const sameDayDeleted = await mcp("tools/call", { name: "delete_reminder", arguments: { ...sameDayWeekly.args, recurringDeletionScope: "occurrence" } });
+    assert.equal(sameDayDeleted.result.isError, undefined, JSON.stringify(sameDayDeleted.result)); assert.equal(sameDayDeleted.result.structuredContent.record.listId, null);
+    assert.equal(sameDayDeleted.result.structuredContent.record.dueDate, "2030-10-21T08:15:00.000Z"); assert.equal(state.modifies.length, endedWeeklyBefore + 4);
+    const pastWeekly = seedEndedWeekly("DELETE-ENDED-PAST", "2030-10-21T08:15:00Z"); pastWeekly.rule.fields.EndDate = field("TIMESTAMP", Date.parse("2030-10-20T12:00:00Z"));
+    const pastWeeklyRefused = await mcp("tools/call", { name: "delete_reminder", arguments: { ...pastWeekly.args, recurringDeletionScope: "all_future" } });
+    assert.equal(pastWeeklyRefused.result.structuredContent.error.code, "UNSUPPORTED_FEATURE"); assert.equal(state.modifies.length, endedWeeklyBefore + 4);
+    const seedDailyDelete = suffix => {
+      const id = `Reminder/DELETE-DAILY-${suffix}`, ruleId = `RecurrenceRule/DELETE-DAILY-${suffix}`, active = reminderRecord(id);
+      active.parent = { recordName: listId }; active.fields.AllDay = field("INT64", 1); active.fields.DueDate = field("TIMESTAMP", Date.parse("2030-10-19T00:00:00Z")); delete active.fields.TimeZone;
+      active.fields.AlarmIDs = field("UNKNOWN_LIST", []); active.fields.RecurrenceRuleIDs = field("STRING_LIST", [ruleId]);
+      const rule = { ...structuredClone(state.records.get(recurrenceId)), recordName: ruleId, recordChangeTag: `tag-${ruleId}`, parent: { recordName: id }, fields: {
+        ...state.records.get(recurrenceId).fields, Frequency: field("INT64", 0), Reminder: field("REFERENCE", { recordName: id, action: "VALIDATE", zoneID: active.zoneID }),
+      } };
+      state.records.set(id, active); state.records.set(ruleId, rule);
+      return { active, rule, args: { listId, reminderId: id, recordChangeTag: active.recordChangeTag, expectedGeneration: generation } };
+    };
+    const dailyDeleteFixture = seedDailyDelete("JOURNEY"), beforeDailyDelete = state.modifies.length;
+    const dailyDeleteBase = dailyDeleteFixture.args, dailyOccurrenceArgs = { ...dailyDeleteBase, recurringDeletionScope: "occurrence" }, dailyKeysBefore = [...state.records.keys()].sort();
+    const dailyMembershipBefore = state.records.get(listId).fields.ReminderIDs.value;
+    assert.equal(JSON.parse(dailyMembershipBefore).includes(dailyDeleteFixture.active.recordName), false);
+    dailyDeleteFixture.rule.fields.EndDate = field("TIMESTAMP", Date.parse("2030-10-20T09:00:00Z"));
+    for (const scope of ["occurrence", "all_future"]) {
+      const refused = await mcp("tools/call", { name: "delete_reminder", arguments: { ...dailyDeleteBase, recurringDeletionScope: scope } });
+      assert.equal(refused.result.structuredContent.error.code, "UNSUPPORTED_FEATURE"); assert.equal(state.modifies.length, beforeDailyDelete);
+    }
+    delete dailyDeleteFixture.rule.fields.EndDate;
+    dailyDeleteFixture.active.fields.TimeZone = field("STRING", "Europe/London");
+    const zonedDailyDelete = await mcp("tools/call", { name: "delete_reminder", arguments: dailyOccurrenceArgs });
+    assert.equal(zonedDailyDelete.result.structuredContent.error.code, "UNSUPPORTED_FEATURE"); assert.equal(state.modifies.length, beforeDailyDelete); delete dailyDeleteFixture.active.fields.TimeZone;
+    state.nextModify = "committed-500";
+    const lostDailyOccurrence = await mcp("tools/call", { name: "delete_reminder", arguments: dailyOccurrenceArgs });
+    assert.equal(lostDailyOccurrence.result.structuredContent.error.code, "WRITE_OUTCOME_UNKNOWN"); assert.equal(state.modifies.length, beforeDailyDelete + 1); assert.equal(state.modifies.at(-1).operationCount, 3);
+    const dailyOccurrenceReplay = await mcp("tools/call", { name: "delete_reminder", arguments: dailyOccurrenceArgs });
+    assert.equal(dailyOccurrenceReplay.result.isError, undefined, JSON.stringify(dailyOccurrenceReplay.result)); assert.equal(dailyOccurrenceReplay.result.structuredContent.replayed, true);
+    assert.equal(dailyOccurrenceReplay.result.structuredContent.record.dueDate, "2030-10-20T00:00:00.000Z"); assert.equal(dailyOccurrenceReplay.result.structuredContent.record.completed, false);
+    assert.deepEqual(dailyOccurrenceReplay.result.structuredContent.record.alarmIds, []); assert.deepEqual([...state.records.keys()].sort(), dailyKeysBefore); assert.equal(state.modifies.length, beforeDailyDelete + 1);
+    const otherDailyScope = await mcp("tools/call", { name: "delete_reminder", arguments: { ...dailyDeleteBase, recurringDeletionScope: "all_future" } });
+    assert.equal(otherDailyScope.result.structuredContent.error.code, "CONFLICT"); assert.equal(state.modifies.length, beforeDailyDelete + 1);
+    const dailyFutureArgs = { ...dailyDeleteBase, recordChangeTag: state.records.get(dailyDeleteFixture.active.recordName).recordChangeTag, recurringDeletionScope: "all_future" };
+    const dailyListTokensBefore = JSON.parse(state.records.get(listId).fields.ResolutionTokenMap.value).map, dailyRuleBeforeRetire = structuredClone(state.records.get(dailyDeleteFixture.rule.recordName));
+    state.omitLookupZoneIds.add(listId); state.nextModify = "committed-500";
+    const lostDailyFuture = await mcp("tools/call", { name: "delete_reminder", arguments: dailyFutureArgs });
+    assert.equal(lostDailyFuture.result.structuredContent.error.code, "WRITE_OUTCOME_UNKNOWN"); assert.equal(state.modifies.length, beforeDailyDelete + 2);
+    const dailyFutureReplay = await mcp("tools/call", { name: "delete_reminder", arguments: dailyFutureArgs });
+    assert.equal(dailyFutureReplay.result.isError, undefined, JSON.stringify(dailyFutureReplay.result)); assert.equal(dailyFutureReplay.result.structuredContent.replayed, true);
+    assert.equal(dailyFutureReplay.result.structuredContent.record.deleted, true); assert.equal(dailyFutureReplay.result.structuredContent.record.listId, null); assert.equal(dailyFutureReplay.result.structuredContent.record.dueDate, "2030-10-20T00:00:00.000Z");
+    assert.equal(state.modifies.length, beforeDailyDelete + 2); assert.deepEqual([...state.records.keys()].sort(), dailyKeysBefore);
+    assert.deepEqual(state.records.get(dailyDeleteFixture.rule.recordName).fields, { ...dailyRuleBeforeRetire.fields, Deleted: field("INT64", 1) });
+    assert.deepEqual(state.records.get(dailyDeleteFixture.rule.recordName).parent, dailyRuleBeforeRetire.parent); assert.equal(state.records.get(listId).fields.ReminderIDs.value, dailyMembershipBefore);
+    const dailyListTokensAfter = JSON.parse(state.records.get(listId).fields.ResolutionTokenMap.value).map;
+    assert.equal(dailyListTokensAfter.reminderIDsMergeableOrdering.counter, dailyListTokensBefore.reminderIDsMergeableOrdering.counter + 1);
+    assert.deepEqual(Object.fromEntries(Object.entries(dailyListTokensAfter).filter(([key]) => key !== "reminderIDsMergeableOrdering")), Object.fromEntries(Object.entries(dailyListTokensBefore).filter(([key]) => key !== "reminderIDsMergeableOrdering")));
+    state.omitLookupZoneIds.delete(listId);
+    const normalDailyFixture = seedDailyDelete("NORMAL"), normalDailyOccurrence = await mcp("tools/call", { name: "delete_reminder", arguments: { ...normalDailyFixture.args, recurringDeletionScope: "occurrence" } });
+    assert.equal(normalDailyOccurrence.result.isError, undefined, JSON.stringify(normalDailyOccurrence.result)); assert.equal(normalDailyOccurrence.result.structuredContent.replayed, false);
+    const normalDailyFuture = await mcp("tools/call", { name: "delete_reminder", arguments: { ...normalDailyFixture.args, recordChangeTag: state.records.get(normalDailyFixture.active.recordName).recordChangeTag, recurringDeletionScope: "all_future" } });
+    assert.equal(normalDailyFuture.result.isError, undefined, JSON.stringify(normalDailyFuture.result)); assert.equal(normalDailyFuture.result.structuredContent.record.listId, null);
+    const endedDelete = seedDailyDelete("ENDED"), endedDeleteBefore = state.modifies.length;
+    endedDelete.active.fields.DueDate = field("TIMESTAMP", Date.parse("2030-10-26T00:00:00Z"));
+    endedDelete.rule.fields.EndDate = field("TIMESTAMP", Date.parse("2030-10-26T23:51:29Z"));
+    const endedSkipArgs = { ...endedDelete.args, recurringDeletionScope: "occurrence", recurrenceCalendarTimeZone: "Europe/London" };
+    for (const args of [{ ...endedDelete.args, recurringDeletionScope: "occurrence" }, { ...endedSkipArgs, recurrenceCalendarTimeZone: "Unknown/Invalid" },
+      { ...normalDailyFixture.args, recurringDeletionScope: "occurrence", recurrenceCalendarTimeZone: "Europe/London", recordChangeTag: state.records.get(normalDailyFixture.active.recordName).recordChangeTag }]) {
+      const refused = await mcp("tools/call", { name: "delete_reminder", arguments: args });
+      assert.equal(refused.result.isError, true); assert.equal(state.modifies.length, endedDeleteBefore);
+    }
+    const endedSkip = await mcp("tools/call", { name: "delete_reminder", arguments: endedSkipArgs });
+    assert.equal(endedSkip.result.isError, undefined, JSON.stringify(endedSkip.result)); assert.equal(endedSkip.result.structuredContent.record.dueDate, "2030-10-27T00:00:00.000Z");
+    assert.equal(endedSkip.result.structuredContent.record.deleted, false); assert.equal(state.modifies.at(-1).operationCount, 3);
+    const endedSkipReplay = await mcp("tools/call", { name: "delete_reminder", arguments: endedSkipArgs });
+    assert.equal(endedSkipReplay.result.structuredContent.replayed, true); assert.equal(state.modifies.length, endedDeleteBefore + 1);
+    const endedFinalArgs = { ...endedSkipArgs, recordChangeTag: state.records.get(endedDelete.active.recordName).recordChangeTag };
+    const endedKeys = [...state.records.keys()].sort(), endedRuleBefore = structuredClone(state.records.get(endedDelete.rule.recordName));
+    const endedMembership = state.records.get(listId).fields.ReminderIDs.value, endedOrdering = JSON.parse(state.records.get(listId).fields.ResolutionTokenMap.value).map.reminderIDsMergeableOrdering.counter;
+    state.nextModify = "committed-500";
+    const endedFinalLost = await mcp("tools/call", { name: "delete_reminder", arguments: endedFinalArgs });
+    assert.equal(endedFinalLost.result.structuredContent.error.code, "WRITE_OUTCOME_UNKNOWN"); assert.equal(state.modifies.length, endedDeleteBefore + 2);
+    const endedFinalReplay = await mcp("tools/call", { name: "delete_reminder", arguments: endedFinalArgs });
+    assert.equal(endedFinalReplay.result.isError, undefined, JSON.stringify(endedFinalReplay.result)); assert.equal(endedFinalReplay.result.structuredContent.replayed, true);
+    assert.equal(endedFinalReplay.result.structuredContent.record.deleted, true); assert.equal(endedFinalReplay.result.structuredContent.record.listId, null);
+    assert.equal(endedFinalReplay.result.structuredContent.record.dueDate, "2030-10-27T00:00:00.000Z"); assert.equal(endedFinalReplay.result.structuredContent.record.completed, false);
+    assert.deepEqual([...state.records.keys()].sort(), endedKeys); assert.deepEqual(state.records.get(endedDelete.rule.recordName).fields, { ...endedRuleBefore.fields, Deleted: field("INT64", 1) });
+    assert.deepEqual(state.records.get(endedDelete.rule.recordName).parent, endedRuleBefore.parent); assert.equal(state.records.get(listId).fields.ReminderIDs.value, endedMembership);
+    assert.equal(JSON.parse(state.records.get(listId).fields.ResolutionTokenMap.value).map.reminderIDsMergeableOrdering.counter, endedOrdering + 1);
+    for (const change of [{ recurrenceCalendarTimeZone: "UTC" }, { recurringDeletionScope: "all_future" }]) {
+      const changed = await mcp("tools/call", { name: "delete_reminder", arguments: { ...endedFinalArgs, ...change } });
+      assert.equal(changed.result.structuredContent.error.code, "CONFLICT"); assert.equal(state.modifies.length, endedDeleteBefore + 2);
+    }
+    const endedFuture = seedDailyDelete("ENDED-FUTURE"); endedFuture.rule.fields.EndDate = field("TIMESTAMP", Date.parse("2030-10-20T00:00:00Z"));
+    const futureList = state.records.get(listId), futureMembers = JSON.parse(futureList.fields.ReminderIDs.value);
+    futureList.fields.ReminderIDs = field("STRING", JSON.stringify([...futureMembers, endedFuture.active.recordName]));
+    const futureRetire = await mcp("tools/call", { name: "delete_reminder", arguments: { ...endedFuture.args, recurringDeletionScope: "all_future" } });
+    assert.equal(futureRetire.result.isError, undefined, JSON.stringify(futureRetire.result)); assert.equal(futureRetire.result.structuredContent.record.listId, null);
+    assert.deepEqual(JSON.parse(state.records.get(listId).fields.ReminderIDs.value), futureMembers); assert.equal(state.modifies.length, endedDeleteBefore + 3);
+    const normalFinalDelete = seedDailyDelete("ENDED-FINAL-NORMAL"); normalFinalDelete.rule.fields.EndDate = field("TIMESTAMP", Date.parse("2030-10-19T00:00:00Z"));
+    const normalFinalArgs = { ...normalFinalDelete.args, recurringDeletionScope: "occurrence" };
+    const normalFinal = await mcp("tools/call", { name: "delete_reminder", arguments: normalFinalArgs });
+    assert.equal(normalFinal.result.isError, undefined, JSON.stringify(normalFinal.result)); assert.equal(normalFinal.result.structuredContent.record.listId, null);
+    assert.equal(normalFinal.result.structuredContent.record.dueDate, "2030-10-19T00:00:00.000Z"); assert.equal(state.modifies.at(-1).operationCount, 3);
+    const normalFinalAgain = await mcp("tools/call", { name: "delete_reminder", arguments: normalFinalArgs }); assert.equal(normalFinalAgain.result.structuredContent.replayed, true);
+    const beyondEnd = seedDailyDelete("BEYOND"); beyondEnd.rule.fields.EndDate = field("TIMESTAMP", Date.parse("2030-10-18T00:00:00Z"));
+    const beyondRefused = await mcp("tools/call", { name: "delete_reminder", arguments: { ...beyondEnd.args, recurringDeletionScope: "all_future" } });
+    assert.equal(beyondRefused.result.structuredContent.error.code, "UNSUPPORTED_FEATURE"); assert.equal(state.modifies.length, endedDeleteBefore + 4);
+    const monthlyDeleteFixture = seedDailyDelete("LAST-DAY-MONTHLY"), monthlyDeleteBefore = state.modifies.length;
+    monthlyDeleteFixture.active.fields.DueDate = field("TIMESTAMP", Date.parse("2030-10-31T00:00:00Z"));
+    Object.assign(monthlyDeleteFixture.rule.fields, { Frequency: field("INT64", 2), DaysOfTheMonth: field("BYTES", Buffer.from("[28,29,30,31]").toString("base64")), SetPositions: field("BYTES", Buffer.from("[-1]").toString("base64")) });
+    const monthlyDeleteArgs = { ...monthlyDeleteFixture.args, recurringDeletionScope: "occurrence" };
+    for (const change of [{ root: { DueDate: field("TIMESTAMP", Date.parse("2030-10-30T00:00:00Z")) } }, { rule: { EndDate: field("TIMESTAMP", Date.parse("2030-11-30T00:00:00Z")) } },
+      { rule: { OccurrenceCount: field("INT64", 2) } }, { rule: { Imported: field("INT64", 1) } }, { rule: { SetPositions: field("BYTES", Buffer.from("[1]").toString("base64")) } },
+      { root: { UnknownParentRelationship: field("REFERENCE", { recordName: "Reminder/OTHER", action: "VALIDATE" }) } }]) {
+      const record = change.root ? monthlyDeleteFixture.active : monthlyDeleteFixture.rule, originalFields = structuredClone(record.fields);
+      Object.assign(record.fields, change.root ?? change.rule);
+      const rejected = await mcp("tools/call", { name: "delete_reminder", arguments: monthlyDeleteArgs });
+      assert.equal(rejected.result.isError, true); assert.equal(state.modifies.length, monthlyDeleteBefore); record.fields = originalFields;
+    }
+    const monthlyCalendarRefused = await mcp("tools/call", { name: "delete_reminder", arguments: { ...monthlyDeleteArgs, recurrenceCalendarTimeZone: "UTC" } });
+    assert.equal(monthlyCalendarRefused.result.structuredContent.error.code, "UNSUPPORTED_FEATURE"); assert.equal(state.modifies.length, monthlyDeleteBefore);
+    const monthlyKeys = [...state.records.keys()].sort(), monthlyRootBefore = structuredClone(monthlyDeleteFixture.active), monthlyRuleBefore = structuredClone(monthlyDeleteFixture.rule);
+    const monthlyListFields = structuredClone(state.records.get(listId).fields);
+    state.nextModify = "committed-500";
+    const monthlySkipLost = await mcp("tools/call", { name: "delete_reminder", arguments: monthlyDeleteArgs });
+    assert.equal(monthlySkipLost.result.structuredContent.error.code, "WRITE_OUTCOME_UNKNOWN"); assert.equal(state.modifies.length, monthlyDeleteBefore + 1); assert.equal(state.modifies.at(-1).operationCount, 3);
+    const monthlySkipReplay = await mcp("tools/call", { name: "delete_reminder", arguments: monthlyDeleteArgs });
+    assert.equal(monthlySkipReplay.result.isError, undefined, JSON.stringify(monthlySkipReplay.result)); assert.equal(monthlySkipReplay.result.structuredContent.replayed, true);
+    assert.equal(monthlySkipReplay.result.structuredContent.record.dueDate, "2030-11-30T00:00:00.000Z"); assert.equal(monthlySkipReplay.result.structuredContent.record.completed, false);
+    assert.deepEqual([...state.records.keys()].sort(), monthlyKeys); assert.equal(state.modifies.length, monthlyDeleteBefore + 1);
+    assert.deepEqual(state.records.get(monthlyDeleteFixture.rule.recordName).fields, monthlyRuleBefore.fields); assert.deepEqual(state.records.get(listId).fields, monthlyListFields);
+    const monthlyRootAfter = state.records.get(monthlyDeleteFixture.active.recordName);
+    for (const [key, value] of Object.entries(monthlyRootBefore.fields)) if (!["DueDate", "LastModifiedDate", "ResolutionTokenMap"].includes(key)) assert.deepEqual(monthlyRootAfter.fields[key], value);
+    assert.deepEqual(monthlyRootAfter.parent, { ...monthlyRootBefore.parent, zoneID: { zoneName: "Reminders", zoneType: "REGULAR_CUSTOM_ZONE", ownerRecordName: zoneOwner } });
+    const monthlyOtherScope = await mcp("tools/call", { name: "delete_reminder", arguments: { ...monthlyDeleteArgs, recurringDeletionScope: "all_future" } });
+    assert.equal(monthlyOtherScope.result.structuredContent.error.code, "CONFLICT"); assert.equal(state.modifies.length, monthlyDeleteBefore + 1);
+    const monthlyRetireArgs = { ...monthlyDeleteArgs, recurringDeletionScope: "all_future", recordChangeTag: monthlyRootAfter.recordChangeTag };
+    const monthlyOrderingBefore = JSON.parse(state.records.get(listId).fields.ResolutionTokenMap.value).map.reminderIDsMergeableOrdering.counter;
+    state.nextModify = "committed-500";
+    const monthlyRetireLost = await mcp("tools/call", { name: "delete_reminder", arguments: monthlyRetireArgs });
+    assert.equal(monthlyRetireLost.result.structuredContent.error.code, "WRITE_OUTCOME_UNKNOWN"); assert.equal(state.modifies.length, monthlyDeleteBefore + 2);
+    const monthlyRetireReplay = await mcp("tools/call", { name: "delete_reminder", arguments: monthlyRetireArgs });
+    assert.equal(monthlyRetireReplay.result.isError, undefined, JSON.stringify(monthlyRetireReplay.result)); assert.equal(monthlyRetireReplay.result.structuredContent.replayed, true);
+    assert.equal(monthlyRetireReplay.result.structuredContent.record.deleted, true); assert.equal(monthlyRetireReplay.result.structuredContent.record.listId, null);
+    assert.equal(monthlyRetireReplay.result.structuredContent.record.dueDate, "2030-11-30T00:00:00.000Z"); assert.deepEqual([...state.records.keys()].sort(), monthlyKeys);
+    assert.deepEqual(state.records.get(monthlyDeleteFixture.rule.recordName).fields, { ...monthlyRuleBefore.fields, Deleted: field("INT64", 1) });
+    assert.deepEqual(state.records.get(monthlyDeleteFixture.rule.recordName).parent, { ...monthlyRuleBefore.parent, zoneID: { zoneName: "Reminders", zoneType: "REGULAR_CUSTOM_ZONE", ownerRecordName: zoneOwner } });
+    assert.equal(state.records.get(listId).fields.ReminderIDs.value, monthlyListFields.ReminderIDs.value);
+    assert.equal(JSON.parse(state.records.get(listId).fields.ResolutionTokenMap.value).map.reminderIDsMergeableOrdering.counter, monthlyOrderingBefore + 1);
+    assert.equal(state.modifies.length, monthlyDeleteBefore + 2);
+    // Keep unrelated later journeys within the same deliberately bounded scan.
+    const recurringDeleteFixtureIds = new Set([...state.records.keys()].filter(id => !beforeRecurringDeleteJourney.has(id)));
+    for (const id of recurringDeleteFixtureIds) state.records.delete(id);
+    const afterDeleteList = state.records.get(listId);
+    afterDeleteList.fields.ReminderIDs = field("STRING", JSON.stringify(JSON.parse(afterDeleteList.fields.ReminderIDs.value).filter(id => !recurringDeleteFixtureIds.has(id.startsWith("Reminder/") ? id : `Reminder/${id}`))));
+
+
+    const seedEndedDaily = (suffix, dueDate) => {
+      const id = `Reminder/ENDED-DAILY-${suffix}`, ruleId = `RecurrenceRule/ENDED-DAILY-${suffix}`;
+      const active = reminderRecord(id); active.parent = { recordName: listId };
+      active.fields.AllDay = field("INT64", 1); active.fields.DueDate = field("TIMESTAMP", Date.parse(dueDate)); delete active.fields.TimeZone;
+      active.fields.RecurrenceRuleIDs = field("STRING_LIST", [ruleId]);
+      const rule = { ...state.records.get(recurrenceId), recordName: ruleId, recordChangeTag: `tag-${ruleId}`, fields: {
+        ...state.records.get(recurrenceId).fields, Frequency: field("INT64", 0), EndDate: field("TIMESTAMP", Date.parse("2030-03-05T00:00:00Z")),
+        Reminder: field("REFERENCE", { recordName: id, action: "VALIDATE", zoneID: active.zoneID }),
+      } };
+      state.records.set(id, active); state.records.set(ruleId, rule);
+      const list = state.records.get(listId); list.fields.ReminderIDs = field("STRING", JSON.stringify([...JSON.parse(list.fields.ReminderIDs.value), id]));
+      return { active, rule, args: { listId, reminderId: id, recordChangeTag: active.recordChangeTag, expectedGeneration: generation } };
+    };
+    for (const mode of ["recurring-rule-race", "recurring-list-race"]) {
+      const { active, args } = seedEndedDaily(mode, "2030-03-05T00:00:00Z"), before = state.modifies.length;
+      state.nextModify = mode;
+      const staleFinal = await mcp("tools/call", { name: "complete_reminder", arguments: args });
+      assert.equal(staleFinal.result.structuredContent.error.code, "CONFLICT");
+      assert.equal(state.modifies.length, before + 1); assert.equal(state.records.get(active.recordName).fields.Completed.value, 0);
+      assert.equal(state.modifies.at(-1).operationCount, 3); assert.equal(state.modifies.at(-1).historyId, undefined);
+      const observedAtomicRejection = await mcp("tools/call", { name: "complete_reminder", arguments: args });
+      assert.equal(observedAtomicRejection.result.structuredContent.error.code, "WRITE_OUTCOME_UNKNOWN");
+      assert.equal(state.modifies.length, before + 1, "A definitively rejected retained request remains read-only on replay.");
+    }
+    const { active: endedDaily, rule: endedDailyRule, args: penultimateArgs } = seedEndedDaily("JOURNEY", "2030-03-04T00:00:00Z");
+    const beforeDaily = state.modifies.length;
+    endedDailyRule.fields.EndDate = field("TIMESTAMP", Date.parse("2030-03-05T09:00:00Z"));
+    const unsupportedEnd = await mcp("tools/call", { name: "complete_reminder", arguments: penultimateArgs });
+    assert.equal(unsupportedEnd.result.structuredContent.error.code, "UNSUPPORTED_FEATURE"); assert.equal(state.modifies.length, beforeDaily);
+    endedDailyRule.fields.EndDate = field("TIMESTAMP", Date.parse("2030-03-05T00:00:00Z"));
+    const staleDailyTag = await mcp("tools/call", { name: "complete_reminder", arguments: { ...penultimateArgs, recordChangeTag: "stale-daily-tag" } });
+    assert.equal(staleDailyTag.result.structuredContent.error.code, "CONFLICT"); assert.equal(state.modifies.length, beforeDaily);
+    const penultimateResponse = await mcp("tools/call", { name: "complete_reminder", arguments: penultimateArgs });
+    assert.equal(penultimateResponse.result.isError, undefined, JSON.stringify(penultimateResponse.result));
+    const penultimateDaily = penultimateResponse.result.structuredContent;
+    assert.equal(penultimateDaily.record.completed, false); assert.equal(penultimateDaily.record.dueDate, "2030-03-05T00:00:00.000Z");
+    assert.equal(penultimateDaily.completedOccurrence.dueDate, "2030-03-04T00:00:00.000Z"); assert.equal(state.modifies.length, beforeDaily + 1);
+    const finalArgs = { ...penultimateArgs, recordChangeTag: state.records.get(endedDaily.recordName).recordChangeTag };
+    const keysBeforeFinal = [...state.records.keys()].sort(), activeBeforeFinal = structuredClone(state.records.get(endedDaily.recordName));
+    const ruleFieldsBeforeFinal = structuredClone(state.records.get(endedDailyRule.recordName).fields), listFieldsBeforeFinal = structuredClone(state.records.get(listId).fields);
+    state.foreignZoneIds.add(listId);
+    const foreignFinalList = await mcp("tools/call", { name: "complete_reminder", arguments: finalArgs });
+    assert.equal(foreignFinalList.result.structuredContent.error.code, "PROTOCOL_CHANGED"); assert.equal(state.modifies.length, beforeDaily + 1);
+    state.foreignZoneIds.delete(listId); state.omitLookupZoneIds.add(listId);
+    state.nextModify = "committed-500";
+    const lostFinal = await mcp("tools/call", { name: "complete_reminder", arguments: finalArgs });
+    assert.equal(lostFinal.result.structuredContent.error.code, "WRITE_OUTCOME_UNKNOWN"); assert.equal(state.modifies.length, beforeDaily + 2);
+    assert.deepEqual([...state.records.keys()].sort(), keysBeforeFinal); assert.equal(state.modifies.at(-1).operationCount, 3);
+    const finalResponse = await mcp("tools/call", { name: "complete_reminder", arguments: finalArgs });
+    assert.equal(finalResponse.result.isError, undefined, JSON.stringify(finalResponse.result));
+    const completedDaily = finalResponse.result.structuredContent;
+    assert.equal(completedDaily.replayed, true); assert.equal(completedDaily.record.completed, true); assert.equal(completedDaily.completedOccurrence, undefined);
+    assert.equal(completedDaily.affectedRecords.length, 1); assert.equal(completedDaily.record.id, endedDaily.recordName);
+    assert.equal(completedDaily.record.dueDate, "2030-03-05T00:00:00.000Z");
+    assert.deepEqual(state.records.get(endedDailyRule.recordName).fields, ruleFieldsBeforeFinal); assert.deepEqual(state.records.get(listId).fields, listFieldsBeforeFinal);
+    assert.deepEqual(JSON.parse(state.records.get(endedDaily.recordName).fields.ResolutionTokenMap.value).map.dueDate, JSON.parse(activeBeforeFinal.fields.ResolutionTokenMap.value).map.dueDate);
+    assert.deepEqual(state.records.get(endedDaily.recordName).fields.RecurrenceRuleIDs, activeBeforeFinal.fields.RecurrenceRuleIDs);
+    await mcp("tools/call", { name: "complete_reminder", arguments: finalArgs }); assert.equal(state.modifies.length, beforeDaily + 2);
+    const reopenDailyArgs = { ...finalArgs, recordChangeTag: state.records.get(endedDaily.recordName).recordChangeTag };
+    const reopenDailyResponse = await mcp("tools/call", { name: "reopen_reminder", arguments: reopenDailyArgs });
+    assert.equal(reopenDailyResponse.result.isError, undefined, JSON.stringify(reopenDailyResponse.result));
+    const reopenedDaily = reopenDailyResponse.result.structuredContent;
+    assert.equal(reopenedDaily.operation, "reopen"); assert.equal(reopenedDaily.record.completed, false); assert.equal(reopenedDaily.record.completedDate, null);
+    assert.equal(reopenedDaily.completedOccurrence, undefined); assert.equal(reopenedDaily.affectedRecords.length, 1);
+    assert.equal(reopenedDaily.record.dueDate, "2030-03-05T00:00:00.000Z"); assert.equal(state.modifies.length, beforeDaily + 3);
+    assert.deepEqual([...state.records.keys()].sort(), keysBeforeFinal);
+    assert.deepEqual(state.records.get(endedDailyRule.recordName).fields, ruleFieldsBeforeFinal); assert.deepEqual(state.records.get(listId).fields, listFieldsBeforeFinal);
+    const reopenedDailyReplay = await mcp("tools/call", { name: "reopen_reminder", arguments: reopenDailyArgs });
+    assert.equal(reopenedDailyReplay.result.structuredContent.replayed, true); assert.equal(state.modifies.length, beforeDaily + 3);
+    state.omitLookupZoneIds.delete(listId);
+
+    const { active: calendarDaily, rule: calendarRule, args: calendarBaseArgs } = seedEndedDaily("CALENDAR", "2030-10-26T00:00:00Z");
+    calendarRule.fields.EndDate = field("TIMESTAMP", Date.parse("2030-10-26T23:51:29Z"));
+    const calendarArgs = { ...calendarBaseArgs, recurrenceCalendarTimeZone: "Europe/London" }, beforeCalendar = state.modifies.length;
+    const omittedCalendar = await mcp("tools/call", { name: "complete_reminder", arguments: calendarBaseArgs });
+    assert.equal(omittedCalendar.result.structuredContent.error.code, "UNSUPPORTED_FEATURE"); assert.equal(state.modifies.length, beforeCalendar);
+    const invalidCalendar = await mcp("tools/call", { name: "complete_reminder", arguments: { ...calendarArgs, recurrenceCalendarTimeZone: "+01:00" } });
+    assert.ok(invalidCalendar.result?.isError || invalidCalendar.error); assert.equal(state.modifies.length, beforeCalendar);
+    state.nextModify = "committed-500";
+    const lostCalendarAdvance = await mcp("tools/call", { name: "complete_reminder", arguments: calendarArgs });
+    assert.equal(lostCalendarAdvance.result.structuredContent.error.code, "WRITE_OUTCOME_UNKNOWN"); assert.equal(state.modifies.length, beforeCalendar + 1);
+    const calendarHistoryId = state.modifies.at(-1).historyId;
+    for (const args of [calendarBaseArgs, { ...calendarArgs, recurrenceCalendarTimeZone: "UTC" }]) {
+      const differentCalendar = await mcp("tools/call", { name: "complete_reminder", arguments: args });
+      assert.equal(differentCalendar.result.structuredContent.error.code, "CONFLICT"); assert.equal(state.modifies.length, beforeCalendar + 1);
+    }
+    const calendarAdvanceResponse = await mcp("tools/call", { name: "complete_reminder", arguments: calendarArgs });
+    assert.equal(calendarAdvanceResponse.result.isError, undefined, JSON.stringify(calendarAdvanceResponse.result));
+    const calendarAdvanced = calendarAdvanceResponse.result.structuredContent;
+    assert.equal(calendarAdvanced.replayed, true); assert.equal(calendarAdvanced.record.dueDate, "2030-10-27T00:00:00.000Z");
+    assert.equal(calendarAdvanced.record.timeZone, null); assert.equal(calendarAdvanced.completedOccurrence.id, calendarHistoryId); assert.equal(state.modifies.length, beforeCalendar + 1);
+    const calendarFinalArgs = { ...calendarArgs, recordChangeTag: state.records.get(calendarDaily.recordName).recordChangeTag };
+    const wrongCalendarBoundary = await mcp("tools/call", { name: "complete_reminder", arguments: { ...calendarFinalArgs, recurrenceCalendarTimeZone: "UTC" } });
+    assert.equal(wrongCalendarBoundary.result.structuredContent.error.code, "UNSUPPORTED_FEATURE"); assert.equal(state.modifies.length, beforeCalendar + 1);
+    const calendarKeys = [...state.records.keys()].sort(), rawCalendarRule = structuredClone(state.records.get(calendarRule.recordName).fields);
+    state.nextModify = "committed-500";
+    const lostCalendarFinal = await mcp("tools/call", { name: "complete_reminder", arguments: calendarFinalArgs });
+    assert.equal(lostCalendarFinal.result.structuredContent.error.code, "WRITE_OUTCOME_UNKNOWN"); assert.equal(state.modifies.length, beforeCalendar + 2);
+    const calendarFinalResponse = await mcp("tools/call", { name: "complete_reminder", arguments: calendarFinalArgs });
+    assert.equal(calendarFinalResponse.result.isError, undefined, JSON.stringify(calendarFinalResponse.result));
+    assert.equal(calendarFinalResponse.result.structuredContent.replayed, true); assert.equal(calendarFinalResponse.result.structuredContent.record.completed, true);
+    assert.equal(calendarFinalResponse.result.structuredContent.completedOccurrence, undefined); assert.equal(state.modifies.length, beforeCalendar + 2);
+    assert.deepEqual([...state.records.keys()].sort(), calendarKeys); assert.deepEqual(state.records.get(calendarRule.recordName).fields, rawCalendarRule);
+    const calendarReopenArgs = { ...calendarFinalArgs, recordChangeTag: state.records.get(calendarDaily.recordName).recordChangeTag };
+    const wrongReopenCalendar = await mcp("tools/call", { name: "reopen_reminder", arguments: { ...calendarReopenArgs, recurrenceCalendarTimeZone: "UTC" } });
+    assert.equal(wrongReopenCalendar.result.structuredContent.error.code, "UNSUPPORTED_FEATURE"); assert.equal(state.modifies.length, beforeCalendar + 2);
+    const calendarReopenResponse = await mcp("tools/call", { name: "reopen_reminder", arguments: calendarReopenArgs });
+    assert.equal(calendarReopenResponse.result.isError, undefined, JSON.stringify(calendarReopenResponse.result));
+    assert.equal(calendarReopenResponse.result.structuredContent.record.completed, false); assert.equal(calendarReopenResponse.result.structuredContent.record.dueDate, "2030-10-27T00:00:00.000Z");
+    const calendarReopenReplay = await mcp("tools/call", { name: "reopen_reminder", arguments: calendarReopenArgs });
+    assert.equal(calendarReopenReplay.result.structuredContent.replayed, true); assert.equal(state.modifies.length, beforeCalendar + 3);
+    assert.deepEqual([...state.records.keys()].sort(), calendarKeys); assert.deepEqual(state.records.get(calendarRule.recordName).fields, rawCalendarRule);
+
+    const dateAlarmRoot = reminderRecord("Reminder/ORDINARY-DATE-LIFECYCLE"); dateAlarmRoot.parent = { recordName: listId };
+    const dateAlarmId = `Alarm/${randomUUID().toUpperCase()}`, dateTriggerId = `AlarmTrigger/${randomUUID().toUpperCase()}`;
+    dateAlarmRoot.fields.AlarmIDs = field("STRING_LIST", [dateAlarmId]);
+    dateAlarmRoot.fields.ResolutionTokenMap = field("STRING", JSON.stringify({ map: { dueDate: { counter: 1, modificationTime: 1_600_000_000, replicaID: randomUUID().toUpperCase() } } }));
+    const dateAlarm = { recordName: dateAlarmId, recordType: "Alarm", recordChangeTag: "ordinary-date-alarm-before", zoneID: dateAlarmRoot.zoneID, parent: { recordName: dateAlarmRoot.recordName }, fields: {
+      AlarmUID: field("STRING", dateAlarmId.slice(6)), TriggerID: field("STRING", dateTriggerId.slice(13)), DueDateResolutionTokenAsNonce: field("DOUBLE", dueDateNonce(dateAlarmRoot.fields.ResolutionTokenMap.value)),
+      Reminder: field("REFERENCE", { recordName: dateAlarmRoot.recordName, action: "VALIDATE", zoneID: dateAlarmRoot.zoneID }), Imported: field("INT64", 0), Deleted: field("INT64", 0),
+    } };
+    const dateTrigger = { recordName: dateTriggerId, recordType: "AlarmTrigger", recordChangeTag: "ordinary-date-trigger-before", zoneID: dateAlarmRoot.zoneID, parent: { recordName: dateAlarmId }, fields: {
+      DateComponentsData: field("BYTES", Buffer.from(JSON.stringify(dateComponents("2030-03-04T09:15:00.000Z", "Europe/London"))).toString("base64")), Type: field("STRING", "Date"),
+      Alarm: field("REFERENCE", { recordName: dateAlarmId, action: "VALIDATE", zoneID: dateAlarmRoot.zoneID }), Imported: field("INT64", 0), Deleted: field("INT64", 0),
+    } };
+    for (const record of [dateAlarmRoot, dateAlarm, dateTrigger]) state.records.set(record.recordName, record);
+    state.records.get(listId).fields.ReminderIDs = field("STRING", JSON.stringify([...JSON.parse(state.records.get(listId).fields.ReminderIDs.value), dateAlarmRoot.recordName]));
+    const dateArgs = { listId, reminderId: dateAlarmRoot.recordName, recordChangeTag: dateAlarmRoot.recordChangeTag, expectedGeneration: generation };
+    const beforeDate = state.modifies.length;
+    const nonce = dateAlarm.fields.DueDateResolutionTokenAsNonce;
+    dateAlarm.fields.DueDateResolutionTokenAsNonce = field("DOUBLE", 0);
+    const badDateNonce = await mcp("tools/call", { name: "complete_reminder", arguments: dateArgs });
+    assert.equal(badDateNonce.result.structuredContent.error.code, "CONFLICT"); assert.equal(state.modifies.length, beforeDate); dateAlarm.fields.DueDateResolutionTokenAsNonce = nonce;
+    dateAlarmRoot.fields.MysteryRelationship = field("REFERENCE", { recordName: "Reminder/OTHER", action: "VALIDATE" });
+    const unknownDateRelationship = await mcp("tools/call", { name: "complete_reminder", arguments: dateArgs });
+    assert.equal(unknownDateRelationship.result.structuredContent.error.code, "UNSUPPORTED_FEATURE"); assert.equal(state.modifies.length, beforeDate); delete dateAlarmRoot.fields.MysteryRelationship;
+    state.foreignZoneIds.add(dateAlarmId);
+    const foreignDateAlarm = await mcp("tools/call", { name: "complete_reminder", arguments: dateArgs });
+    assert.equal(foreignDateAlarm.result.structuredContent.error.code, "PROTOCOL_CHANGED"); assert.equal(state.modifies.length, beforeDate); state.foreignZoneIds.delete(dateAlarmId);
+    const alarmedChild = reminderRecord("Reminder/DATE-ROOT-CHILD"); alarmedChild.fields.ParentReminder = field("REFERENCE", { recordName: dateAlarmRoot.recordName, action: "VALIDATE" });
+    alarmedChild.fields.DueDateDeltaAlertsData = field("BYTES", Buffer.from("synthetic-unrecognized-relative-payload").toString("base64"));
+    state.records.set(alarmedChild.recordName, alarmedChild);
+    const unsupportedDateFamily = await mcp("tools/call", { name: "complete_reminder", arguments: dateArgs });
+    assert.equal(unsupportedDateFamily.result.structuredContent.error.code, "UNSUPPORTED_FEATURE"); assert.equal(state.modifies.length, beforeDate); state.records.delete(alarmedChild.recordName);
+    for (const mode of ["date-alarm-alarm-race", "date-alarm-list-race"]) {
+      state.nextModify = mode;
+      const racedDate = await mcp("tools/call", { name: "complete_reminder", arguments: dateArgs });
+      assert.equal(racedDate.result.structuredContent.error.code, "CONFLICT"); assert.equal(state.records.get(dateAlarmRoot.recordName).fields.Completed.value, 0);
+    }
+    const beforeDateCommit = state.modifies.length, datePairBefore = [structuredClone(state.records.get(dateAlarmId)), structuredClone(state.records.get(dateTriggerId))];
+    const keysBeforeDate = [...state.records.keys()].sort();
+    for (const id of [listId, dateAlarmId, dateTriggerId]) state.omitLookupZoneIds.add(id);
+    state.nextModify = "committed-500";
+    const lostDateComplete = await mcp("tools/call", { name: "complete_reminder", arguments: dateArgs });
+    assert.equal(lostDateComplete.result.structuredContent.error.code, "WRITE_OUTCOME_UNKNOWN"); assert.equal(state.modifies.length, beforeDateCommit + 1);
+    const oldDateArgs = await mcp("tools/call", { name: "complete_reminder", arguments: dateArgs });
+    assert.equal(oldDateArgs.result.structuredContent.error.code, "CONFLICT"); assert.equal(state.modifies.length, beforeDateCommit + 1);
+    const completedDateRead = await mcp("tools/call", { name: "get_reminder", arguments: { listId, reminderId: dateAlarmRoot.recordName } });
+    assert.equal(completedDateRead.result.structuredContent.record.completed, true);
+    const dateReopenArgs = { ...dateArgs, recordChangeTag: state.records.get(dateAlarmRoot.recordName).recordChangeTag };
+    const reopenedDateResponse = await mcp("tools/call", { name: "reopen_reminder", arguments: dateReopenArgs });
+    assert.equal(reopenedDateResponse.result.isError, undefined, JSON.stringify(reopenedDateResponse.result));
+    assert.equal(reopenedDateResponse.result.structuredContent.record.completed, false);
+    assert.equal(reopenedDateResponse.result.structuredContent.record.dueDate, "2030-03-04T09:15:00.000Z");
+    for (const before of datePairBefore) { assert.deepEqual(state.records.get(before.recordName).fields, before.fields); assert.deepEqual(state.records.get(before.recordName).parent, before.parent); }
+    const dateDeleteArgs = { ...dateArgs, recordChangeTag: state.records.get(dateAlarmRoot.recordName).recordChangeTag };
+    const deletedDateResponse = await mcp("tools/call", { name: "delete_reminder", arguments: dateDeleteArgs });
+    assert.equal(deletedDateResponse.result.isError, undefined, JSON.stringify(deletedDateResponse.result));
+    assert.equal(deletedDateResponse.result.structuredContent.record.deleted, true); assert.equal(deletedDateResponse.result.structuredContent.record.listId, null);
+    assert.deepEqual([...state.records.keys()].sort(), keysBeforeDate);
+    for (const before of datePairBefore) {
+      assert.deepEqual(state.records.get(before.recordName).fields, { ...before.fields, Deleted: field("INT64", 1) });
+      assert.deepEqual(state.records.get(before.recordName).parent, before.parent);
+    }
+    assert.equal(state.records.get(dateAlarmRoot.recordName).parent, undefined);
+    const oldDateDelete = await mcp("tools/call", { name: "delete_reminder", arguments: dateDeleteArgs });
+    assert.equal(oldDateDelete.result.structuredContent.error.code, "CONFLICT"); assert.equal(state.modifies.length, beforeDateCommit + 3);
+    for (const id of [listId, dateAlarmId, dateTriggerId]) state.omitLookupZoneIds.delete(id);
+    const parentReceiptRoot = structuredClone(dateAlarmRoot); parentReceiptRoot.recordName = "Reminder/DATE-PARENT-RECEIPT"; parentReceiptRoot.recordChangeTag = "parent-receipt-before";
+    const parentReceiptAlarm = structuredClone(dateAlarm), parentReceiptTrigger = structuredClone(dateTrigger);
+    parentReceiptAlarm.recordName = `Alarm/${randomUUID().toUpperCase()}`; parentReceiptTrigger.recordName = `AlarmTrigger/${randomUUID().toUpperCase()}`;
+    parentReceiptRoot.fields.AlarmIDs = field("STRING_LIST", [parentReceiptAlarm.recordName]);
+    parentReceiptAlarm.parent = { recordName: parentReceiptRoot.recordName }; parentReceiptAlarm.fields.Reminder.value.recordName = parentReceiptRoot.recordName;
+    parentReceiptAlarm.fields.AlarmUID.value = parentReceiptAlarm.recordName.slice(6); parentReceiptAlarm.fields.TriggerID.value = parentReceiptTrigger.recordName.slice(13);
+    parentReceiptTrigger.parent = { recordName: parentReceiptAlarm.recordName }; parentReceiptTrigger.fields.Alarm.value.recordName = parentReceiptAlarm.recordName;
+    for (const record of [parentReceiptRoot, parentReceiptAlarm, parentReceiptTrigger]) state.records.set(record.recordName, record);
+    const parentReceiptArgs = { ...dateArgs, reminderId: parentReceiptRoot.recordName, recordChangeTag: parentReceiptRoot.recordChangeTag }, beforeParentReceipt = state.modifies.length;
+    state.nextModify = "date-alarm-parent-drift";
+    const wrongPairParent = await mcp("tools/call", { name: "complete_reminder", arguments: parentReceiptArgs });
+    assert.equal(wrongPairParent.result.structuredContent.error.code, "WRITE_OUTCOME_UNKNOWN"); assert.equal(state.modifies.length, beforeParentReceipt + 1);
+    const wrongPairParentReplay = await mcp("tools/call", { name: "complete_reminder", arguments: parentReceiptArgs });
+    assert.equal(wrongPairParentReplay.result.structuredContent.error.code, "CONFLICT"); assert.equal(state.modifies.length, beforeParentReceipt + 1);
 
     // Exact IDs survive uncertain 5xx and network failures; retry safely reconciles the committed record.
     for (const [key, mode] of [["9de431a5-27a6-4b40-a23b-7a76a1dcae7d", "committed-500"], ["bb3d717e-1712-4ea2-baa5-8f5728b34f96", "committed-network-drop"]]) {
@@ -661,6 +2081,14 @@ export async function verifyReminderWrites(options) {
     state.nextModify = "changed-resolution-tokens";
     const tokenMismatch = await mcp("tools/call", { name: "update_reminder", arguments: { listId, reminderId, recordChangeTag: state.records.get(reminderId).recordChangeTag, changes: { title: "Unconfirmed token change" }, expectedGeneration: generation } });
     assert.equal(tokenMismatch.result.structuredContent.error.code, "WRITE_OUTCOME_UNKNOWN");
+    for (const mode of ["signed-asset-checksum-drift", "signed-asset-wrapping-drift"]) {
+      state.nextModify = mode;
+      const count = state.modifies.length;
+      const rejected = await mcp("tools/call", { name: "update_reminder", arguments: { listId, reminderId,
+        recordChangeTag: state.records.get(reminderId).recordChangeTag, changes: { title: `Receipt ${mode}` }, expectedGeneration: generation } });
+      assert.equal(rejected.result.structuredContent.error.code, "WRITE_OUTCOME_UNKNOWN");
+      assert.equal(state.modifies.length, count + 1);
+    }
 
     // Creating an early alarm copies only validated account metadata from an exact same-list source and atomically guards it.
     const accountIdentifier = "8a187515-3b92-4658-a9d0-815b5fd95a52";
@@ -752,12 +2180,230 @@ export async function verifyReminderWrites(options) {
     assert.equal(noSourceMutation.result.structuredContent.error.code, "UNSUPPORTED_FEATURE");
     assert.equal(state.modifies.length, beforeNoSource, "Cross-list metadata must never produce an Apple write.");
 
+    // Organization edits and transfers stay atomic across the root, linked records, and List membership.
+    const organizationListId = "List/ORG-SOURCE";
+    const organizationDestinationId = "List/ORG-DESTINATION";
+    const organizationCopyListId = "List/ORG-COPY-DESTINATION";
+    const organizationLostAckListId = "List/ORG-LOST-ACK-DESTINATION";
+    const organizationReminderId = "Reminder/9B7634D4-1517-4AA8-9A50-74AC3BAE4A54";
+    const organizationUrlId = "Attachment/11111111-2222-4333-8444-555555555555";
+    const keepTagId = "Hashtag/aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+    const removeTagId = "Hashtag/bbbbbbbb-cccc-4ddd-8eee-ffffffffffff";
+    const sourceListMember = organizationReminderId.slice("Reminder/".length);
+    state.records.set(organizationListId, listRecord(organizationListId, [sourceListMember]));
+    state.records.set(organizationDestinationId, listRecord(organizationDestinationId));
+    state.records.set(organizationCopyListId, listRecord(organizationCopyListId));
+    state.records.set(organizationLostAckListId, listRecord(organizationLostAckListId));
+    const organizationReminder = reminderRecord(organizationReminderId);
+    organizationReminder.fields.List = field("REFERENCE", { recordName: organizationListId, action: "VALIDATE", zoneID: { zoneName: "Reminders", ownerRecordName: zoneOwner } });
+    organizationReminder.fields.DueDate = field("TIMESTAMP", null);
+    organizationReminder.fields.TimeZone = field("STRING", null);
+    organizationReminder.fields.StartDate = field("TIMESTAMP", null);
+    organizationReminder.fields.AttachmentIDs = field("STRING_LIST", [organizationUrlId.slice("Attachment/".length)]);
+    organizationReminder.fields.HashtagIDs = field("STRING_LIST", [keepTagId.slice("Hashtag/".length), removeTagId.slice("Hashtag/".length)]);
+    organizationReminder.parent = { recordName: organizationListId };
+    state.records.set(organizationReminderId, organizationReminder);
+    const backlink = { type: "REFERENCE", value: { recordName: organizationReminderId, action: "VALIDATE" } };
+    state.records.set(organizationUrlId, { recordName: organizationUrlId, recordType: "Attachment", recordChangeTag: "organization-url-v1",
+      zoneID: organizationReminder.zoneID, fields: { Type: field("STRING", "URL"), UTI: field("STRING", "public.url"), Imported: field("INT64", 0),
+        Deleted: field("INT64", 0), URL: { ...field("STRING", "https://example.invalid/original"), isEncrypted: true }, Reminder: backlink } });
+    const makeTag = (id, name, version) => ({ recordName: id, recordType: "Hashtag", recordChangeTag: version,
+      zoneID: organizationReminder.zoneID, fields: { CreationDate: field("TIMESTAMP", 1_700_000_000_000), Type: field("INT64", 0),
+        Imported: field("INT64", 0), Deleted: field("INT64", 0), Name: { ...field("STRING", name), isEncrypted: true }, Reminder: backlink } });
+    state.records.set(keepTagId, makeTag(keepTagId, "Keep", "organization-tag-keep-v1"));
+    state.records.set(removeTagId, makeTag(removeTagId, "Remove", "organization-tag-remove-v1"));
+    const organizationTarget = async () => (await invoke("get_reminder", { listId: state.records.get(organizationReminderId).fields.List.value.recordName, reminderId: organizationReminderId })).record;
+    const organizationMutationTarget = async () => ({ listId: organizationListId, reminderId: organizationReminderId,
+      recordChangeTag: (await organizationTarget()).recordChangeTag, expectedGeneration: generation });
+    const organizationView = await invoke("get_reminder_organization", { listId: organizationListId, reminderId: organizationReminderId, expectedGeneration: generation });
+    assert.equal(organizationView.url.url, "https://example.invalid/original");
+    assert.equal(organizationView.url.id, organizationUrlId);
+    assert.deepEqual(organizationView.tags.map(tag => tag.name), ["Keep", "Remove"]);
+    assert.deepEqual(organizationView.otherAttachmentIds, []);
+    assert.ok(!JSON.stringify(organizationView).includes(opaqueMetadata));
+
+    const originalOrganizationRoot = structuredClone(state.records.get(organizationReminderId));
+    const urlResult = await invoke("set_reminder_url", { ...(await organizationMutationTarget()), url: "https://example.invalid/updated" });
+    const updatedURLId = `Attachment/${state.records.get(organizationReminderId).fields.AttachmentIDs.value[0]}`;
+    assert.equal(urlResult.record.id, organizationReminderId);
+    assert.notEqual(updatedURLId, organizationUrlId, "Replacing a URL creates a fresh linked attachment identity.");
+    assert.equal(state.records.get(updatedURLId).fields.URL.value, "https://example.invalid/updated");
+    assert.equal(state.records.get(updatedURLId).fields.URL.isEncrypted, true);
+    assert.equal(state.records.get(updatedURLId).fields.Reminder.value.recordName, organizationReminderId);
+    assert.equal(state.records.get(organizationUrlId).fields.Deleted.value, 1);
+    assert.equal(state.records.get(organizationUrlId).fields.Reminder.value, null);
+    assert.equal(state.records.get(organizationReminderId).fields.NotesDocument.value, originalOrganizationRoot.fields.NotesDocument.value);
+
+    const initialTags = await invoke("get_reminder_organization", { listId: organizationListId, reminderId: organizationReminderId, expectedGeneration: generation });
+    const tagResult = await invoke("set_reminder_tags", { ...(await organizationMutationTarget()), tags: ["Keep", "Added"] });
+    const afterTagEdit = await invoke("get_reminder_organization", { listId: organizationListId, reminderId: organizationReminderId, expectedGeneration: generation });
+    assert.deepEqual(afterTagEdit.tags.map(tag => tag.name), ["Keep", "Added"]);
+    const addedTag = afterTagEdit.tags.find(tag => tag.name === "Added");
+    assert.ok(addedTag && !initialTags.tags.some(tag => tag.id === addedTag.id), "New tags receive fresh linked identities.");
+    assert.equal(state.records.get(removeTagId).fields.Deleted.value, 1);
+    assert.equal(state.records.get(removeTagId).fields.Reminder.value, null);
+    assert.equal(state.records.get(addedTag.id).fields.Name.isEncrypted, true);
+    assert.equal(tagResult.record.recordChangeTag, state.records.get(organizationReminderId).recordChangeTag);
+
+    const rootBeforeRelatedRace = structuredClone(state.records.get(organizationReminderId));
+    const addedBeforeRelatedRace = structuredClone(state.records.get(addedTag.id));
+    const modifyCountBeforeRelatedRace = state.modifies.length;
+    state.nextModify = "related-version-race";
+    const relatedRace = await mcp("tools/call", { name: "set_reminder_tags", arguments: {
+      ...(await organizationMutationTarget()), tags: ["Keep", "Fresh"],
+    } });
+    assert.equal(relatedRace.result.structuredContent.error.code, "CONFLICT");
+    assert.equal(state.modifies.length, modifyCountBeforeRelatedRace + 1);
+    assert.equal(state.records.get(organizationReminderId).recordChangeTag, rootBeforeRelatedRace.recordChangeTag);
+    assert.deepEqual(state.records.get(organizationReminderId).fields.HashtagIDs, rootBeforeRelatedRace.fields.HashtagIDs,
+      "A raced retained tag rejects the root unlink/link as one atomic group.");
+    assert.deepEqual(state.records.get(addedTag.id).fields, addedBeforeRelatedRace.fields, "A rejected tag replacement does not retire another tag.");
+    assert.equal([...state.records.values()].some(record => record.recordType === "Hashtag" && record.fields.Name?.value === "Fresh"), false,
+      "A rejected tag replacement does not create its new related record.");
+
+    const tagRetry = await invoke("set_reminder_tags", { ...(await organizationMutationTarget()), tags: ["Keep", "Fresh"] });
+    assert.deepEqual((await invoke("get_reminder_organization", { listId: organizationListId, reminderId: organizationReminderId,
+      expectedGeneration: generation })).tags.map(tag => tag.name), ["Keep", "Fresh"]);
+    assert.equal(state.records.get(addedTag.id).fields.Deleted.value, 1);
+    assert.equal(tagRetry.record.recordChangeTag, state.records.get(organizationReminderId).recordChangeTag);
+
+    const snapshotList = async id => (await invoke("get_reminder_list", { listId: id, expectedGeneration: generation })).list;
+    const beforeMoveRoot = await organizationTarget();
+    const beforeMoveSourceList = await snapshotList(organizationListId);
+    const beforeMoveDestinationList = await snapshotList(organizationDestinationId);
+    const moveArgs = { listId: organizationListId, reminderId: organizationReminderId, recordChangeTag: beforeMoveRoot.recordChangeTag,
+      destinationListId: organizationDestinationId, sourceListChangeTag: beforeMoveSourceList.recordChangeTag,
+      destinationListChangeTag: beforeMoveDestinationList.recordChangeTag, expectedGeneration: generation };
+    const sourceMembershipBeforeRace = state.records.get(organizationListId).fields.ReminderIDs.value;
+    const destinationMembershipBeforeRace = state.records.get(organizationDestinationId).fields.ReminderIDs.value;
+    const beforeMoveModifyCount = state.modifies.length;
+    state.nextModify = "transfer-list-race";
+    const listRace = await mcp("tools/call", { name: "move_reminder", arguments: moveArgs });
+    assert.equal(listRace.result.structuredContent.error.code, "CONFLICT");
+    assert.equal(state.modifies.length, beforeMoveModifyCount + 1);
+    assert.equal(state.records.get(organizationReminderId).fields.List.value.recordName, organizationListId);
+    assert.equal(state.records.get(organizationListId).fields.ReminderIDs.value, sourceMembershipBeforeRace);
+    assert.equal(state.records.get(organizationDestinationId).fields.ReminderIDs.value, destinationMembershipBeforeRace,
+      "A stale destination List version rejects both membership changes and the Reminder move.");
+
+    const refreshedMoveSource = await snapshotList(organizationListId);
+    const refreshedMoveDestination = await snapshotList(organizationDestinationId);
+    const moved = await invoke("move_reminder", { ...moveArgs, recordChangeTag: (await organizationTarget()).recordChangeTag,
+      sourceListChangeTag: refreshedMoveSource.recordChangeTag, destinationListChangeTag: refreshedMoveDestination.recordChangeTag });
+    assert.equal(moved.record.listId, organizationDestinationId);
+    assert.equal(state.records.get(organizationReminderId).parent.recordName, organizationDestinationId,
+      "The atomic response and local Apple fixture retain the native parent supplied by the transfer.");
+    assert.deepEqual(JSON.parse(state.records.get(organizationListId).fields.ReminderIDs.value), []);
+    assert.deepEqual(JSON.parse(state.records.get(organizationDestinationId).fields.ReminderIDs.value), [sourceListMember]);
+    assert.deepEqual(state.records.get(organizationReminderId).fields.HashtagIDs.value.map(id => `Hashtag/${id}`).map(id => state.records.get(id).fields.Name.value),
+      ["Keep", "Fresh"], "Moving preserves the existing native tag links.");
+
+    const copySource = await organizationTarget();
+    const copySourceList = await snapshotList(organizationDestinationId);
+    const copyDestinationList = await snapshotList(organizationCopyListId);
+    const sourceRelatedIds = [updatedURLId, ...state.records.get(organizationReminderId).fields.HashtagIDs.value.map(id => `Hashtag/${id}`)];
+    const guardTagsBeforeCopy = new Map([organizationReminderId, organizationDestinationId, ...sourceRelatedIds]
+      .map(id => [id, state.records.get(id).recordChangeTag]));
+    const copyKey = randomUUID();
+    const copyArgs = { listId: organizationDestinationId, reminderId: organizationReminderId, recordChangeTag: copySource.recordChangeTag,
+      destinationListId: organizationCopyListId, sourceListChangeTag: copySourceList.recordChangeTag,
+      destinationListChangeTag: copyDestinationList.recordChangeTag, idempotencyKey: copyKey, expectedGeneration: generation };
+    const copied = await invoke("copy_reminder", copyArgs);
+    const copiedId = `Reminder/${copyKey.toUpperCase()}`;
+    assert.equal(copied.record.id, copiedId);
+    assert.equal(copied.idempotencyKey, copyKey);
+    assert.notEqual(state.records.get(copiedId).parent.recordName, organizationDestinationId);
+    assert.equal(state.records.get(copiedId).parent.recordName, organizationCopyListId);
+    const copiedURLId = `Attachment/${state.records.get(copiedId).fields.AttachmentIDs.value[0]}`;
+    const copiedTagIds = state.records.get(copiedId).fields.HashtagIDs.value.map(id => `Hashtag/${id}`);
+    assert.notEqual(copiedURLId, updatedURLId, "A copied URL receives a fresh Attachment identity.");
+    assert.ok(copiedTagIds.every(id => !sourceRelatedIds.includes(id)), "Copied tags receive fresh Hashtag identities.");
+    assert.equal(state.records.get(copiedURLId).fields.URL.value, state.records.get(updatedURLId).fields.URL.value);
+    assert.equal(state.records.get(copiedURLId).fields.Reminder.value.recordName, copiedId);
+    assert.deepEqual(copiedTagIds.map(id => state.records.get(id).fields.Name.value), ["Keep", "Fresh"]);
+    for (const [id, previousTag] of guardTagsBeforeCopy) assert.notEqual(state.records.get(id).recordChangeTag, previousTag,
+      `The atomic copy must version-guard and advance ${id}.`);
+    const modifyCountAfterCopy = state.modifies.length;
+    const copyReplay = await invoke("copy_reminder", copyArgs);
+    assert.equal(copyReplay.replayed, true);
+    assert.equal(state.modifies.length, modifyCountAfterCopy,
+      "An identical copy replays without Apple writes even after source, list, and related guards advanced.");
+    const changedCopyInput = await mcp("tools/call", { name: "copy_reminder", arguments: { ...copyArgs,
+      recordChangeTag: (await organizationTarget()).recordChangeTag,
+      sourceListChangeTag: (await snapshotList(organizationDestinationId)).recordChangeTag,
+      destinationListId: organizationLostAckListId,
+      destinationListChangeTag: (await snapshotList(organizationLostAckListId)).recordChangeTag,
+    } });
+    assert.equal(changedCopyInput.result.structuredContent.error.code, "CONFLICT");
+    assert.equal(state.modifies.length, modifyCountAfterCopy, "A copy key cannot be reused for changed input.");
+
+    const lostAckKey = randomUUID();
+    const lostAckDestination = await snapshotList(organizationLostAckListId);
+    const lostAckArgs = { ...copyArgs, recordChangeTag: (await organizationTarget()).recordChangeTag,
+      sourceListChangeTag: (await snapshotList(organizationDestinationId)).recordChangeTag, destinationListId: organizationLostAckListId,
+      destinationListChangeTag: lostAckDestination.recordChangeTag, idempotencyKey: lostAckKey };
+    const beforeLostAck = state.modifies.length;
+    state.nextModify = "committed-network-drop";
+    const lostAck = await mcp("tools/call", { name: "copy_reminder", arguments: lostAckArgs });
+    assert.equal(lostAck.result.structuredContent.error.code, "WRITE_OUTCOME_UNKNOWN");
+    assert.equal(lostAck.result.structuredContent.error.idempotencyKey, lostAckKey);
+    assert.equal(state.modifies.length, beforeLostAck + 1);
+    const lostAckReplay = await invoke("copy_reminder", lostAckArgs);
+    assert.equal(lostAckReplay.replayed, true);
+    assert.equal(state.modifies.length, beforeLostAck + 1,
+      "A lost copy acknowledgement is reconciled with its same key and never resubmitted.");
+
+    // Native empty relationships are untyped until their first member. URL
+    // edits and moves must preserve an untouched UNKNOWN_LIST representation.
+    const emptyId = "Reminder/7A6C6A09-1A9D-4D57-8643-30A851409650";
+    const emptyRoot = reminderRecord(emptyId);
+    emptyRoot.fields.List.value.recordName = organizationListId;
+    emptyRoot.fields.DueDate.value = null; emptyRoot.fields.TimeZone.value = null;
+    emptyRoot.fields.AttachmentIDs = field("UNKNOWN_LIST", []);
+    emptyRoot.fields.HashtagIDs = field("UNKNOWN_LIST", []);
+    state.records.set(emptyId, emptyRoot);
+    state.records.get(organizationListId).fields.ReminderIDs.value = JSON.stringify([emptyId.slice("Reminder/".length)]);
+    const emptyURL = await invoke("set_reminder_url", { listId: organizationListId, reminderId: emptyId,
+      recordChangeTag: emptyRoot.recordChangeTag, url: "https://example.invalid/first-url", expectedGeneration: generation });
+    assert.equal(state.records.get(emptyId).fields.HashtagIDs.type, "UNKNOWN_LIST");
+    const emptySource = await snapshotList(organizationListId), emptyDestination = await snapshotList(organizationDestinationId);
+    const emptyMove = await invoke("move_reminder", { listId: organizationListId, reminderId: emptyId, recordChangeTag: emptyURL.record.recordChangeTag,
+      destinationListId: organizationDestinationId, sourceListChangeTag: emptySource.recordChangeTag,
+      destinationListChangeTag: emptyDestination.recordChangeTag, expectedGeneration: generation });
+    assert.equal(emptyMove.record.listId, organizationDestinationId);
+    assert.equal(state.records.get(emptyId).fields.HashtagIDs.type, "UNKNOWN_LIST");
+
+    // A child record remains outside the supported ordinary-root transfer shape.
+    const childListId = "List/ORG-CHILD-REFUSAL";
+    const childParentId = "Reminder/410F770D-2E1C-47CB-9BF0-123C1C98A987";
+    const childId = "Reminder/510F770D-2E1C-47CB-9BF0-123C1C98A987";
+    const childDestinationId = "List/ORG-CHILD-DESTINATION";
+    state.records.set(childListId, listRecord(childListId, [childParentId.slice("Reminder/".length), childId.slice("Reminder/".length)]));
+    state.records.set(childDestinationId, listRecord(childDestinationId));
+    const childParent = reminderRecord(childParentId);
+    childParent.fields.List.value.recordName = childListId; childParent.fields.DueDate.value = null; childParent.fields.TimeZone.value = null;
+    const childReminder = reminderRecord(childId);
+    childReminder.fields.List.value.recordName = childListId; childReminder.fields.DueDate.value = null; childReminder.fields.TimeZone.value = null;
+    childReminder.fields.ParentReminder = field("REFERENCE", { recordName: childParentId, action: "VALIDATE" });
+    state.records.set(childParentId, childParent); state.records.set(childId, childReminder);
+    const childSourceSnapshot = await snapshotList(childListId), childDestinationSnapshot = await snapshotList(childDestinationId);
+    const beforeChildRefusal = state.modifies.length;
+    const childMove = await mcp("tools/call", { name: "move_reminder", arguments: { listId: childListId, reminderId: childId,
+      recordChangeTag: childReminder.recordChangeTag, destinationListId: childDestinationId,
+      sourceListChangeTag: childSourceSnapshot.recordChangeTag, destinationListChangeTag: childDestinationSnapshot.recordChangeTag,
+      expectedGeneration: generation } });
+    assert.equal(childMove.result.structuredContent.error.code, "UNSUPPORTED_FEATURE");
+    assert.equal(state.modifies.length, beforeChildRefusal, "A child reminder is refused before atomic transfer dispatch.");
+
     // Native D1 ledger and real MCP schemas exercise simple request-driven jobs.
+    const jobListId = "List/REQUEST-DRIVEN-JOBS";
+    state.records.set(jobListId, listRecord(jobListId));
+    state.pristineLists.add(jobListId);
     const jobKey = randomUUID();
     const job = await invoke("create_reminder_job", { kind: "bulk_create", idempotencyKey: jobKey, expectedGeneration: generation });
     assert.equal(job.jobId, jobKey);
     assert.equal((await invoke("create_reminder_job", { kind: "bulk_create", idempotencyKey: jobKey, expectedGeneration: generation })).jobId, job.jobId);
-    const jobItems = [0, 1, 2, 3].map(index => ({ kind: "bulk_create", clientItemKey: `ordered-${index}`, input: { listId, idempotencyKey: randomUUID(), title: "Equal titles are distinct", notes: `Synthetic job ${index}` } }));
+    const jobItems = [0, 1, 2, 3].map(index => ({ kind: "bulk_create", clientItemKey: `ordered-${index}`, input: { listId: jobListId, idempotencyKey: randomUUID(), title: "Equal titles are distinct", notes: `Synthetic job ${index}` } }));
     const appendArgs = { jobId: job.jobId, chunkKey: randomUUID(), expectedRevision: job.revision, items: jobItems };
     const appended = await invoke("append_reminder_job_items", appendArgs);
     assert.equal((await invoke("append_reminder_job_items", appendArgs)).revision, appended.revision);
@@ -774,7 +2420,7 @@ export async function verifyReminderWrites(options) {
     assert.equal((await request(`/api/reminder-jobs/${job.jobId}`, { user: "different-owner" })).status, 403);
     assert.equal((await request(`/api/reminder-jobs/${job.jobId}/continue`, { method: "POST", body: {}, requestOrigin: "https://evil.example" })).status, 403);
     const firstSlice = await invoke("continue_reminder_job", { jobId: job.jobId });
-    assert.equal(firstSlice.counts.succeeded, 3); assert.equal(firstSlice.counts.pending, 1);
+    assert.equal(firstSlice.counts.succeeded, 3, JSON.stringify(firstSlice)); assert.equal(firstSlice.counts.pending, 1);
     const secondSlice = await invoke("continue_reminder_job", { jobId: job.jobId });
     assert.equal(secondSlice.state, "completed");
     assert.deepEqual(secondSlice.results.map(item => item.clientItemKey), ["ordered-0", "ordered-1", "ordered-2", "ordered-3"]);
@@ -799,6 +2445,36 @@ export async function verifyReminderWrites(options) {
     const cancelledJob = await invoke("create_reminder_job", { kind: "bulk_create", idempotencyKey: randomUUID(), expectedGeneration: generation });
     const cancelled = await invoke("cancel_reminder_job", { jobId: cancelledJob.jobId });
     assert.equal(cancelled.state, "cancelled");
+
+    // Bulk authorization remains childless-only when a second, otherwise exact
+    // family scan sees a newly attached child after the first scan saw none.
+    const deletionRootId = `Reminder/${jobItems[0].input.idempotencyKey.toUpperCase()}`;
+    const deletionTarget = { listId: jobListId, reminderId: deletionRootId, recordChangeTag: state.records.get(deletionRootId).recordChangeTag };
+    const deletionJob = await invoke("create_reminder_job", { kind: "bulk_delete", idempotencyKey: randomUUID(), expectedGeneration: generation });
+    const deletionAppend = await invoke("append_reminder_job_items", { jobId: deletionJob.jobId, chunkKey: randomUUID(), expectedRevision: deletionJob.revision,
+      items: [{ kind: "bulk_delete", clientItemKey: "childless-only", input: deletionTarget }] });
+    const deletionPreview = await invoke("preview_reminder_job", { jobId: deletionJob.jobId, expectedRevision: deletionAppend.revision });
+    assert.equal(deletionPreview.counts.failed, 0);
+    await invoke("start_reminder_job", { jobId: deletionJob.jobId, previewToken: deletionPreview.previewToken });
+    let deletionScans = 0;
+    const racingChildId = "Reminder/BULK-SECOND-SCAN-CHILD";
+    state.onReminderListQuery = () => {
+      if (++deletionScans !== 2) return;
+      const child = reminderRecord(racingChildId);
+      child.fields.List.value.recordName = jobListId;
+      child.fields.ParentReminder = field("REFERENCE", { recordName: deletionRootId, action: "VALIDATE" });
+      state.records.set(racingChildId, child);
+      state.onReminderListQuery = null;
+    };
+    const beforeDeletionRace = state.modifies.length;
+    const rejectedDeletion = await invoke("continue_reminder_job", { jobId: deletionJob.jobId });
+    assert.equal(deletionScans, 2);
+    assert.equal(rejectedDeletion.counts.failed, 1);
+    assert.equal(rejectedDeletion.results[0].result.code, "UNSUPPORTED_FEATURE");
+    assert.equal(state.modifies.length, beforeDeletionRace, "A family found by the final bulk deletion plan must never dispatch.");
+    assert.equal(state.records.get(deletionRootId).fields.Deleted.value, 0);
+    assert.equal(state.records.get(racingChildId).fields.Deleted.value, 0);
+    state.records.delete(racingChildId);
 
     // Expired device assurance is rejected before any Apple request, even when row state says READY.
     generation = await workerHarness.seedReady(true);
@@ -871,6 +2547,10 @@ export async function verifyReminderWrites(options) {
       const beforeStatus = await (await subtaskHarness.request("/api/connection")).json();
       assert.equal(beforeStatus.capabilities.subtasks, true);
       const firstParent = "Reminder/SUBTASK-PARENT", secondParent = "Reminder/SUBTASK-OTHER";
+      const subtaskList = state.records.get(listId);
+      const membersBeforeParents = JSON.parse(subtaskList.fields.ReminderIDs.value);
+      subtaskList.fields.ReminderIDs = field("STRING", JSON.stringify([...membersBeforeParents,
+        firstParent.slice("Reminder/".length), secondParent.slice("Reminder/".length)]));
       for (const id of [firstParent, secondParent]) {
         const root = reminderRecord(id);
         root.fields.DueDate = field("TIMESTAMP", null); root.fields.TimeZone = field("STRING", null);
@@ -881,16 +2561,20 @@ export async function verifyReminderWrites(options) {
       const parentFields = structuredClone(state.records.get(firstParent).fields);
       const created = await invokeSubtask("create_subtask", input), childId = created.record.id;
       assert.equal(created.record.parentReminderId, firstParent); assert.equal(created.record.listId, listId);
-      assert.equal(state.modifies.length, 1); assert.equal(state.modifies[0].operationCount, 2);
+      assert.equal(state.modifies.length, 1); assert.equal(state.modifies[0].atomicCreationGroup, true); assert.equal(state.modifies[0].operationCount, 3);
+      assert.deepEqual(JSON.parse(state.records.get(listId).fields.ReminderIDs.value), [...membersBeforeParents,
+        firstParent.slice("Reminder/".length), secondParent.slice("Reminder/".length), childId.slice("Reminder/".length)]);
       assert.deepEqual(state.records.get(firstParent).fields, parentFields);
+      const changedList = state.records.get(listId);
+      state.records.set(listId, { ...changedList, recordChangeTag: `${changedList.recordChangeTag}-concurrent` });
       assert.equal((await invokeSubtask("create_subtask", input)).replayed, true);
-      assert.equal(state.modifies.length, 1);
+      assert.equal(state.modifies.length, 1, "A matching-key replay stays read-only after the List version changes.");
       const conflictingReplay = await subtaskHarness.mcp("tools/call", { name: "create_subtask", arguments: { ...input, parentReminder: parentTarget(secondParent) } });
       assert.equal(conflictingReplay.result.structuredContent.error.code, "CONFLICT");
       const staleParent = await subtaskHarness.mcp("tools/call", { name: "create_subtask", arguments: { ...input, idempotencyKey: randomUUID() } });
       assert.equal(staleParent.result.structuredContent.error.code, "CONFLICT");
       assert.equal(state.modifies.length, 1);
-      for (const action of ["complete", "reopen", "delete"]) {
+      for (const action of ["reopen"]) {
         const before = state.modifies.length;
         const reply = await subtaskHarness.mcp("tools/call", { name: `${action}_reminder`, arguments: { listId, ...parentTarget(firstParent) } });
         assert.ok(["UNSUPPORTED_FEATURE", "CONFLICT"].includes(reply.result.structuredContent.error.code));
@@ -898,9 +2582,15 @@ export async function verifyReminderWrites(options) {
       }
       const beforeMove = structuredClone(state.records.get(childId).fields);
       const move = { listId, ...parentTarget(childId), parentReminder: parentTarget(secondParent) };
+      const beforeMoveRequests = state.requests.length;
       const moved = await invokeSubtask("set_reminder_parent", move);
       assert.equal(moved.record.parentReminderId, secondParent);
-      assert.equal(state.modifies.at(-1).operationCount, 3);
+      assert.equal(state.modifies.at(-1).operationCount, 4);
+      const moveRequests = state.requests.slice(beforeMoveRequests);
+      assert.ok(moveRequests.some(request => request.path.endsWith("/records/query")), "Parent changes inspect the current List.");
+      const exactMoveIds = new Set(moveRequests.filter(request => request.path.endsWith("/records/lookup"))
+        .flatMap(request => request.body.records.map(record => record.recordName)));
+      for (const id of [listId, childId, firstParent, secondParent]) assert.ok(exactMoveIds.has(id), `The exact parent plan resolves ${id}.`);
       for (const [key, value] of Object.entries(beforeMove)) if (!["ParentReminder", "ResolutionTokenMap", "LastModifiedDate"].includes(key)) {
         assert.deepEqual(state.records.get(childId).fields[key], value);
       }
@@ -908,7 +2598,7 @@ export async function verifyReminderWrites(options) {
       assert.equal(replayMove.result.structuredContent.error.code, "CONFLICT");
       const detached = await invokeSubtask("set_reminder_parent", { listId, ...parentTarget(childId), parentReminder: null });
       assert.equal(detached.record.parentReminderId, null);
-      assert.equal(state.modifies.at(-1).operationCount, 2);
+      assert.equal(state.modifies.at(-1).operationCount, 3);
       state.nextModify = "parent-race";
       const beforeRace = structuredClone(state.records.get(childId));
       const raced = await subtaskHarness.mcp("tools/call", { name: "set_reminder_parent", arguments: { listId, ...parentTarget(childId), parentReminder: parentTarget(firstParent) } });
@@ -1043,6 +2733,63 @@ export async function verifyReminderWrites(options) {
       assert.equal(state.records.get(id).fields.IsLinkedToAccount.value, 1);
       assert.equal(state.records.get(id).fields.ShouldAutoCategorizeItems.isEncrypted, true);
       assert.equal(state.records.get(id).fields.Name.isEncrypted, true);
+
+      const firstChildKey = randomUUID(), firstChildArgs = { listId: id, idempotencyKey: firstChildKey, title: "First reminder in a fresh List" };
+      state.records.get(id).fields.SyntheticFutureListField = field("STRING", "preserve-future-list-field");
+      const firstListTokens = JSON.parse(state.records.get(id).fields.ResolutionTokenMap.value);
+      firstListTokens.map.syntheticUnrelatedToken = { counter: 3, modificationTime: 757_382_399, replicaID: "4e6cb834-5b1c-4ce6-8c39-00e752121111" };
+      state.records.get(id).fields.ResolutionTokenMap = field("STRING", JSON.stringify(firstListTokens));
+      const freshListFields = structuredClone(state.records.get(id).fields), beforeFirstChild = state.modifies.length;
+      const firstChild = await callList("create_reminder", firstChildArgs);
+      assert.equal(firstChild.isError, undefined, JSON.stringify(firstChild));
+      assert.equal(firstChild.structuredContent.record.id, `Reminder/${firstChildKey.toUpperCase()}`);
+      assert.equal(firstChild.structuredContent.replayed, false);
+      assert.equal(state.modifies.length, beforeFirstChild + 1);
+      assert.equal(state.modifies.at(-1).operationCount, 2);
+      assert.deepEqual(JSON.parse(state.records.get(id).fields.ReminderIDs.value), [firstChildKey.toUpperCase()]);
+      assert.equal(JSON.parse(state.records.get(id).fields.ResolutionTokenMap.value).map.reminderIDsMergeableOrdering.counter,
+        JSON.parse(freshListFields.ResolutionTokenMap.value).map.reminderIDsMergeableOrdering.counter + 1);
+      assert.deepEqual(JSON.parse(state.records.get(id).fields.ResolutionTokenMap.value).map.syntheticUnrelatedToken,
+        JSON.parse(freshListFields.ResolutionTokenMap.value).map.syntheticUnrelatedToken);
+      for (const [fieldName, fieldValue] of Object.entries(freshListFields)) if (!["ReminderIDs", "ResolutionTokenMap"].includes(fieldName)) {
+        assert.deepEqual(state.records.get(id).fields[fieldName], fieldValue, "Creation preserves unrelated native List fields.");
+      }
+      const afterFirstChildFields = structuredClone(state.records.get(id).fields);
+      assert.equal((await callList("create_reminder", firstChildArgs)).structuredContent.replayed, true);
+      assert.equal(state.modifies.length, beforeFirstChild + 1, "A matching first-child key replays without another POST.");
+      assert.deepEqual(state.records.get(id).fields, afterFirstChildFields, "A matching replay leaves confirmed List membership and tokens unchanged.");
+
+      const lostAckKey = randomUUID(), lostAckArgs = { listId: id, idempotencyKey: lostAckKey, title: "First-child lost acknowledgement" };
+      state.nextModify = "committed-network-drop";
+      const lostAck = await callList("create_reminder", lostAckArgs);
+      assert.equal(lostAck.structuredContent.error.code, "WRITE_OUTCOME_UNKNOWN");
+      const lostAckId = `Reminder/${lostAckKey.toUpperCase()}`;
+      assert.equal(state.records.has(lostAckId), true, "The fake commits before dropping the create acknowledgement.");
+      const exactReadback = await callList("get_reminder", { listId: id, reminderId: lostAckId });
+      assert.equal(exactReadback.isError, undefined, JSON.stringify(exactReadback));
+      assert.equal(exactReadback.structuredContent.record.id, lostAckId);
+      const afterLostAck = state.modifies.length;
+      assert.equal((await callList("create_reminder", lostAckArgs)).structuredContent.replayed, true);
+      assert.equal(state.modifies.length, afterLostAck, "Exact UUID readback makes a lost-ack replay read-only.");
+      assert.deepEqual(JSON.parse(state.records.get(id).fields.ReminderIDs.value), [firstChildKey.toUpperCase(), lostAckKey.toUpperCase()]);
+      assert.equal(JSON.parse(state.records.get(id).fields.ResolutionTokenMap.value).map.reminderIDsMergeableOrdering.counter,
+        JSON.parse(freshListFields.ResolutionTokenMap.value).map.reminderIDsMergeableOrdering.counter + 2);
+      const afterLostAckFields = structuredClone(state.records.get(id).fields);
+      assert.equal(state.records.get(id).fields.SyntheticFutureListField.value, freshListFields.SyntheticFutureListField.value);
+
+      const staleChildKey = randomUUID(), staleChildArgs = { listId: id, idempotencyKey: staleChildKey, title: "Stale List guard" };
+      state.nextModify = "family-list-race";
+      const staleListGuard = await callList("create_reminder", staleChildArgs);
+      assert.equal(staleListGuard.structuredContent.error.code, "CONFLICT");
+      assert.equal(state.records.has(`Reminder/${staleChildKey.toUpperCase()}`), false, "A stale List guard must atomically refuse the create.");
+      assert.deepEqual(state.records.get(id).fields, afterLostAckFields, "A stale List guard does not change membership, tokens or other List fields.");
+
+      state.records.delete(`Reminder/${firstChildKey.toUpperCase()}`);
+      state.records.delete(lostAckId);
+      state.records.get(id).fields = structuredClone(freshListFields);
+      state.records.get(id).recordChangeTag = created.list.recordChangeTag;
+      state.firstChildWritten.delete(id);
+
       const writes = state.modifies.length;
       assert.equal((await callList("create_reminder_list", { name, idempotencyKey: key })).structuredContent.replayed, true);
       assert.equal((await callList("create_reminder_list", { name: "Different", idempotencyKey: key })).structuredContent.error.code, "CONFLICT");
@@ -1050,8 +2797,101 @@ export async function verifyReminderWrites(options) {
       state.omitLookupZoneIds.add(id);
       const exact = (await callList("get_reminder_list", { listId: id })).structuredContent.list;
       assert.equal(exact.id, id); assert.equal(exact.recordChangeTag, created.list.recordChangeTag);
+      const originalList = state.records.get(id);
+      originalList.fields.PinnedDate = field("TIMESTAMP", Date.parse("2030-02-03T04:05:06.000Z"));
+      originalList.fields.FutureAppearanceMetadata = field("STRING", "preserve opaque metadata");
+      const appearanceTokenMap = JSON.parse(originalList.fields.ResolutionTokenMap.value);
+      for (let tokenIndex = 0; tokenIndex < 24; tokenIndex += 1) {
+        const tokenName = `retainedAppearanceReplica${String(tokenIndex).padStart(2, "0")}`;
+        appearanceTokenMap.map[tokenName] = { counter: tokenIndex + 1, modificationTime: 1_700_000_000 + tokenIndex,
+          replicaID: `11111111-2222-4333-8444-${String(tokenIndex + 1).padStart(12, "0")}` };
+      }
+      originalList.fields.ResolutionTokenMap = field("STRING", JSON.stringify(appearanceTokenMap));
+      assert.ok(originalList.fields.ResolutionTokenMap.value.length > 2_048, "The token fixture exercises the full native token-map budget.");
+      const appearanceBefore = (await callList("get_reminder_list_appearance", { listId: id })).structuredContent;
+      assert.deepEqual(appearanceBefore.color, { kind: "default" });
+      assert.deepEqual(appearanceBefore.badge, { kind: "none" });
+      const appearanceArgs = { listId: id, recordChangeTag: appearanceBefore.recordChangeTag, colorPreset: "blue", emoji: "🧭" };
+      state.nextModify = "reorder-list-json-receipt";
+      const beforeAppearanceWrite = state.modifies.length;
+      const appearanceSet = await callList("update_reminder_list_appearance", appearanceArgs);
+      assert.equal(appearanceSet.isError, undefined, JSON.stringify(appearanceSet));
+      assert.deepEqual(appearanceSet.structuredContent.color, { kind: "preset", preset: "blue" });
+      assert.deepEqual(appearanceSet.structuredContent.badge, { kind: "emoji", emoji: "🧭" });
+      assert.equal(state.modifies.length, beforeAppearanceWrite + 1);
+      const updatedAppearanceList = state.records.get(id);
+      assert.deepEqual(JSON.parse(updatedAppearanceList.fields.Color.value), {
+        colorRGBSpace: 2, red: 0, daHexString: "#0088FF", green: 0.5333333333333333, alpha: 1,
+        daSymbolicColorName: "blue", ckSymbolicColorName: "blue", blue: 1,
+      });
+      assert.equal(updatedAppearanceList.fields.BadgeEmblem.value, '{"Emoji" : "🧭"}');
+      assert.deepEqual(updatedAppearanceList.fields.PinnedDate, originalList.fields.PinnedDate);
+      assert.deepEqual(updatedAppearanceList.fields.FutureAppearanceMetadata, originalList.fields.FutureAppearanceMetadata);
+      const beforeAppearanceTokens = JSON.parse(originalList.fields.ResolutionTokenMap.value).map;
+      const afterAppearanceTokens = JSON.parse(updatedAppearanceList.fields.ResolutionTokenMap.value).map;
+      assert.deepEqual(afterAppearanceTokens.reminderIDsMergeableOrdering, beforeAppearanceTokens.reminderIDsMergeableOrdering);
+      for (let tokenIndex = 0; tokenIndex < 24; tokenIndex += 1) {
+        const tokenName = `retainedAppearanceReplica${String(tokenIndex).padStart(2, "0")}`;
+        assert.deepEqual(afterAppearanceTokens[tokenName], beforeAppearanceTokens[tokenName], "Appearance edits preserve extra token replicas.");
+      }
+      assert.equal(afterAppearanceTokens.color.counter, 1); assert.equal(afterAppearanceTokens.badgeEmblem.counter, 1);
+      for (const invalid of [
+        { ...appearanceArgs, colorPreset: "#ff0000" },
+        { ...appearanceArgs, emoji: "shopping" },
+        { ...appearanceArgs, emoji: "🧭🛒" },
+      ]) {
+        const beforeInvalid = state.modifies.length;
+        assert.equal((await callList("update_reminder_list_appearance", invalid)).isError, true);
+        assert.equal(state.modifies.length, beforeInvalid, "Malformed appearance input must not dispatch.");
+      }
+      const staleAppearanceWrites = state.modifies.length;
+      assert.equal((await callList("update_reminder_list_appearance", appearanceArgs)).structuredContent.error.code, "CONFLICT");
+      assert.equal(state.modifies.length, staleAppearanceWrites, "An exact stale appearance request must not be posted.");
+
+      const sharedAppearance = { ...state.records.get(id), share: { recordName: "Share/SYNTHETIC" } };
+      state.records.set(id, sharedAppearance);
+      const appearanceRefusals = state.modifies.length;
+      assert.equal((await callList("update_reminder_list_appearance", { listId: id, recordChangeTag: sharedAppearance.recordChangeTag, colorPreset: "rose" })).isError, true);
+      const unsharedAppearance = { ...sharedAppearance }; delete unsharedAppearance.share; state.records.set(id, unsharedAppearance);
+      state.omitLookupZoneIds.delete(id);
+      state.foreignZoneIds.add(id);
+      assert.equal((await callList("update_reminder_list_appearance", { listId: id, recordChangeTag: sharedAppearance.recordChangeTag, colorPreset: "rose" })).isError, true);
+      state.foreignZoneIds.delete(id);
+      state.omitLookupZoneIds.add(id);
+      const groupAppearance = { ...state.records.get(id), fields: { ...state.records.get(id).fields, IsGroup: field("INT64", 1) } };
+      state.records.set(id, groupAppearance);
+      assert.equal((await callList("update_reminder_list_appearance", { listId: id, recordChangeTag: groupAppearance.recordChangeTag, emoji: "🌱" })).structuredContent.error.code, "UNSUPPORTED_FEATURE");
+      assert.equal(state.modifies.length, appearanceRefusals, "Shared, foreign and group appearances must be refused before dispatch.");
+      const restoredGroup = { ...groupAppearance, fields: { ...groupAppearance.fields, IsGroup: field("INT64", 0) } };
+      const customColor = { type: "STRING", value: '{"colorRGBSpace":2,"red":0.2,"green":0.3,"blue":0.4,"alpha":1,"custom":true}' };
+      restoredGroup.fields.Color = customColor;
+      restoredGroup.recordChangeTag = `${restoredGroup.recordChangeTag}-custom`;
+      state.records.set(id, restoredGroup);
+      const customAppearance = (await callList("get_reminder_list_appearance", { listId: id })).structuredContent;
+      assert.deepEqual(customAppearance.color, { kind: "custom" });
+      const emojiOnly = { listId: id, recordChangeTag: customAppearance.recordChangeTag, emoji: "📌" };
+      state.nextModify = "reorder-color-json";
+      const emojiOnlyReply = await callList("update_reminder_list_appearance", emojiOnly);
+      assert.equal(emojiOnlyReply.isError, undefined, JSON.stringify(emojiOnlyReply));
+      assert.deepEqual(emojiOnlyReply.structuredContent.color, { kind: "custom" });
+      assert.deepEqual(JSON.parse(state.records.get(id).fields.Color.value), JSON.parse(customColor.value));
+      assert.deepEqual(state.records.get(id).fields.PinnedDate, originalList.fields.PinnedDate);
+      assert.deepEqual(state.records.get(id).fields.FutureAppearanceMetadata, originalList.fields.FutureAppearanceMetadata);
+
+      const uncertainAppearanceRead = (await callList("get_reminder_list_appearance", { listId: id })).structuredContent;
+      const uncertainAppearanceArgs = { listId: id, recordChangeTag: uncertainAppearanceRead.recordChangeTag, colorPreset: "rose" };
+      state.nextModify = "committed-network-drop";
+      const beforeUnknownAppearance = state.modifies.length;
+      assert.equal((await callList("update_reminder_list_appearance", uncertainAppearanceArgs)).structuredContent.error.code, "WRITE_OUTCOME_UNKNOWN");
+      assert.equal(state.modifies.length, beforeUnknownAppearance + 1);
+      const reconciledAppearance = (await callList("get_reminder_list_appearance", { listId: id })).structuredContent;
+      assert.deepEqual(reconciledAppearance.color, { kind: "preset", preset: "rose" });
+      const beforeOldAppearanceRetry = state.modifies.length;
+      assert.equal((await callList("update_reminder_list_appearance", uncertainAppearanceArgs)).structuredContent.error.code, "CONFLICT");
+      assert.equal(state.modifies.length, beforeOldAppearanceRetry, "A lost appearance acknowledgement must never replay its old arguments.");
       const original = structuredClone(state.records.get(id));
-      const rename = { listId: id, recordChangeTag: exact.recordChangeTag, name: "Renamed synthetic list" };
+      const currentList = (await callList("get_reminder_list", { listId: id })).structuredContent.list;
+      const rename = { listId: id, recordChangeTag: currentList.recordChangeTag, name: "Renamed synthetic list" };
       const renamed = (await callList("rename_reminder_list", rename)).structuredContent.list;
       assert.equal(renamed.title, rename.name);
       const current = state.records.get(id);
@@ -1144,11 +2984,16 @@ export async function verifyReminderWrites(options) {
       "atomic-guard-fields-session-deadline-and-ready-linked-capability-preserved",
       "permanent-subtask-create-replay-reparent-detach-and-API-output-contracts",
       "subtask-parent-version-race-and-unknown-confirmations-never-retried",
-      "observed-parents-refuse-noncascading-lifecycle-writes",
+      "guarded-family-completion-selective-reopening-and-independent-child-lifecycle",
       "permanent-linked-date-preview-atomic-update-stale-dependency-and-unknown-no-retry",
       "API-linked-zone-change-preserves-instant-and-token-and-unrelated-text-edits",
       "native-standard-list-create-rename-empty-delete-and-unknown-reconciliation",
+      "typed-list-appearance-read-preset-emoji-preservation-and-unknown-no-retry",
       "list-metadata-omissions-completed-items-stale-version-and-owner-group-refusals",
+      "native-URL-tag-retirement-and-retained-expanded-reference-guards",
+      "ordinary-move-membership-parent-and-stale-list-atomic-conflict",
+      "copy-fresh-related-IDs-encrypted-intent-and-lost-ack-no-write-replay",
+      "native-empty-UNKNOWN_LIST-preservation-and-child-transfer-refusal",
     ] };
   } finally {
     if (workerHarness) await workerHarness.worker.dispose();

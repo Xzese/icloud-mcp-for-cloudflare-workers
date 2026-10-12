@@ -11,7 +11,6 @@ import { checkPreparation, createPreparation, preparationContext } from "../remi
 import { AppendJob, CreateJob, GetJob, JobIdentity, JobOutput, JobResult, JOB_LIMITS, PreviewJob, StartJob, type JobItemData } from "./schemas.ts";
 import { isTerminalJob } from "./state.ts";
 import { runJobSlice } from "./runner.ts";
-import { jobExecutionMode } from "./execution.ts";
 
 export const BULK_DELETE_NOTICE = "Bulk deletion soft-deletes each exact reminder version after a fresh subtask check. Parents, subtasks, recurring and alarmed reminders are refused. A subtask added in Apple Reminders after that check cannot be blocked; it is reported afterwards. No cascade or Recently Deleted recovery is promised.";
 const parse = <Schema extends z.ZodTypeAny>(schema: Schema, value: unknown): z.output<Schema> => {
@@ -37,7 +36,6 @@ export class ReminderJobService {
     return { account, generation: saved.fence.generation, expiresAt: saved.session.login.expiresAt };
   }
   async output(job: JobRow, offset = 0, limit = 50, previewToken: string | null = null, previewExpiresAt: number | null = null) {
-    const mode = jobExecutionMode(this.env);
     const items = await this.repository.items(job, offset, limit), counts = await this.repository.counts(job);
     const decoded = await Promise.all(items.map(async item => {
       const value = await this.repository.input(job, item);
@@ -55,11 +53,10 @@ export class ReminderJobService {
     return JobOutput.parse({
       jobId: job.job_id, kind: job.kind, generation: job.generation,
       state: expired ? counts.unknown || counts.dispatching || counts.verifying ? "needs_attention" : "expired" : job.state,
-      executionMode: mode, revision: job.revision, expiresAt: job.expires_at, nextRetryAt: job.next_eligible_at || null,
+      executionMode: "request-driven", revision: job.revision, expiresAt: job.expires_at, nextRetryAt: job.next_eligible_at || null,
       cancellationRequested: !!job.cancel_requested, counts, results, nextOffset: offset + results.length < job.item_count ? offset + results.length : null,
       previewToken, previewExpiresAt, warnings: [
-        mode === "queue" ? "Queue execution starts from the durable outbox, normally within a minute. Authentication pauses and unknown outcomes require review; status reads never execute work." :
-          "Request-driven execution pauses unless continue_reminder_job is called. Status reads never execute work.",
+        "Request-driven execution pauses unless continue_reminder_job is called. Status reads never execute work.",
         "Preview tokens are not authorization. Obtain user approval for the exact sealed manifest.",
         "Cancellation is not rollback; already dispatched operations may still complete.",
         ...(job.kind === "bulk_delete" ? [BULK_DELETE_NOTICE] : ["Creation execution order does not establish Apple's display order."]),
@@ -67,7 +64,6 @@ export class ReminderJobService {
     });
   }
   async create(value: unknown) {
-    jobExecutionMode(this.env);
     const input = parse(CreateJob, value), binding = await this.binding(undefined, input.expectedGeneration);
     await this.repository.expireUndispatched();
     await this.repository.purgeResolvedContent();
@@ -134,7 +130,6 @@ export class ReminderJobService {
     return this.output(sealed, 0, 50, token, expiresAt);
   }
   async start(value: unknown) {
-    jobExecutionMode(this.env);
     const input = parse(StartJob, value), job = await this.repository.get(input.jobId);
     await this.binding(job);
     if (!job.manifest_hash) throw new AppError("CONFLICT", "Seal and review the complete manifest before start.", 409);

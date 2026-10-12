@@ -3,6 +3,7 @@ import { LocationAlarmSummary } from "../reminders/location-alarm.ts";
 import { z } from "zod";
 import { RecurrenceSummary } from "../reminders/recurrence.ts";
 import { SavedListSchema } from "../persistence/apple-sessions.ts";
+import { ListBadgeAppearance, ListColorAppearance } from "../reminders/list-appearance.ts";
 
 const counter = z.number().int().nonnegative().safe();
 const nullableTime = counter.nullable();
@@ -16,7 +17,7 @@ export const ExpectedGenerationInput = counter.optional().describe("Apple sessio
 // material and transport metadata outside the advertised success contracts.
 export const ReminderOutput = z.object({
   id: z.string().describe("Exact reminder ID to retain for subsequent reads and changes."),
-  listId: z.string(),
+  listId: z.string().nullable().describe("Stored List relationship; null for an owned soft-deleted reminder detached by native deletion."),
   title: text,
   notes: text,
   completed: flag,
@@ -64,6 +65,49 @@ export const ReminderLookupOutput = z.object({
   missing: z.boolean().describe("True only when Apple reports the exact item absent. A soft-deleted item may instead be returned with record.deleted=true."),
 }).strict();
 
+export const ReminderOrganizationOutput = z.object({
+  generation: counter, reminderId: z.string(), recordChangeTag: z.string(),
+  url: z.object({ id: z.string(), url: z.string() }).strict().nullable(),
+  tags: z.array(z.object({ id: z.string(), name: z.string() }).strict()),
+  otherAttachmentIds: z.array(z.string()).describe("Opaque IDs of attachments that are preserved; their contents are not exposed."),
+}).strict();
+
+export const ShoppingCategoriesOutput = z.object({
+  generation: counter,
+  listId: z.string(),
+  listRecordChangeTag: z.string(),
+  locale: text,
+  categories: z.array(z.object({
+    categoryId: z.string(),
+    name: z.string(),
+    canonicalName: text,
+    recordChangeTag: z.string(),
+  }).strict()),
+  memberships: z.array(z.object({ reminderId: z.string(), categoryId: z.string() }).strict()),
+  orderedCategoryIds: z.array(z.string()),
+  complete: z.boolean(),
+  paginationComplete: z.boolean(),
+  continuation: z.string().uuid().nullable(),
+  pendingReason: z.enum(["continuation"]).nullable(),
+  pagesRead: counter,
+  writesEnabled: z.boolean(),
+}).strict();
+
+export const ShoppingCategoryMutationOutput = z.object({
+  generation: counter,
+  operation: z.literal("set_category"),
+  listId: z.string(),
+  listRecordChangeTag: z.string(),
+  category: z.object({
+    categoryId: z.string(),
+    name: z.string(),
+    canonicalName: text,
+    recordChangeTag: z.string(),
+  }).strict(),
+  record: ReminderOutput,
+  writesEnabled: z.literal(true),
+}).strict();
+
 export const AllOpenOutput = z.object({
   generation: counter,
   records: z.array(ReminderOutput),
@@ -81,7 +125,23 @@ export const AllOpenOutput = z.object({
   writesEnabled: z.boolean(),
 }).strict();
 
-export function MutationOutput(action: "create" | "update" | "complete" | "reopen" | "delete" | "create_subtask" | "set_parent") {
+export const ReminderSearchOutput = z.object({
+  generation: counter,
+  records: z.array(ReminderOutput),
+  recordErrors: z.array(recordError),
+  complete: z.boolean().describe("True only after every page in the selected owned private lists finished without errors."),
+  paginationComplete: z.boolean(),
+  continuation: z.string().uuid().nullable().describe("Single-use, ten-minute owner/account/session-bound continuation. Repeat the same filters and use the newly returned token."),
+  pendingReason: text,
+  progress: z.object({ listsTotal: counter, listsCompleted: counter, pagesRead: counter, totalPages: counter, currentListId: text }).strict(),
+  freshness,
+  source: z.literal("direct-cloudkit-query"),
+  scope: z.literal("search-reminders"),
+  consistency: z.literal("live-pages-not-snapshot").describe("Each page is current when fetched; reminders can change between pages."),
+  writesEnabled: z.boolean(),
+}).strict();
+
+export function MutationOutput(action: "create" | "update" | "complete" | "reopen" | "delete" | "create_subtask" | "set_parent" | "set_url" | "set_tags" | "move" | "copy") {
   const result = z.object({
     generation: counter,
     operation: z.literal(action),
@@ -89,7 +149,11 @@ export function MutationOutput(action: "create" | "update" | "complete" | "reope
     record: ReminderOutput,
     writesEnabled: z.literal(true),
   }).strict();
-  return action === "create" || action === "create_subtask" ? result.extend({ idempotencyKey: z.string().uuid() }).strict() : result;
+  if (action === "complete" || action === "reopen" || action === "delete") return result.extend({
+    ...(action === "complete" ? { completedOccurrence: ReminderOutput.optional().describe("Fresh completed history when recurrence advances. Absent for ordinary completion or when a supported ended daily/weekly recurrence completes its final active occurrence in place.") } : {}),
+    affectedRecords: z.array(ReminderOutput).max(31).describe("Reminder records mutated atomically, including a root touched by direct child deletion. Unchanged family members are version guarded.").optional(),
+  }).strict();
+  return action === "create" || action === "create_subtask" || action === "copy" ? result.extend({ idempotencyKey: z.string().uuid() }).strict() : result;
 }
 
 export const ExactListOutput = z.object({
@@ -108,6 +172,15 @@ export const ListMutationOutput = z.object({
   }).strict(),
   writesEnabled: z.literal(true),
   idempotencyKey: z.string().uuid().optional(),
+}).strict();
+
+const listAppearance = { color: ListColorAppearance, badge: ListBadgeAppearance };
+export const ListAppearanceOutput = z.object({
+  generation: counter, listId: z.string(), recordChangeTag: z.string(), ...listAppearance,
+}).strict();
+export const ListAppearanceMutationOutput = z.object({
+  generation: counter, operation: z.literal("update"), listId: z.string(), recordChangeTag: z.string(),
+  ...listAppearance, writesEnabled: z.literal(true),
 }).strict();
 
 export const ConnectionStatusOutput = z.object({
@@ -138,13 +211,15 @@ export const ConnectionStatusOutput = z.object({
   phase: z.enum(["read-only", "read-write"]),
   capabilities: z.object({
     liveRead: z.boolean(), controlledRead: z.boolean(), listReminders: z.boolean(),
-    allOpenReminders: z.boolean(), search: z.literal(false), create: z.boolean(),
+    allOpenReminders: z.boolean(), search: z.boolean(), create: z.boolean(),
     update: z.boolean(), complete: z.boolean(), reopen: z.boolean(), delete: z.boolean(),
     prepareUpdate: z.boolean(), linkedScheduling: z.boolean(), reminderJobs: z.boolean(),
-    bulkCreate: z.boolean(), bulkDelete: z.boolean(), autonomousJobs: z.boolean(),
-    jobExecutionMode: z.enum(["request-driven", "queue"]),
-    subtasks: z.boolean(),
+    bulkCreate: z.boolean(), bulkDelete: z.boolean(), autonomousJobs: z.literal(false),
+    jobExecutionMode: z.literal("request-driven"),
+    subtasks: z.boolean(), urls: z.boolean(), tags: z.boolean(), moveCopy: z.boolean(),
     createList: z.boolean(), renameList: z.boolean(), deleteList: z.boolean(),
+    listAppearanceRead: z.boolean(), listAppearanceUpdate: z.boolean(),
+    shoppingCategoriesRead: z.boolean().optional(), shoppingCategoriesUpdate: z.boolean().optional(),
   }).strict(),
   mcpTools: z.array(z.string()),
   message: z.string(),
