@@ -20,6 +20,11 @@ Do not push the generated checkout or its Git history to a public source reposit
 
 ## Verification
 
-Use `npm run typecheck`, `npm test`, `npm run public-config:check`, `npm run build`,
+Use `npm run lint`, `npm run typecheck`, `npm test`, `npm run public-config:check`, `npm run build`,
 `npm run test:worker` and `npm run verify:artifact`. Use `npm run build:check` for the standalone
 Cloudflare bundle. Keep real Apple credentials and reminder contents out of test fixtures.
+
+Before pushing, also run the Git-history secret scan with the CI-pinned Gitleaks version.
+Generate synthetic idempotency keys at runtime where possible. Historical false positives
+require evidence and exact rule/path/value exceptions; do not exclude whole test files or
+disable default secret rules. Keep scan output redacted.

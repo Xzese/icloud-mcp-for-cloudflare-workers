@@ -1,6 +1,6 @@
 // Adapted from @openai/sites-vite-plugin 0.2.0 (openai/sites#9).
 // See sites-vite-plugin.LICENSE for the upstream MIT license.
-import { access, cp, mkdir, rm } from "node:fs/promises";
+import { access, cp, mkdir, readdir, rm } from "node:fs/promises";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { resolve } from "node:path";
 import type { Plugin } from "vite";
@@ -175,18 +175,19 @@ export function sites({ mockAuth = true } = {}): Plugin {
 
       const outputDirectory = resolve(root, "dist", ".openai");
       const hostingConfig = resolve(root, ".openai", "hosting.json");
-      const schemaSource = resolve(root, "schema.sql");
+      const migrationsDirectory = resolve(root, "migrations");
 
       await rm(outputDirectory, { recursive: true, force: true });
       await mkdir(outputDirectory, { recursive: true });
 
       await cp(hostingConfig, resolve(outputDirectory, "hosting.json"));
-      if (await exists(schemaSource)) {
-        // Sites consumes SQL initialization through this package layout. The
-        // current schema is the sole source; no ORM or historical files needed.
+      if (await exists(migrationsDirectory)) {
+        // Applied Sites migrations are immutable. Package the original
+        // initializer and every additive migration under their stable names.
         const schemaDirectory = resolve(outputDirectory, "drizzle");
         await mkdir(schemaDirectory, { recursive: true });
-        await cp(schemaSource, resolve(schemaDirectory, "0000_schema.sql"));
+        const migrations = (await readdir(migrationsDirectory)).filter(file => /^\d{4}_[a-z0-9_]+\.sql$/.test(file)).sort();
+        for (const file of migrations) await cp(resolve(migrationsDirectory, file), resolve(schemaDirectory, file));
       }
     },
   };

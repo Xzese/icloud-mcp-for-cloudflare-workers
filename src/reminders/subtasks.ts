@@ -1,6 +1,6 @@
 import { z } from "zod";
 import { AppError } from "../errors.ts";
-import { CloudKitRateLimitedError, normalizeReminder, type CloudKitRecord, type CloudKitRemindersClient } from "../icloud/cloudkit.ts";
+import { CloudKitRateLimitedError, normalizeList, normalizeReminder, type CloudKitRecord, type CloudKitRemindersClient } from "../icloud/cloudkit.ts";
 import { jsonBytes } from "../lib/canonical.ts";
 import { omitField } from "../lib/omit-field.ts";
 import { CreateReminderInput, ReminderTargetInput, assertOwnedReminder, buildCreateReminder, updateResolutionTokenMap, type CloudKitWriteRecord } from "./writes.ts";
@@ -28,7 +28,7 @@ function requireSimple(record: CloudKitRecord, listId: string, owner: string) {
   return reminder;
 }
 
-function requireNoReadErrors(errors: { serverErrorCode: string }[]) {
+export function requireNoReadErrors(errors: { serverErrorCode: string }[]) {
   for (const error of errors) {
     const code = error.serverErrorCode.toUpperCase();
     if (["AUTHENTICATION_REQUIRED", "NOT_AUTHENTICATED", "INVALID_AUTH_TOKEN", "AUTHENTICATION_FAILED"].includes(code)) {
@@ -40,25 +40,38 @@ function requireNoReadErrors(errors: { serverErrorCode: string }[]) {
   if (errors.length) throw new AppError("UNSUPPORTED_FEATURE", "The relationship inspection returned record errors; no mutation was dispatched.");
 }
 
-/** Complete bounded scan of one list, returning every nondeleted parent ID and its nondeleted child IDs. */
-export async function listChildren(client: Pick<CloudKitRemindersClient, "queryRemindersPage">, owner: string, listId: string): Promise<Map<string, string[]>> {
+async function scanListReminders(client: Pick<CloudKitRemindersClient, "queryRemindersPage">, owner: string, listId: string): Promise<CloudKitRecord[]> {
   let continuation: string | null = null, bytes = 0, count = 0;
-  const seen = new Set<string>(), children = new Map<string, string[]>();
+  const seen = new Set<string>(), remindersSeen = new Set<string>(), reminders: CloudKitRecord[] = [];
   for (let index = 0; index < 5; index++) {
     const page = await client.queryRemindersPage({ listId, includeCompleted: true, limit: 200, continuation });
     requireNoReadErrors(page.recordErrors);
     for (const record of page.records) {
       bytes += jsonBytes(record);
       if (bytes > 262_144 || ++count > 1000) throw new AppError("UNSUPPORTED_FEATURE", "The complete child check exceeds its inspection budget.");
+      if (record.recordName.startsWith("Reminder/")) {
+        if (remindersSeen.has(record.recordName)) throw new AppError("PROTOCOL_CHANGED", "The child check returned a duplicate reminder identity.");
+        remindersSeen.add(record.recordName);
+      }
+      if ("recordType" in record) {
+        assertOwnedReminder(record, owner);
+        // reminderList is a compound query: linked scheduling/organization
+        // records may repeat across pages. They consume the full scan budget
+        // but have no role in discovering ParentReminder relationships.
+        if (["Alarm", "AlarmTrigger", "RecurrenceRule", "Attachment", "Hashtag"].includes(record.recordType)) continue;
+      }
       if ("recordType" in record && record.recordType === "Reminder" && !record.deleted) {
+        if (Object.keys(record.fields).some(field => /parent|child|subtask/i.test(field) && field !== "ParentReminder")) {
+          throw new AppError("UNSUPPORTED_FEATURE", "Unknown relationship fields prevent a complete child inspection.");
+        }
         const reminder = normalizeReminder(record, owner);
         if (reminder.listId !== listId) throw new AppError("PROTOCOL_CHANGED", "The child check returned a reminder from another list.");
-        if (reminder.parentReminderId && reminder.deleted !== true) children.set(reminder.parentReminderId, [...children.get(reminder.parentReminderId) ?? [], record.recordName]);
-      }
+        if (reminder.deleted !== true) reminders.push(record);
+      } else if (!record.deleted) throw new AppError("PROTOCOL_CHANGED", "The child check returned an unexpected record type.");
     }
     if (page.paginationComplete) {
       if (!page.complete) throw new AppError("UNSUPPORTED_FEATURE", "The child check is incomplete; no mutation was dispatched.");
-      return children;
+      return reminders;
     }
     if (!page.continuation || seen.has(page.continuation)) throw new AppError("PROTOCOL_CHANGED", "The child-check continuation did not advance.");
     continuation = page.continuation; seen.add(continuation);
@@ -66,13 +79,76 @@ export async function listChildren(client: Pick<CloudKitRemindersClient, "queryR
   throw new AppError("UNSUPPORTED_FEATURE", "The child check did not finish; absence of descendants is not established.");
 }
 
-export const HAS_SUBTASKS_MESSAGE = "This reminder has subtasks. Moving a parent, descendant cascades and parent lifecycle actions are unsupported.";
-export async function requireNoChildren(client: Pick<CloudKitRemindersClient, "queryRemindersPage">, owner: string, listId: string, reminderId: string) {
-  if ((await listChildren(client, owner, listId)).has(reminderId)) throw new AppError("UNSUPPORTED_FEATURE", HAS_SUBTASKS_MESSAGE);
+function childRelationships(records: CloudKitRecord[], owner: string) {
+  const children = new Map<string, string[]>();
+  for (const record of records) {
+    const parent = normalizeReminder(record, owner).parentReminderId;
+    if (parent) children.set(parent, [...children.get(parent) ?? [], record.recordName]);
+  }
+  return children;
+}
+
+/** Query-only discovery; mutation inspection also resolves the native inventory below. */
+export async function listChildren(client: Pick<CloudKitRemindersClient, "queryRemindersPage">, owner: string, listId: string) {
+  return childRelationships(await scanListReminders(client, owner, listId), owner);
+}
+
+/** Resolve query and native membership identities exactly, without trusting index freshness. */
+export async function inspectListChildren(client: Pick<CloudKitRemindersClient, "lookup" | "queryRemindersPage">,
+  owner: string, list: CloudKitRecord): Promise<Map<string, string[]>> {
+  assertOwnedReminder(list, owner);
+  const snapshot = normalizeList(list);
+  if (list.deleted || snapshot.deleted !== false || snapshot.isGroup === true || !list.recordChangeTag ||
+    snapshot.reminderIds === null || new Set(snapshot.reminderIds).size !== snapshot.reminderIds.length) {
+    throw new AppError("UNSUPPORTED_FEATURE", "Relationship inspection requires an exact live List with explicit, unambiguous membership.");
+  }
+  const queried = await scanListReminders(client, owner, list.recordName);
+  const queryIds = new Set(queried.map(record => record.recordName));
+  const ids = [...new Set([...queryIds, ...snapshot.reminderIds])];
+  if (ids.length > 1000) throw new AppError("UNSUPPORTED_FEATURE", "The exact membership check exceeds its inspection budget.");
+  const exact: CloudKitRecord[] = [];
+  let bytes = 0;
+  for (let start = 0; start < ids.length; start += 200) {
+    const batch = ids.slice(start, start + 200), found = await client.lookup(batch);
+    const missing = found.recordErrors.filter(error => error.serverErrorCode.toUpperCase() === "NOT_FOUND" &&
+      error.recordName !== null && batch.includes(error.recordName));
+    requireNoReadErrors(found.recordErrors.filter(error => !missing.includes(error)));
+    const answers = [...found.records.map(record => record.recordName), ...missing.map(error => error.recordName!)];
+    if (found.unresolvedRecordNames.length || answers.length !== batch.length || new Set(answers).size !== batch.length ||
+      answers.some(id => !batch.includes(id)) || !found.complete && missing.length === 0) {
+      throw new AppError("CONFLICT", "Every membership identity must resolve before relationship planning.", 409);
+    }
+    // Native ordering can retain retired IDs; definite absence is safe only for those entries.
+    if (missing.some(error => queryIds.has(error.recordName!))) {
+      throw new AppError("CONFLICT", "A queried reminder disappeared during relationship inspection.", 409);
+    }
+    for (const record of found.records) {
+      bytes += jsonBytes(record);
+      if (bytes > 262_144) throw new AppError("UNSUPPORTED_FEATURE", "The exact membership check exceeds its inspection budget.");
+      if (record.deleted) continue;
+      if (!("recordType" in record) || record.recordType !== "Reminder") throw new AppError("PROTOCOL_CHANGED", "The membership lookup returned an unexpected record type.");
+      assertOwnedReminder(record, owner);
+      const reminder = normalizeReminder(record, owner, true);
+      if (reminder.deleted === true) continue;
+      if (reminder.deleted !== false || reminder.listId !== list.recordName || !record.recordChangeTag) {
+        throw new AppError("CONFLICT", "The exact live membership changed or could not be established.", 409);
+      }
+      if (Object.keys(record.fields).some(field => /parent|child|subtask/i.test(field) && field !== "ParentReminder")) {
+        throw new AppError("UNSUPPORTED_FEATURE", "Unknown relationship fields prevent complete membership inspection.");
+      }
+      exact.push(record);
+    }
+  }
+  return childRelationships(exact, owner);
+}
+
+export const HAS_SUBTASKS_MESSAGE = "This reminder has subtasks. Moving or deleting a parent is unsupported.";
+export async function requireNoChildren(client: Pick<CloudKitRemindersClient, "lookup" | "queryRemindersPage">, owner: string, list: CloudKitRecord, reminderId: string) {
+  if ((await inspectListChildren(client, owner, list)).has(reminderId)) throw new AppError("UNSUPPORTED_FEATURE", HAS_SUBTASKS_MESSAGE);
 }
 
 export async function subtaskParents(client: Pick<CloudKitRemindersClient, "lookup" | "queryRemindersPage">,
-  owner: string, listId: string, current: CloudKitRecord | null, parent: z.infer<typeof ParentReminderInput> | null) {
+  owner: string, listId: string, current: CloudKitRecord | null, parent: z.infer<typeof ParentReminderInput> | null, list: CloudKitRecord) {
   const target = current ? requireSimple(current, listId, owner) : null;
   if (parent?.reminderId === current?.recordName) throw new AppError("VALIDATION_ERROR", "A reminder cannot be its own parent.", 400);
   if (target && target.parentReminderId === (parent?.reminderId ?? null)) throw new AppError("VALIDATION_ERROR", "The requested parent relationship is already present.", 400);
@@ -95,7 +171,7 @@ export async function subtaskParents(client: Pick<CloudKitRemindersClient, "look
       parents.push({ ...record, zoneID: record.zoneID ?? { zoneName: "Reminders", ownerRecordName: owner } });
     }
   }
-  if (current) await requireNoChildren(client, owner, listId, current.recordName);
+  if (current) await requireNoChildren(client, owner, list, current.recordName);
   return parents;
 }
 

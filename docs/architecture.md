@@ -95,11 +95,10 @@ using the same UUID. Successful mutations invalidate an unfinished all-open cont
 cannot silently skip a newly created item in a previously scanned list. See `write-access.md`.
 
 `src/jobs/` uses a durable owner/account/generation-bound ledger, immutable sealed manifests,
-CAS account/job leases and bounded authenticated continuation by default on **both** targets.
-The standalone entrypoint additionally supports an opt-in Queue consumer and one-minute durable
-outbox pump; Sites does not expose these handlers. Opaque message hints never establish owner
-authority and are acknowledged only after durable progress/next delivery. Status does not execute
-work. Queue mode requires verified private bindings. Simple bulk creation is a permanent
+CAS account/job leases and bounded authenticated continuation on **both** targets.
+Both entrypoints expose request handling only; no Queue consumer or scheduled outbox pump
+exists. Only an authenticated continuation runs a slice. Status and start requests do not
+execute work. Simple bulk creation is a permanent
 ready-account capability once the job schema is installed;
 simple bulk deletion reuses the single-delete checks per item, with a read-only preview preflight and post-commit subtask report.
 Recovered dispatch intent is read-only reconciled and stays unknown without a valid receipt.
@@ -137,9 +136,13 @@ Creation keeps CloudKit ownership under the List and writes `ParentReminder` ind
 Movement changes only that reference and its modification tokens. Affected Reminder parents
 are protected by exact-version marker guards in the same atomic group. Guard confirmations
 must preserve their complete fields. The simple bulk-create schema is unchanged.
-Observed parents are refused by lifecycle actions; bounded inspections do not establish
-general protection against unreferenced new-child races; bulk deletion therefore rescans after commit
-and reports remaining subtasks instead of claiming prevention.
+Creation atomically appends the new identity to native List ordering before creating the
+Reminder; subtask creation also guards its root. Relationship changes guard the full List
+and affected roots. Family and childless inspection resolve the union of queried and native
+ordering identities through bounded exact lookups, covering query-index lag before the first
+read as well as stale versions after inspection. Bulk deletion refuses discovered parents
+and rescans after commit to report remaining subtasks. These protections cover the established
+membership recipes; they do not invent a universal native predicate for unreferenced additions.
 
 The provenance directory preserves upstream references and licenses. Checked-in synthetic fixtures
 exercise the pinned protocol reference, not a live Apple account. See SECURITY.md for invariants

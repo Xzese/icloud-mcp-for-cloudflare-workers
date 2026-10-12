@@ -1,11 +1,11 @@
 # Durable reminder jobs
 
-Jobs are **request-driven by default on both Cloudflare Workers and ChatGPT Sites**.
-Starting a job saves its reviewed manifest and outbox eligibility in D1. Sites uses authenticated
-continuations; standalone Workers can opt into the Queue adapter described below. Status GETs
-never dispatch, renew Apple credentials, schedule a timer or execute through `waitUntil`.
-`executionMode` and `connection_status` describe the actual configured mode. Sites cannot
-enable Queue mode: its entrypoint does not expose a consumer.
+Jobs are **request-driven on both Cloudflare Workers and ChatGPT Sites**. No Cloudflare
+Queue, consumer binding or cron runner is required or supported. Starting a job saves its
+reviewed manifest and authorization in D1; only authenticated `continue_reminder_job` calls
+execute bounded slices. Status GETs never dispatch, renew Apple credentials, schedule a timer
+or execute through `waitUntil`. `executionMode` and `connection_status` always report
+`request-driven`, and `autonomousJobs` is false.
 
 **Initial support:** current simple-reminder bulk creation is a permanent connected-account
 capability once the additive job schema is installed. No feature flag or extra approval
@@ -13,11 +13,12 @@ setting is required; the authenticated owner still reviews and authorizes each e
 Simple bulk deletion is also permanent. Preview performs a read-only preflight of every target:
 missing or already-deleted, stale-tag, duplicate, recurring, alarmed, nested and parent reminders
 (one complete subtask scan per list) fail before sealing and are never dispatched. Execution sends
-each remaining item through the single-item delete path, which repeats the exact lookup and subtask
-scan immediately before one exact-version soft-delete. It never cascades.
+each remaining item through the single-item delete path, which repeats exact lookup and complete
+family inspection before a version-guarded native soft-delete. The final plan must still contain
+only the approved root; a newly discovered family is rejected rather than cascaded.
 
-Apple offers no observed commit-time predicate for "has no children", so a subtask attached in
-Apple Reminders between the final scan and the commit cannot be blocked. A read-only rescan after
+The transaction guards the root and List. Observed native child attachments advanced those
+versions, but a universal native predicate for "has no children" remains unproven. A read-only rescan after
 each confirmed deletion reports it as `SUBTASKS_REMAIN` (or `SUBTASK_CHECK_INCOMPLETE` when the
 rescan fails) on the succeeded item. A lost acknowledgement stays `unknown`; read-only
 reconciliation reports whether the target is deleted, never replays and never claims who deleted it.
@@ -61,7 +62,7 @@ constitute authorization. Start does not execute Apple writes.
 Each continuation selects at most three items in original ordinal order and within a bounded
 slice deadline. Results include the stable client key, approved input/target, status,
 attempts, sanitized code/recovery message and separate `operationConfirmed` /
-`desiredStateObserved` flags. Counts come from durable states, not incremented queue totals.
+`desiredStateObserved` flags. Counts come from durable item states.
 Mixed failures finish as `completed_with_errors`, never `completed`.
 Execution order does not promise Apple-app display ordering.
 
@@ -111,7 +112,8 @@ generation reauthorization is not implemented. Status/cancel remain available wi
 
 `migrations/0001_reminder_jobs.sql` is additive. Fresh installs use the matching `schema.sql`.
 The tables are jobs, items, chunk receipts, account-scoped replay reservations, account
-leases/cooldowns and outbox eligibility. Owner-scoped reads always use the authenticated
+leases/cooldowns. The immutable original migration also retains a historical outbox table;
+current execution does not read or write it. Owner-scoped reads always use the authenticated
 deployment owner before database access. Item content, target IDs, generated mutations and
 detailed results use the existing AES-GCM primitives with a separate job/item/field AAD context.
 The Apple session envelope schema and rows are unchanged.
@@ -122,8 +124,11 @@ Apply the additive migration to an existing standalone database, using private o
 npx wrangler d1 execute icloud-reminders --remote --config wrangler.production.toml --file migrations/0001_reminder_jobs.sql
 ```
 
-For Sites, preserve the exact ignored Site binding, use the native source workflow, regenerate
-with `npm run sites:prepare`, and verify application of the additive packaged schema to its
+For Sites, the build packages the unchanged original `migrations/0000_schema.sql` and
+additive `migrations/0001_reminder_jobs.sql` under `dist/.openai/drizzle`. Later schema changes
+append new migration files; changing an already-applied initializer does not install new
+tables. Preserve the exact ignored Site binding, use the native source workflow, regenerate
+with `npm run sites:prepare`, and verify application of the pending additive migration to its
 existing D1 before using bulk creation. Never reset D1, overwrite an Apple session,
 replace the Site or publish generated private source history.
 
@@ -146,59 +151,35 @@ same state before launching; build the current checkout first and retain the ori
 session generation and fixed expiry. Only separately authorized synthetic test-list
 reminders may be mutated.
 
-To stop new dispatches, cancel undispatched authorized jobs and stop continuation automation
-or Queue delivery. Preserve all tables, receipts, encryption keys and Apple session state, and keep
+To stop new dispatches, cancel undispatched authorized jobs and stop continuation calls. Preserve all tables, receipts, encryption keys and Apple session state, and keep
 a compatible status/reconciliation reader. Do not drop/reset storage or disconnect as rollback.
 Slice logs contain only event name, processed count and state, not reminder text, raw Apple
 responses, credentials, cookies or full IDs.
 
 Synthetic SQLite and built-Worker checks cover duplicate/chunk handling, bounded execution,
-encrypted storage, cancellation, version/session fencing and lost acknowledgements. Linked
-scheduling evidence and autonomous adapters remain release requirements; the Queue adapter requires operator binding verification before deployment, while
-linked writes remain blocked as described in [the protocol evidence gate](linked-record-protocol.md).
+encrypted storage, cancellation, version/session fencing and lost acknowledgements. Supported linked scheduling recipes require the separate native evidence and checks described
+in [the protocol evidence gate](linked-record-protocol.md).
 
-## Optional standalone Queue execution
+## Queue-free operation and upgrades
 
-The standalone entrypoint exports a Queue consumer and a dedicated outbox recovery handler.
-The runner, ledger, encryption and account/session fences are identical to continuation mode.
-Messages contain only a job UUID and revision hint, never owner authority, target IDs or text.
-Duplicate/stale messages reload the ledger; confirmed writes cannot be resubmitted.
-Only runnable states execute. Authentication pauses and unknown outcomes require explicit review.
-Cancellation, expiry, account cooldown and live leases are honored.
+After reviewing and starting the exact manifest, call `continue_reminder_job` until the job
+is terminal or needs attention. Each call processes at most three items. Respect `nextRetryAt`
+before another call; review authentication pauses and unknown outcomes instead of blindly
+retrying. `get_reminder_job` only reads progress. If continuation calls stop, the durable job
+waits without executing Apple writes. The API state `queued` means authorized work waiting
+for a continuation, not an external Cloudflare Queue.
 
-After a slice, progress and the next outbox request are persisted before sending the next message
-and acknowledging the current delivery. Send failures, exhausted delivery retries or a lost
-acknowledgement leave D1 recovery authority intact. A one-minute scheduled pump sends at most five
-due owner-scoped requests, with a two-minute recovery spacing after successful delivery.
-This schedule processes only job outbox rows; it does not revive retired catalogue work or renew
-sessions. Queue mode is an operational delivery setting, not user authorization.
+Both deployment entrypoints expose request handling only. Standalone configuration generation
+rejects Queue producers/consumers, cron schedules and the retired `REMINDER_JOB_EXECUTION_MODE`
+/ `REMINDER_JOB_QUEUE_NAME` variables. Remove any legacy delivery bindings and schedules from
+private operator configuration before building an upgraded standalone deployment.
 
-Provision a Queue in the existing Cloudflare account and verify its producer/consumer bindings
-and the deployed standalone entrypoint before enabling `REMINDER_JOB_EXECUTION_MODE=queue-v1`.
-Keep identifiers in **ignored `wrangler.production.toml`**, not the checked-in template. Within
-its existing `[vars]`, set the mode and exact `REMINDER_JOB_QUEUE_NAME`. Then add:
-
-```toml
-[[queues.producers]]
-binding = "REMINDER_JOB_QUEUE"
-queue = "your-private-reminder-job-queue"
-
-[[queues.consumers]]
-queue = "your-private-reminder-job-queue"
-max_batch_size = 1
-max_batch_timeout = 1
-max_concurrency = 1
-max_retries = 5
-
-[triggers]
-crons = ["* * * * *"]
-```
-
-The Queue name must exactly match the variable. Configuration generation rejects missing,
-mismatched or unbounded bindings and unrelated schedules. No Queue is provisioned or deployed
-automatically. No bulk-creation feature flag is required. Rollback clears the
-delivery mode and removes only these job bindings/schedule; retain D1 and use authenticated
-continuation/status/reconciliation. The outbox survives a switch back to request-driven mode.
+The existing job, receipt, session and authorization data remain intact. Previously started
+jobs can use authenticated continuations under their original account/session fences; ambiguous
+dispatches still reconcile through reads without replay. The original SQL migrations and
+historical `reminder_job_outbox` table remain unchanged for upgrade compatibility, but runtime
+job availability and execution do not depend on that table. Do not reset D1, remove receipts
+or replace a session as part of removing Queue configuration.
 
 On 10 October 2026, the current build also passed authenticated local draft/chunk replay,
 changed-replay conflict, complete manifest preview with live exact-list validation,
@@ -232,5 +213,36 @@ one subtask. A four-item bulk-delete preview refused exactly the stale-tag and p
 `completed_with_errors`, and a further continuation sent nothing. Exact readback showed both refused
 targets and the subtask unchanged. Cleanup detached and deleted the rest individually. Exactly 11
 modify requests were observed (4 creates, 1 subtask, 2 bulk deletes, 4 cleanup), and the session
-generation and fixed expiry were preserved. The Apple app was not visually inspected. The standalone Queue adapter is
-covered by synthetic D1 and exact built-workerd producer/consumer tests, not a live deployment.
+generation and fixed expiry were preserved. The Apple app was not visually inspected.
+The former standalone Queue adapter was covered by synthetic tests and was never deployed
+for this acceptance; it has now been removed. Current standalone integration exercises the
+authenticated request-driven start/status/continuation, replay and cancellation journey.
+
+
+On 12 October 2026, the Queue-free implementation passed all 186 unit tests, TypeScript,
+lint, public configuration validation, Sites and standalone Cloudflare builds, built-Worker
+and local integration, artifact verification and the CI-pinned full-history secret scan.
+The standalone Access-authenticated journey verified that preview, start and status do not
+write, continuations process three then one item, completed continuation replay is inert,
+and cancellation/session expiry fence dispatch. A synthetic database with the historical
+outbox table absent also completed the request-driven journey. An independent review found
+no actionable issues. All four [runtime CI jobs passed](https://github.com/Xzese/icloud-reminders-mcp-for-cloudflare-workers/actions/runs/38300871428).
+
+Hosted version 47 then passed a live four-item creation and deletion journey through the
+normal installed MCP tools and Apple Reminders. The connection reported
+`jobExecutionMode=request-driven` and `autonomousJobs=false`. After starting creation,
+status showed four pending items with zero attempts and Reminders showed the disposable
+List empty. The first continuation succeeded for three items and left the fourth pending;
+a subsequent status read and native display confirmed that pause. The second continuation
+completed the fourth. A completed continuation replay returned the identical ledger, and
+fresh exact-ID reads confirmed all four synthetic records. Reminders displayed all four.
+
+Using fresh exact versions, a separate bulk-delete manifest previewed and started with all
+four items pending. Its first continuation soft-deleted three, leaving one visible in
+Reminders; its second completed the fourth. Completed replay again returned an identical
+ledger. Exact Apple readbacks confirmed all four soft-deleted records, and Reminders showed
+the List empty. The normal exact-version empty-List deletion then retired that disposable
+List; an exact read and the native sidebar confirmed cleanup. Recently Deleted was not
+purged. The existing private audience, runtime environment revision, Apple session generation
+and absolute expiry were preserved. This acceptance covers request-driven bulk execution;
+it does not extend Shopping classification or other native capability boundaries.

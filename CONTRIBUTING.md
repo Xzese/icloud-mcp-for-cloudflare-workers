@@ -42,6 +42,13 @@ The last command checks the standalone bundle without deploying it. Run `npm run
 before using the Sites/local live runner. Follow the README for each deployment's separate
 identity and provisioning requirements.
 
+Run the CI-pinned Gitleaks version against the public history before pushing. For a checkout
+with local orchestration/checkpoint refs, scan `HEAD` and the public remote refs rather than
+those private refs: `gitleaks git . --log-opts='--remotes=origin HEAD' --redact=100 --no-banner`.
+Use runtime-generated UUIDs for synthetic idempotency keys where possible, retaining each
+key throughout its test. Any historical false-positive exception must identify the invented
+value, exact file and rule; default secret detection stays enabled.
+
 MCP tool names, schemas, annotations, continuations and structured outputs are public interfaces.
 Changes should be intentional, documented and covered by representative behavioural tests.
 Preserve generation fencing, encrypted owner-bound storage, request bounds and fail-closed
@@ -51,7 +58,8 @@ authentication incidentally. Use only synthetic write responses in CI; live vali
 a dedicated test reminder and explicit operator opt-in.
 
 Keep the current database definition in `schema.sql` and use native D1 prepared statements.
-Local setup and tests execute that file; the Sites build packages the same SQL for initialization.
+Local setup uses that file. Sites packages the immutable numbered SQL history from `migrations/`;
+append a migration when changing an installed schema rather than rewriting an applied initializer.
 If changing a schema already in use, document how operators upgrade their existing databases.
 
 Keep application code under `src/`, including the dashboard in `src/app/` and shared UI/helpers

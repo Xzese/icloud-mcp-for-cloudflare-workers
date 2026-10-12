@@ -7,10 +7,12 @@ import { tmpdir } from "node:os";
 import { resolve, join } from "node:path";
 import { Envelopes } from "../../src/crypto/envelopes.ts";
 import { loginAssurance } from "../../src/auth/apple/policy.ts";
+import { encodeDocument } from "../../src/reminders/crdt.ts";
 import { randomBytes } from "node:crypto";
 import { verifyReminderWrites } from "./reminder-writes.mjs";
 import { verifySessionRetention } from "./session-retention.mjs";
 import { JOB_TOOLS } from "../../src/jobs/schemas.ts";
+const SEARCH_REMINDER_KEYS = ["List", "ParentReminder", "TitleDocument", "NotesDocument", "Completed", "CompletionDate", "DueDate", "StartDate", "Priority", "Flagged", "AllDay", "Deleted", "TimeZone", "AlarmIDs", "AttachmentIDs", "HashtagIDs", "RecurrenceRuleIDs"];
 const root = resolve(new URL("../..", import.meta.url).pathname);
 const config = JSON.parse(await readFile(join(root, "dist/server/wrangler.json"), "utf8"));
 const directory = await mkdtemp(join(tmpdir(), "reminders-worker-acceptance-"));
@@ -52,9 +54,25 @@ function socketMessages(socket) {
 try {
   worker = new Miniflare(options); const db = await worker.getD1Database("DB");
   const schema = await readFile(join(root, "schema.sql"), "utf8");
-  // Exercise the SQL packaged for Sites, rather than a separate test schema.
-  assert.equal(await readFile(join(root, "dist/.openai/drizzle/0000_schema.sql"), "utf8"), schema);
-  await db.prepare(schema).run();
+  // Upgrade an existing Sites database using the actual packaged migration
+  // history. Rewriting an applied initializer would leave job tables absent.
+  const migrationDirectory = join(root, "dist/.openai/drizzle");
+  const migrationNames = (await readdir(migrationDirectory)).sort();
+  assert.deepEqual(migrationNames, (await readdir(join(root, "migrations"))).filter(file => /^\d{4}_[a-z0-9_]+\.sql$/.test(file)).sort());
+  const applyMigration = async file => {
+    const sql = await readFile(join(migrationDirectory, file), "utf8");
+    assert.equal(sql, await readFile(join(root, "migrations", file), "utf8"));
+    await db.batch(sql.split(";").map(statement => statement.trim()).filter(Boolean).map(statement => db.prepare(statement)));
+  };
+  await applyMigration("0000_schema.sql");
+  const migrationWitnessOwner = "synthetic-migration-witness";
+  const migrationWitness = { generation: 47, version: 62, state: "READY", envelope: "synthetic-opaque-existing-envelope" };
+  await db.prepare("INSERT INTO apple_session_state (owner_id, account_id, generation, version, state, envelope) VALUES (?, ?, ?, ?, ?, ?)")
+    .bind(migrationWitnessOwner, "apple-reminders", migrationWitness.generation, migrationWitness.version, migrationWitness.state, migrationWitness.envelope).run();
+  for (const file of migrationNames.slice(1)) await applyMigration(file);
+  assert.equal((await db.prepare("SELECT COUNT(*) AS count FROM sqlite_master WHERE type='table' AND name IN ('reminder_jobs','reminder_job_items','reminder_job_receipts','reminder_job_chunks','reminder_job_outbox','reminder_job_accounts')").first()).count, 6);
+  assert.deepEqual(await db.prepare("SELECT generation, version, state, envelope FROM apple_session_state WHERE owner_id = ?").bind(migrationWitnessOwner).first(), migrationWitness);
+  await db.prepare("DELETE FROM apple_session_state WHERE owner_id = ?").bind(migrationWitnessOwner).run();
   assert.deepEqual((await db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'probe_%'").all()).results, []);
   assert.equal((await request("/api/connection", { user: null })).status, 401);
   assert.equal((await request("/api/connection", { user: "wrong-owner" })).status, 403);
@@ -74,7 +92,21 @@ try {
   };
   const init = await mcp("initialize", { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "synthetic-acceptance", version: "1" } });
   assert.equal(init.result.serverInfo.name, "hosted-icloud-reminders");
-  const tools = await mcp("tools/list", {}); assert.deepEqual(tools.result.tools.map((t) => t.name).sort(), ["complete_reminder", "connection_status", "create_reminder", "create_subtask", "set_reminder_parent", "delete_reminder", "get_all_open_reminders", "get_reminder", "get_reminder_lists", "get_reminder_list", "create_reminder_list", "rename_reminder_list", "delete_reminder_list", "get_reminders", "reopen_reminder", "update_reminder", "prepare_reminder_update", ...JOB_TOOLS].sort());
+  const tools = await mcp("tools/list", {}); assert.deepEqual(tools.result.tools.map((t) => t.name).sort(), ["complete_reminder", "connection_status", "create_reminder", "create_subtask", "set_reminder_parent", "delete_reminder", "get_all_open_reminders", "get_reminder", "get_reminder_organization", "set_reminder_url", "set_reminder_tags", "move_reminder", "copy_reminder", "get_reminder_lists", "get_reminder_list", "get_reminder_list_appearance", "update_reminder_list_appearance", "get_shopping_categories", "set_reminder_category", "create_reminder_list", "rename_reminder_list", "delete_reminder_list", "get_reminders", "search_reminders", "reopen_reminder", "update_reminder", "prepare_reminder_update", ...JOB_TOOLS].sort());
+  const listReadTool = tools.result.tools.find(tool => tool.name === "get_reminders");
+  // Client adapters can require a full pattern match. A generated prefix-only
+  // pattern rejected valid List IDs before the live server could read them.
+  const listReadPattern = new RegExp(`^(?:${listReadTool.inputSchema.properties.listId.pattern})$`, "u");
+  assert.ok(listReadPattern.test("List/12345678-1234-4234-8234-123456789abc"));
+  assert.ok(!listReadPattern.test("List/parent/child"));
+  assert.ok(!listReadPattern.test("List/invalid name"));
+  const categoryTool = tools.result.tools.find(tool => tool.name === "set_reminder_category");
+  assert.equal(categoryTool.inputSchema.type, "object");
+  assert.equal(categoryTool.inputSchema.properties.categoryId.type, "string");
+  for (const field of ["expectedGeneration", "listId", "reminderId", "recordChangeTag", "listRecordChangeTag", "categoryId", "categoryRecordChangeTag"])
+    assert.ok(categoryTool.inputSchema.required.includes(field), `Missing category move input: ${field}`);
+  const gatedCategories = await mcp("tools/call", { name: "get_shopping_categories", arguments: { listId: "List/NEW" } });
+  assert.equal(gatedCategories.result.isError, true);
   const gatedRead = await mcp("tools/call", { name: "get_reminders", arguments: { listId: "List/NEW" } }); assert.equal(gatedRead.result.isError, true);
   const call = await mcp("tools/call", { name: "connection_status", arguments: {} }); assert.equal(call.result.structuredContent.connected, false);
   const removed = await mcp("tools/call", { name: "feasibility_status", arguments: {} }); assert.equal(removed.result.isError, true);
@@ -129,9 +161,10 @@ try {
       if (pathname.endsWith("/records/lookup")) {
         const body = await req.clone().json();
         assert.deepEqual(body.desiredKeys, ["Name", "Color", "Count", "IsGroup", "Deleted"]);
-        assert.deepEqual(body.records, [{ recordName: "List/KNOWN" }]);
         assert.equal(body.zoneID.ownerRecordName, "synthetic-private-owner");
-        return new Response(JSON.stringify({ records: [directMcpScenario.knownList] }), { headers: { "content-type": "application/json" } });
+        const ids = body.records.map(({ recordName }) => recordName);
+        assert.ok(ids.every(id => ["List/KNOWN", "List/ACTIVE"].includes(id)));
+        return new Response(JSON.stringify({ records: ids.map(id => id === "List/KNOWN" ? directMcpScenario.knownList : directMcpScenario.activeList) }), { headers: { "content-type": "application/json" } });
       }
       if (pathname.endsWith("/records/query")) {
         const body = await req.clone().json();
@@ -146,10 +179,19 @@ try {
         assert.equal(body.query.recordType, "reminderList");
         assert.equal(body.resultsLimit, 200);
         const listId = body.query.filterBy.find(filter => filter.fieldName === "List").fieldValue.value.recordName;
-        assert.equal(body.query.filterBy.find(filter => filter.fieldName === "includeCompleted").fieldValue.value, 0);
         const page = directMcpScenario.reminderPages[listId].shift();
         assert.ok(page, `Unexpected direct all-open query for ${listId}`);
+        assert.equal(body.query.filterBy.find(filter => filter.fieldName === "includeCompleted").fieldValue.value, page.includeCompleted ?? 0);
         assert.equal(body.continuationMarker, page.inputCursor);
+        if (page.projection === "search") {
+          assert.deepEqual(body.desiredKeys, SEARCH_REMINDER_KEYS);
+          const reply = structuredClone(page.reply);
+          reply.records = reply.records?.map(record => record.recordType === "Reminder" ? {
+            ...record, fields: Object.fromEntries(Object.entries(record.fields).filter(([key]) => body.desiredKeys.includes(key))),
+          } : record);
+          return new Response(JSON.stringify(reply), { headers: { "content-type": "application/json" } });
+        }
+        assert.equal(Object.hasOwn(body, "desiredKeys"), false, "Default get_reminders and all-open pages remain full record queries.");
         const reply = page.reply;
         return reply instanceof Response ? reply : new Response(JSON.stringify(reply), { headers: { "content-type": "application/json" } });
       }
@@ -220,7 +262,7 @@ try {
   await sessionDB.prepare(schema).run();
   assert.deepEqual((await sessionDB.prepare("SELECT * FROM apple_session_state").all()).results, beforeSchemaRepeat);
   await worker.dispose(); worker = new Miniflare(enabledOptions);
-  const restoredApple = await (await request("/api/connection")).json(); assert.equal(restoredApple.state, "READY"); assert.equal(restoredApple.capabilities.liveRead, true); assert.equal(restoredApple.capabilities.listReminders, true); assert.equal(restoredApple.capabilities.allOpenReminders, true); assert.equal(restoredApple.liveReadValidated, undefined); assert.equal(restoredApple.validation, undefined); assert.equal(restoredApple.writeEnabled, true);
+  const restoredApple = await (await request("/api/connection")).json(); assert.equal(restoredApple.state, "READY"); assert.equal(restoredApple.capabilities.liveRead, true); assert.equal(restoredApple.capabilities.listReminders, true); assert.equal(restoredApple.capabilities.allOpenReminders, true); assert.equal(restoredApple.capabilities.search, true); assert.equal(restoredApple.liveReadValidated, undefined); assert.equal(restoredApple.validation, undefined); assert.equal(restoredApple.writeEnabled, true);
   const compoundResponse = await request("/api/apple/read", { method: "POST", body: { action: "reminders", expectedGeneration: empty.generation, listId: "List/SYNTHETIC", includeCompleted: true, limit: 1 } });
   const compound = await compoundResponse.json(); assert.equal(compoundResponse.status, 200, JSON.stringify(compound)); assert.equal(compound.result.records.length, 1); assert.equal(compound.result.auxiliaryRecordCounts.Alarm, 1); assert.equal(compound.result.auxiliaryRecordCounts.List, 1); assert.equal(compound.result.auxiliaryDetailsIncluded, true); assert.equal(compound.liveReadValidated, false);
   assert.deepEqual(controlledReadLookups.at(-1).records, [{ recordName: "List/SYNTHETIC" }], "A controlled single-list reminder read authorizes the list before querying reminders.");
@@ -314,6 +356,7 @@ try {
   assert.equal(restoredLegacyStatus.state, "READY"); assert.equal(restoredLegacyStatus.generation, directGeneration);
   const oldContinuationReply = await mcp("tools/call", { name: "get_all_open_reminders", arguments: { expectedGeneration: directGeneration, continuation: oldContinuation } });
   assert.equal(oldContinuationReply.result.isError, true); assert.equal(oldContinuationReply.result.structuredContent.error.code, "CONFLICT");
+  assert.equal(oldContinuationReply.result.structuredContent.error_code, "CONFLICT", "The raw MCP error carries the connector code before hosted-adapter normalization.");
   const stillConnected = await (await request("/api/connection")).json();
   assert.equal(stillConnected.state, "READY", "Discarding obsolete scan state keeps the valid Apple session connected.");
   assert.equal((await request("/api/apple/read", { user: "other-owner", method: "POST", body: { action: "current-lists", expectedGeneration: directGeneration } })).status, 403);
@@ -334,12 +377,15 @@ try {
       { inputCursor: "direct-list-next", reply: { records: pageTwo } },
       { reply: { records: pageOne, continuationMarker: "direct-list-next" } },
       { inputCursor: "direct-list-next", reply: { records: pageTwo } },
+      { reply: { records: pageOne, continuationMarker: "direct-list-next" } },
+      { inputCursor: "direct-list-next", reply: { records: pageTwo } },
     ],
+    activeList: directListRecord("List/ACTIVE", "Active list", { count: 1 }),
     reminderPages: {
       "List/KNOWN": [{ reply: { records: [directReminder("Reminder/KNOWN", "List/KNOWN")] } }, { reply: { records: [] } }],
       "List/EMPTY": [{ reply: new Response("{}", { status: 503 }) }, { reply: { records: [] } }],
       "List/ACTIVE": [
-        { reply: { records: [directReminder("Reminder/ACTIVE-1", "List/ACTIVE"), directReminder("Reminder/CLOSED", "List/ACTIVE", 1), { ...directReminder("Reminder/DELETED", "List/ACTIVE"), deleted: true }], continuationMarker: "active-next" } },
+        { reply: { records: [directReminder("Reminder/ACTIVE-1", "List/ACTIVE"), directReminder("Reminder/ACTIVE-1", "List/ACTIVE"), directReminder("Reminder/CLOSED", "List/ACTIVE", 1), { ...directReminder("Reminder/DELETED", "List/ACTIVE"), deleted: true }], continuationMarker: "active-next" } },
         { inputCursor: "active-next", reply: { records: [directReminder("Reminder/ACTIVE-2", "List/ACTIVE")] } },
       ],
     },
@@ -419,6 +465,76 @@ try {
   assert.equal(replayedContinuation.result.isError, true); assert.equal(replayedContinuation.result.structuredContent.error.code, "CONFLICT", "A completed all-open continuation cannot be replayed.");
   assert.equal(directMcpScenario.paths["/database/1/com.apple.reminders/production/private/changes/zone"] ?? 0, 0);
   assert.equal(directMcpScenario.paths["/database/1/com.apple.reminders/production/private/zones/list"], 1);
+  directMcpScenario.reminderPages["List/KNOWN"].push({ reply: { records: [
+    directReminder("Reminder/CONFLICTING", "List/KNOWN"), directReminder("Reminder/CONFLICTING", "List/KNOWN", 1),
+  ] } });
+  const conflictingDuplicates = await mcp("tools/call", { name: "get_reminders", arguments: { expectedGeneration: directGeneration, listId: "List/KNOWN" } });
+  assert.equal(conflictingDuplicates.result.isError, true, "Conflicting copies of one identity still fail closed.");
+  assert.equal(conflictingDuplicates.result.structuredContent.error.code, "PROTOCOL_CHANGED");
+  assert.equal(conflictingDuplicates.result.structuredContent.error_code, "PROTOCOL_CHANGED");
+  assert.deepEqual(JSON.parse(conflictingDuplicates.result.content[0].text), conflictingDuplicates.result.structuredContent);
+  assert.equal((await (await request("/api/connection")).json()).generation, directGeneration, "Protocol failures preserve the existing session generation.");
+  const searchTools = await mcp("tools/list", {});
+  const searchTool = searchTools.result.tools.find(tool => tool.name === "search_reminders");
+  assert.ok(searchTool, "search_reminders is registered for MCP clients."); assert.equal(searchTool.annotations.readOnlyHint, true);
+  assert.ok(searchTool.inputSchema?.properties?.limit?.description?.includes("Use 20 or 50"), JSON.stringify(searchTool.inputSchema));
+  const directSearchReminder = (id, listId, title, completed = 0) => ({
+    ...directReminder(id, listId, completed), created: { timestamp: Date.parse("2024-10-01T00:00:00.000Z") },
+    modified: { timestamp: Date.parse("2024-10-02T00:00:00.000Z") },
+    fields: {
+      ...directReminder(id, listId, completed).fields,
+      ParentReminder: { type: "REFERENCE", value: null },
+      TitleDocument: { type: "ENCRYPTED_BYTES", value: encodeDocument(title) },
+      NotesDocument: { type: "ENCRYPTED_BYTES", value: encodeDocument("A searchable history note") },
+      ...(completed ? { CompletionDate: { type: "TIMESTAMP", value: Date.parse("2024-10-03T12:00:00.000Z") } } : {}),
+      DueDate: { type: "TIMESTAMP", value: Date.parse("2024-10-04T00:00:00.000Z") },
+      StartDate: { type: "TIMESTAMP", value: Date.parse("2024-10-03T10:00:00.000Z") },
+      Priority: { type: "INT64", value: 5 }, Flagged: { type: "INT64", value: 1 },
+      AllDay: { type: "INT64", value: 0 }, Deleted: { type: "INT64", value: 0 }, TimeZone: { type: "STRING", value: "Europe/London" },
+      AlarmIDs: { type: "UNKNOWN_LIST", value: [] }, AttachmentIDs: { type: "UNKNOWN_LIST", value: [] },
+      HashtagIDs: { type: "UNKNOWN_LIST", value: [] }, RecurrenceRuleIDs: { type: "UNKNOWN_LIST", value: [] },
+      ResolutionTokenMap: { type: "STRING", value: "opaque-resolution-map" }, CustomFutureField: { type: "STRING", value: "opaque-family-state" },
+    },
+  });
+  directMcpScenario.reminderPages["List/EMPTY"].push(
+    { projection: "search", reply: { records: [directSearchReminder("Reminder/EMPTY-OTHER", "List/EMPTY", "unrelated")], continuationMarker: "search-empty-next" } },
+    { projection: "search", inputCursor: "search-empty-next", reply: { records: [directSearchReminder("Reminder/EMPTY-MATCH", "List/EMPTY", "Needle appears later")] } },
+  );
+  directMcpScenario.reminderPages["List/ACTIVE"].push({ projection: "search", includeCompleted: 1, reply: { records: [
+    directSearchReminder("Reminder/ACTIVE-OPEN", "List/ACTIVE", "Needle open"),
+    directSearchReminder("Reminder/ACTIVE-DONE", "List/ACTIVE", "Needle done", 1),
+  ] } });
+  const searchFirst = await mcp("tools/call", { name: "search_reminders", arguments: { expectedGeneration: directGeneration, text: "needle" } });
+  assert.equal(searchFirst.result.isError, undefined, JSON.stringify(searchFirst));
+  assert.deepEqual(searchFirst.result.structuredContent.records, []); assert.equal(searchFirst.result.structuredContent.complete, false);
+  assert.ok(searchFirst.result.structuredContent.continuation); assert.equal(searchFirst.result.structuredContent.progress.pagesRead, 1);
+  assert.equal(searchFirst.result.structuredContent.progress.currentListId, "List/EMPTY");
+  assert.equal(searchFirst.result.structuredContent.consistency, "live-pages-not-snapshot");
+  const searchContinuation = searchFirst.result.structuredContent.continuation;
+  const searchQueriesBeforeMismatch = directMcpScenario.paths["/database/1/com.apple.reminders/production/private/records/query"];
+  const searchMismatch = await mcp("tools/call", { name: "search_reminders", arguments: { expectedGeneration: directGeneration, text: "other", continuation: searchContinuation } });
+  assert.equal(searchMismatch.result.isError, true); assert.equal(searchMismatch.result.structuredContent.error.code, "CONFLICT");
+  assert.equal(directMcpScenario.paths["/database/1/com.apple.reminders/production/private/records/query"], searchQueriesBeforeMismatch);
+  const searchLater = await mcp("tools/call", { name: "search_reminders", arguments: { expectedGeneration: directGeneration, text: "needle", continuation: searchContinuation } });
+  assert.equal(searchLater.result.isError, undefined, JSON.stringify(searchLater));
+  assert.deepEqual(searchLater.result.structuredContent.records.map(record => record.id), ["Reminder/EMPTY-MATCH"]);
+  assert.equal(searchLater.result.structuredContent.records[0].dueDate, "2024-10-04T00:00:00.000Z");
+  assert.equal(searchLater.result.structuredContent.records[0].created, "2024-10-01T00:00:00.000Z");
+  assert.equal(searchLater.result.structuredContent.records[0].modified, "2024-10-02T00:00:00.000Z");
+  assert.equal(Object.hasOwn(searchLater.result.structuredContent.records[0], "appleRecord"), false);
+  assert.equal(searchLater.result.structuredContent.complete, false);
+  const persistedSearchEnvelope = await directDB.prepare("SELECT envelope FROM apple_session_state WHERE owner_id = ? AND account_id = 'apple-reminders'").bind(owner).first();
+  const persistedSearch = await new Envelopes("synthetic", { synthetic: secret }).decrypt(JSON.parse(persistedSearchEnvelope.envelope), { ownerId: owner, accountId: "apple-reminders", generation: directGeneration, recordId: "apple-session", schemaVersion: 1 });
+  assert.equal(persistedSearch.searchScan.cursor, null);
+  assert.deepEqual(persistedSearch.searchScan.listIds, ["List/EMPTY", "List/ACTIVE"]);
+  assert.equal(JSON.stringify(persistedSearch.searchScan).includes("Needle"), false, "Search continuation state contains no reminder body.");
+  const completedSearch = await mcp("tools/call", { name: "search_reminders", arguments: { expectedGeneration: directGeneration, text: "needle", status: "completed", listId: "List/ACTIVE" } });
+  assert.equal(completedSearch.result.isError, undefined, JSON.stringify(completedSearch));
+  assert.deepEqual(completedSearch.result.structuredContent.records.map(record => record.id), ["Reminder/ACTIVE-DONE"]);
+  assert.equal(completedSearch.result.structuredContent.records[0].completedDate, "2024-10-03T12:00:00.000Z");
+  assert.equal(completedSearch.result.structuredContent.records[0].priority, 5);
+  assert.equal(completedSearch.result.structuredContent.records[0].flagged, true);
+  assert.equal(completedSearch.result.structuredContent.complete, true);
   console.log(JSON.stringify({ type: "synthetic-performance", liveAppleData: false, measurements: [knownMetric, directListsMetric, directOpenInitialMetric, directOpenResumeMetric].map(({ name, elapsedMs, pathCounts }) => ({ name, elapsedMs, pathCounts })) }));
   const writeAcceptance = await verifyReminderWrites(options);
   const retentionAcceptance = await verifySessionRetention(options);

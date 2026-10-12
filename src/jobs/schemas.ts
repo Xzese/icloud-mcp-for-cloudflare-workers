@@ -32,7 +32,7 @@ export const JobResult = z.object({
 export type JobResultData = z.infer<typeof JobResult>;
 export const JobOutput = z.object({
   jobId: z.string().uuid(), kind: JobKind, generation: counter, state: JobState,
-  executionMode: z.enum(["request-driven", "queue"]),
+  executionMode: z.literal("request-driven"),
   revision: counter, expiresAt: counter, nextRetryAt: counter.nullable(), cancellationRequested: z.boolean(),
   counts: z.object({ total: counter, pending: counter, preparing: counter, dispatching: counter, verifying: counter, succeeded: counter, failed: counter, conflict: counter, unknown: counter, cancelled: counter }).strict(),
   results: z.array(z.object({ ordinal: counter, clientItemKey: z.string(), input: z.union([CreateReminderInput, ReminderTargetInput]), status: ItemState, attempts: counter, result: JobResult.nullable() }).strict()),

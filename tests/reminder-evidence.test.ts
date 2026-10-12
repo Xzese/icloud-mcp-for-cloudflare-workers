@@ -8,8 +8,7 @@ import { CookieJar } from "../src/transport/cookie-jar.ts";
 import { AppError } from "../src/errors.ts";
 import { AppleConnectionService } from "../src/auth/service.ts";
 import { parseEvidenceArgs, compareEvidence } from "../scripts/dev/capture-reminder-evidence.mjs";
-import { reminderQueueConfig } from "../scripts/deploy/reminder-queue-config.mjs";
-import { jobExecutionMode } from "../src/jobs/execution.ts";
+import { requestDrivenConfig } from "../scripts/deploy/reminder-job-config.mjs";
 import { readFileSync } from "node:fs";
 import { planReminderUpdate } from "../src/reminders/mutation-plan.ts";
 import { loadSchedulingGraph } from "../src/reminders/linked-records.ts";
@@ -248,15 +247,13 @@ test("observed active January rescheduling preserves the recurrence and historic
   assert.throws(() => compareEvidence(fixture.before, { ...fixture.after, rootRecordName: "Reminder/HISTORY" }));
 });
 
-test("Queue deployment config requires explicit bindings, bounded batches and only the outbox schedule", () => {
-  const configured = { vars: { REMINDER_JOB_EXECUTION_MODE: "queue-v1", REMINDER_JOB_QUEUE_NAME: "synthetic-jobs" },
-    queues: { producers: [{ binding: "REMINDER_JOB_QUEUE", queue: "synthetic-jobs" }],
-      consumers: [{ queue: "synthetic-jobs", max_batch_size: 1, max_batch_timeout: 1, max_concurrency: 1, max_retries: 5 }] },
-    triggers: { crons: ["* * * * *"] } };
-  assert.deepEqual(reminderQueueConfig(configured), { queues: configured.queues, triggers: configured.triggers });
-  assert.deepEqual(reminderQueueConfig({}), {});
-  assert.throws(() => reminderQueueConfig({ ...configured, vars: {} }));
-  assert.throws(() => reminderQueueConfig({ ...configured, triggers: { crons: ["0 * * * *"] } }));
-  assert.equal(jobExecutionMode({}), "request-driven");
-  assert.throws(() => jobExecutionMode({ REMINDER_JOB_EXECUTION_MODE: "queue-v1" }), hasCode("CONFIGURATION_REQUIRED"));
+test("standalone deployment is request-driven and rejects retired Queue and cron settings", () => {
+  assert.deepEqual(requestDrivenConfig({}), {});
+  for (const stale of [
+    { vars: { REMINDER_JOB_EXECUTION_MODE: "queue-v1" } },
+    { vars: { REMINDER_JOB_QUEUE_NAME: "synthetic-jobs" } },
+    { queues: { producers: [{ binding: "REMINDER_JOB_QUEUE", queue: "synthetic-jobs" }] } },
+    { queues: { consumers: [{ queue: "synthetic-jobs" }] } },
+    { triggers: { crons: ["* * * * *"] } },
+  ]) assert.throws(() => requestDrivenConfig(stale), /remove Queue and cron settings/);
 });

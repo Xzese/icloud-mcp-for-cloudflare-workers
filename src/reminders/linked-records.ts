@@ -1,6 +1,7 @@
 import { AppError } from "../errors.ts";
 import { normalizeReminder, type CloudKitLookupResult, type CloudKitRecord } from "../icloud/cloudkit.ts";
 import { fingerprint, jsonBytes } from "../lib/canonical.ts";
+import { stableNativePresentation } from "../lib/native-presentation.ts";
 
 export const SCHEDULING_TYPES = ["Reminder", "Alarm", "AlarmTrigger", "RecurrenceRule"] as const;
 export const GRAPH_LIMITS = { records: 32, bytes: 262_144, depth: 3 } as const;
@@ -18,7 +19,7 @@ export interface SchedulingGraph {
 function graphFingerprint(graph: Pick<SchedulingGraph, "records" | "edges">, earlyReminderWitness?: CloudKitRecord) {
   const value: Record<string, unknown> = {
     records: [...graph.records].sort((a, b) => a.recordName.localeCompare(b.recordName)).map(record => ({
-      id: record.recordName, type: record.recordType, version: record.recordChangeTag, zone: record.zoneID, fields: record.fields,
+      id: record.recordName, type: record.recordType, version: record.recordChangeTag, zone: record.zoneID, fields: stableNativePresentation(record.fields),
     })),
     edges: [...graph.edges].sort((a, b) => a.to.localeCompare(b.to)),
   };
@@ -27,7 +28,7 @@ function graphFingerprint(graph: Pick<SchedulingGraph, "records" | "edges">, ear
     type: earlyReminderWitness.recordType,
     version: earlyReminderWitness.recordChangeTag,
     zone: earlyReminderWitness.zoneID,
-    fields: earlyReminderWitness.fields,
+    fields: stableNativePresentation(earlyReminderWitness.fields),
   };
   return fingerprint(value);
 }

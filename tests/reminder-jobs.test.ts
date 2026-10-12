@@ -14,30 +14,9 @@ import { accountScope, fingerprint } from "../src/lib/canonical.ts";
 import { jsonBytes } from "../src/lib/canonical.ts";
 import { applicationRoute } from "../src/api/router.ts";
 import { CreateReminderInput } from "../src/reminders/writes.ts";
-import { consumeJobQueue, pumpJobOutbox } from "../src/jobs/queue.ts";
-import { QUEUE_CONSUMER_AVAILABLE, type RuntimeEnv } from "../src/platform/sites.ts";
 
 const owner = "synthetic-job-owner", listId = "List/JOB-TEST", zoneOwner = "synthetic-private-owner";
 const hasCode = (code: string) => (error: unknown) => error instanceof AppError && error.code === code;
-function delivery(body: unknown) {
-  const result = { acked: false, retry: 0 };
-  const batch: MessageBatch<unknown> = { queue: "synthetic-jobs", metadata: { metrics: { backlogCount: 1, backlogBytes: 0 } }, messages: [{
-    id: crypto.randomUUID(), timestamp: new Date(), body, attempts: 1,
-    ack() { result.acked = true; }, retry(options) { result.retry = options?.delaySeconds ?? 1; },
-  }], ackAll() { result.acked = true; }, retryAll(options) { result.retry = options?.delaySeconds ?? 1; } };
-  return { batch, result };
-}
-function queuedEnv(f: Awaited<ReturnType<typeof fixture>>, failSend = false) {
-  const sent: unknown[] = [];
-  const metadata = { metrics: { backlogCount: 0, backlogBytes: 0 } };
-  const queue: Queue<{ jobId: string; revision: number }> = {
-    async metrics() { return metadata.metrics; },
-    async send(value) { if (failSend) throw new Error("synthetic queue send failure"); sent.push(value); return { metadata }; },
-    async sendBatch(values) { sent.push(...values); return { metadata }; },
-  };
-  const env: RuntimeEnv = { ...f.env, [QUEUE_CONSUMER_AVAILABLE]: true, REMINDER_JOB_EXECUTION_MODE: "queue-v1", REMINDER_JOB_QUEUE_NAME: "synthetic-jobs", REMINDER_JOB_QUEUE: queue };
-  return { env, sent };
-}
 function item(index: number, key = crypto.randomUUID()) {
   return JobItem.parse({ kind: "bulk_create", clientItemKey: `item-${index}`, input: { listId, idempotencyKey: key, title: "Same title", notes: `Synthetic notes ${index}` } });
 }
@@ -53,7 +32,15 @@ async function fixture() {
   const sessions = new AppleSessionRepository(env, owner), setup = await sessions.begin(0);
   await sessions.commit(setup, session, "READY");
   const jobs = new ReminderJobService(env, owner);
-  const records = new Map<string, Record<string, unknown>>([[listId, { recordName: listId, recordType: "List", fields: { Deleted: { type: "INT64", value: 0 }, IsGroup: { type: "INT64", value: 0 } }, zoneID: { zoneName: "Reminders", ownerRecordName: zoneOwner }, recordChangeTag: "list-1" }]]);
+  const records = new Map<string, Record<string, unknown>>([[listId, { recordName: listId, recordType: "List", fields: {
+    Name: { type: "STRING", value: "Synthetic job list" }, Deleted: { type: "INT64", value: 0 }, IsGroup: { type: "INT64", value: 0 },
+    ReminderIDs: { type: "STRING", value: "[]" },
+    ResolutionTokenMap: { type: "STRING", value: JSON.stringify({ map: {
+      reminderIDsMergeableOrdering: { counter: 3, modificationTime: 757_382_400, replicaID: "3e6cb834-5b1c-4ce6-8c39-00e752121111" },
+      syntheticUnrelatedField: { counter: 2, modificationTime: 757_382_399, replicaID: "4e6cb834-5b1c-4ce6-8c39-00e752121111" },
+    } }) },
+    SyntheticFutureListField: { type: "STRING", value: "preserve-this-list-field" },
+  }, zoneID: { zoneName: "Reminders", ownerRecordName: zoneOwner }, recordChangeTag: "list-1" }]]);
   const nativeFetch = globalThis.fetch;
   const network = { modifies: 0, reads: 0, queries: 0, loseAck: false, rejectRate: false, cancelAtDispatch: null as string | null, onModify: null as (() => void) | null };
   globalThis.fetch = async (url, options) => {
@@ -67,20 +54,44 @@ async function fixture() {
       network.queries++;
       const list = body.query.filterBy[0].fieldValue.value.recordName;
       return Response.json({ records: [...records.values()].filter(record => record.recordType === "Reminder" &&
-        (record.fields as Record<string, { value: { recordName: string } }>).List?.value.recordName === list) });
+        (record.fields as Record<string, { value: { recordName: string } | null }>).List?.value?.recordName === list) });
     }
     assert.ok(path.endsWith("/records/modify"), "Only synthetic exact reads and writes are allowed.");
     network.modifies++;
     if (network.rejectRate) { network.rejectRate = false; return Response.json({}, { status: 429, headers: { "retry-after": "120" } }); }
-    const write = body.operations[0].record;
-    assert.equal(body.atomic, true); assert.equal(body.operations.length, 1);
-    const previous = records.get(write.recordName);
-    const next = { ...previous, ...write, fields: { ...(previous?.fields as object | undefined), ...write.fields }, recordChangeTag: `confirmed-${network.modifies}`, zoneID: { zoneName: "Reminders", ownerRecordName: zoneOwner } };
-    records.set(write.recordName, next);
+    assert.equal(body.atomic, true);
+    assert.equal(body.operations.length, 2);
+    if (body.operations.some((operation: { operationType: string; record: { recordType: string } }) => operation.operationType === "create" && operation.record.recordType === "Reminder")) {
+      const [listUpdate, reminderCreate] = body.operations as { operationType: string; record: Record<string, unknown> & { recordName: string; recordType: string; recordChangeTag?: string; fields: Record<string, unknown> } }[];
+      assert.equal(listUpdate.operationType, "update"); assert.equal(listUpdate.record.recordName, listId); assert.equal(listUpdate.record.recordType, "List");
+      assert.equal(listUpdate.record.recordChangeTag, records.get(listId)?.recordChangeTag);
+      assert.deepEqual(Object.keys(listUpdate.record.fields).sort(), ["ReminderIDs", "ResolutionTokenMap"]);
+      const listBefore = records.get(listId)!;
+      const beforeMembers = JSON.parse(String((listBefore.fields as Record<string, { value: unknown }>).ReminderIDs.value)) as string[];
+      const afterMembers = JSON.parse(String((listUpdate.record.fields.ReminderIDs as { value: unknown }).value)) as string[];
+      assert.deepEqual(afterMembers, [...beforeMembers, reminderCreate.record.recordName.slice("Reminder/".length)], "Creation appends to native List ordering.");
+      const beforeTokens = JSON.parse(String((listBefore.fields as Record<string, { value: unknown }>).ResolutionTokenMap.value)) as { map: Record<string, { counter: number }> };
+      const afterTokens = JSON.parse(String((listUpdate.record.fields.ResolutionTokenMap as { value: unknown }).value)) as { map: Record<string, { counter: number }> };
+      assert.deepEqual(Object.keys(afterTokens.map).sort(), Object.keys(beforeTokens.map).sort());
+      assert.equal(afterTokens.map.reminderIDsMergeableOrdering.counter, beforeTokens.map.reminderIDsMergeableOrdering.counter + 1);
+      assert.deepEqual(afterTokens.map.syntheticUnrelatedField, beforeTokens.map.syntheticUnrelatedField, "Creation preserves unrelated List resolution tokens.");
+      assert.equal(reminderCreate.operationType, "create"); assert.equal(reminderCreate.record.recordType, "Reminder");
+      assert.equal(reminderCreate.record.parent && (reminderCreate.record.parent as { recordName?: unknown }).recordName, listId);
+    }
+    const confirmations = body.operations.map(({ record: write, operationType }: { record: Record<string, unknown> & { recordName: string; fields: object }; operationType: string }) => {
+      const previous = records.get(write.recordName);
+      if (operationType === "update") assert.equal(write.recordChangeTag, previous?.recordChangeTag);
+      const next = { ...previous, ...write, fields: { ...(previous?.fields as object | undefined), ...write.fields }, recordChangeTag: `confirmed-${network.modifies}-${write.recordName}`, zoneID: { zoneName: "Reminders", ownerRecordName: zoneOwner } };
+      if (write.parent && typeof write.parent === "object" && "recordName" in write.parent && write.parent.recordName === null) {
+        delete (next as Record<string, unknown>).parent;
+      }
+      records.set(write.recordName, next);
+      return next;
+    });
     network.onModify?.(); network.onModify = null;
     if (network.cancelAtDispatch) await jobs.cancel({ jobId: network.cancelAtDispatch });
     if (network.loseAck) { network.loseAck = false; return new Response("lost acknowledgement", { status: 503 }); }
-    return Response.json({ records: [next] });
+    return Response.json({ records: confirmations });
   };
   return { db, env, jobs, sessions, session, generation: setup.generation, network, records,
     close() { globalThis.fetch = nativeFetch; db.sqlite.close(); } };
@@ -94,103 +105,6 @@ async function ready(f: Awaited<ReturnType<typeof fixture>>, items = [item(0)]) 
   const preview = await f.jobs.preview({ jobId: job.jobId, expectedRevision: job.revision });
   return f.jobs.start({ jobId: preview.jobId, previewToken: preview.previewToken });
 }
-
-test("Queue outbox and duplicate delivery execute bounded slices in ledger order", async () => {
-  const f = await fixture();
-  try {
-    const job = await ready(f, [item(0), item(1), item(2), item(3)]), q = queuedEnv(f);
-    assert.equal((await new ReminderJobService(q.env, owner).get({ jobId: job.jobId })).executionMode, "queue");
-    await pumpJobOutbox(q.env);
-    assert.deepEqual(q.sent, [{ jobId: job.jobId, revision: job.revision }]);
-    assert.equal(f.network.modifies, 0);
-    const first = delivery(q.sent[0]);
-    await consumeJobQueue(first.batch, q.env);
-    assert.equal(first.result.acked, true); assert.equal(f.network.modifies, 3);
-    assert.equal(q.sent.length, 2);
-    const duplicate = delivery(q.sent[0]);
-    await consumeJobQueue(duplicate.batch, q.env);
-    assert.equal(duplicate.result.acked, true); assert.equal(f.network.modifies, 4);
-    await consumeJobQueue(delivery(q.sent[1]).batch, q.env);
-    assert.equal(f.network.modifies, 4);
-    assert.equal((await f.jobs.get({ jobId: job.jobId })).state, "completed");
-    assert.equal(f.db.sqlite.prepare("SELECT COUNT(*) AS count FROM reminder_job_outbox").get()?.count, 0);
-    assert.equal((await f.sessions.load()).session.login.expiresAt, f.session.login.expiresAt);
-  } finally { f.close(); }
-});
-
-test("lost queue send acknowledgement leaves recoverable outbox and never replays confirmed writes", async () => {
-  const f = await fixture();
-  try {
-    const job = await ready(f, [item(0), item(1), item(2), item(3)]), q = queuedEnv(f, true);
-    await assert.rejects(pumpJobOutbox(q.env), /synthetic queue send failure/);
-    assert.equal((await f.jobs.repository.dueDeliveries()).length, 1);
-    const first = delivery({ jobId: job.jobId, revision: job.revision });
-    await consumeJobQueue(first.batch, q.env);
-    assert.equal(first.result.acked, false); assert.equal(first.result.retry, 120);
-    assert.equal((await f.jobs.get({ jobId: job.jobId })).counts.succeeded, 3);
-    const recovered = delivery({ jobId: job.jobId, revision: job.revision });
-    await consumeJobQueue(recovered.batch, q.env);
-    assert.equal(recovered.result.acked, true); assert.equal(f.network.modifies, 4);
-  } finally { f.close(); }
-});
-
-test("Queue uncertainty and cancellation remain visible and stop autonomous mutation", async () => {
-  const f = await fixture();
-  try {
-    const job = await ready(f), q = queuedEnv(f);
-    f.network.loseAck = true;
-    const first = delivery({ jobId: job.jobId, revision: job.revision });
-    await consumeJobQueue(first.batch, q.env);
-    assert.equal(first.result.acked, true);
-    assert.equal((await f.jobs.get({ jobId: job.jobId })).counts.unknown, 1);
-    await consumeJobQueue(delivery({ jobId: job.jobId, revision: job.revision }).batch, q.env);
-    assert.equal(f.network.modifies, 1); assert.equal(q.sent.length, 0);
-    const cancelled = await ready(f);
-    await f.jobs.cancel({ jobId: cancelled.jobId });
-    await consumeJobQueue(delivery({ jobId: cancelled.jobId, revision: cancelled.revision }).batch, q.env);
-    assert.equal(f.network.modifies, 1);
-  } finally { f.close(); }
-});
-
-test("Queue messages cannot supply owner authority, future revisions or another queue", async () => {
-  const f = await fixture();
-  try {
-    const job = await ready(f), q = queuedEnv(f), malformed = delivery({ jobId: job.jobId, revision: job.revision, owner: "forged" });
-    await consumeJobQueue(malformed.batch, q.env);
-    assert.equal(malformed.result.acked, true);
-    await consumeJobQueue(delivery({ jobId: crypto.randomUUID(), revision: 0 }).batch, q.env);
-    await consumeJobQueue(delivery({ jobId: job.jobId, revision: job.revision + 100 }).batch, q.env);
-    const wrong = delivery({ jobId: job.jobId, revision: job.revision });
-    await assert.rejects(consumeJobQueue({ ...wrong.batch, queue: "other" }, q.env), hasCode("CONFIGURATION_REQUIRED"));
-    assert.equal(f.network.modifies, 0);
-  } finally { f.close(); }
-});
-
-test("Queue delivery honors account cooldown, live leases and authentication pause", async () => {
-  const f = await fixture();
-  try {
-    const job = await ready(f), q = queuedEnv(f);
-    const lease = await f.jobs.repository.claim(await f.jobs.repository.get(job.jobId));
-    const contention = delivery({ jobId: job.jobId, revision: job.revision });
-    await consumeJobQueue(contention.batch, q.env);
-    assert.equal(contention.result.acked, false); assert.ok(contention.result.retry > 0); assert.equal(f.network.modifies, 0);
-    await f.jobs.repository.release(await f.jobs.repository.get(job.jobId), lease);
-    f.network.rejectRate = true;
-    await consumeJobQueue(delivery({ jobId: job.jobId, revision: job.revision }).batch, q.env);
-    assert.equal(f.network.modifies, 1);
-    const deferred = delivery({ jobId: job.jobId, revision: job.revision });
-    await consumeJobQueue(deferred.batch, q.env);
-    assert.equal(deferred.result.acked, false); assert.ok(deferred.result.retry > 0); assert.equal(f.network.modifies, 1);
-    assert.equal((await f.jobs.repository.dueDeliveries()).length, 0);
-    f.db.sqlite.exec("UPDATE reminder_jobs SET next_eligible_at = 0; UPDATE reminder_job_accounts SET cooldown_until = 0; UPDATE reminder_job_items SET next_attempt_at = 0;");
-    await f.sessions.disconnect();
-    const paused = delivery({ jobId: job.jobId, revision: job.revision });
-    await consumeJobQueue(paused.batch, q.env);
-    assert.equal(paused.result.acked, true);
-    assert.equal((await f.jobs.get({ jobId: job.jobId })).state, "paused_auth");
-    assert.equal((await f.jobs.repository.dueDeliveries()).length, 0);
-  } finally { f.close(); }
-});
 
 test("canonical creation defaults, UUID case and date representations produce deterministic hashes", async () => {
   const key = crypto.randomUUID();
@@ -238,7 +152,21 @@ test("draft/chunk replay, revision CAS and scoped key reservations prevent confl
 test("bounded continuation persists order, does not deduplicate titles, and status reads never execute work", async () => {
   const f = await fixture();
   try {
+    // The historical migration may retain an outbox, but execution must not
+    // depend on it or on an external delivery binding.
+    f.db.sqlite.exec("DROP TABLE reminder_job_outbox");
     const job = await ready(f, [item(0), item(1), item(2), item(3)]);
+    assert.equal(job.executionMode, "request-driven");
+    const response = await applicationRoute(new Request(`${f.env.APP_ORIGIN}/api/connection`, {
+      headers: { "oai-authenticated-user-id": owner },
+    }), f.env);
+    assert.equal(response?.status, 200);
+    const connection = await response!.json() as {
+      capabilities: { reminderJobs: boolean; autonomousJobs: boolean; jobExecutionMode: string };
+    };
+    assert.equal(connection.capabilities.reminderJobs, true);
+    assert.equal(connection.capabilities.autonomousJobs, false);
+    assert.equal(connection.capabilities.jobExecutionMode, "request-driven");
     assert.equal(f.network.modifies, 0);
     const before = f.db.sqlite.prepare("SELECT revision FROM reminder_jobs WHERE job_id = ?").get(job.jobId);
     await f.jobs.get({ jobId: job.jobId });

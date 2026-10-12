@@ -2,8 +2,8 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { DatabaseSync, type SQLInputValue } from "node:sqlite";
 import { readFileSync } from "node:fs";
-import { AppleSessionRepository, mergeSavedLists, type AppleSession } from "../src/persistence/apple-sessions.ts";
-import { AppleConnectionService, ControlledRead } from "../src/auth/service.ts";
+import { AppleSessionRepository, RecurringIntentSchema, mergeSavedLists, type AppleSession } from "../src/persistence/apple-sessions.ts";
+import { AppleConnectionService, ControlledRead, SearchReminderInput } from "../src/auth/service.ts";
 import { AppError } from "../src/errors.ts";
 import { omitField } from "../src/lib/omit-field.ts";
 import { CookieJar } from "../src/transport/cookie-jar.ts";
@@ -11,6 +11,9 @@ import { Envelopes } from "../src/crypto/envelopes.ts";
 import { LoginAssuranceSchema, loginAssurance, SESSION_RETENTION_MS } from "../src/auth/apple/policy.ts";
 import { AppleSessionRenewal, appleRequestBudget, renewalCheckpoint } from "../src/auth/apple/session-renewal.ts";
 import { encodeDocument } from "../src/reminders/crdt.ts";
+import { buildCreateReminder } from "../src/reminders/writes.ts";
+import { buildCreateList } from "../src/reminders/list-writes.ts";
+import { encodeGroceryCorrections, encodeSectionMemberships, groceryCorrectionsChecksum, membershipsChecksum, SHOPPING_PROTOCOL_VERSION } from "../src/reminders/shopping-categories.ts";
 import { b64 } from "../src/crypto/bytes.ts";
 
 // Real SQLite executes repository SQL. This adapter models D1's transactional batch.
@@ -70,6 +73,13 @@ const acceptedAccount = (dsid = "123456789", host = "p123-ckdatabasews.icloud.co
   dsInfo: { dsid }, webservices: { ckdatabasews: { url: `https://${host}` } },
 });
 const hasCode = (code: string) => (error: unknown) => error instanceof AppError && error.code === code;
+const syntheticMutableListFields = () => ({
+  Name: { type: "STRING", value: "Synthetic list" }, Deleted: { type: "INT64", value: 0 }, IsGroup: { type: "INT64", value: 0 },
+  ReminderIDs: { type: "STRING", value: "[]" },
+  ResolutionTokenMap: { type: "STRING", value: JSON.stringify({ map: {
+    reminderIDsMergeableOrdering: { counter: 1, modificationTime: 757_382_400, replicaID: "3e6cb834-5b1c-4ce6-8c39-00e752121111" },
+  } }) },
+});
 
 test("legacy and retained assurance variants stay strict and separate authentication from retention", () => {
   const now = Date.parse("2026-10-09T19:25:12.131Z");
@@ -451,7 +461,7 @@ test("read-only recovery rebuilds the client and mutation preparation retries on
           assert.equal(url.hostname, "p42-ckdatabasews.icloud.com", "Recovery must not retain the old service endpoint.");
           const payload = JSON.parse(String(init?.body));
           return new Response(JSON.stringify({ records: payload.records.map((record: { recordName: string }) => record.recordName.startsWith("List/")
-            ? { recordName: record.recordName, recordType: "List", fields: { Name: { type: "STRING", value: "Synthetic list" } } }
+            ? { recordName: record.recordName, recordType: "List", recordChangeTag: "synthetic-list-version", fields: syntheticMutableListFields() }
             : { recordName: record.recordName, serverErrorCode: "NOT_FOUND" }) }));
         }
         if (url.pathname.endsWith("/records/modify")) { dispatches++; return new Response("{}", { status: 503 }); }
@@ -483,7 +493,7 @@ test("authentication rejection after dispatch never starts recovery or repeats a
     if (url.pathname.endsWith("/records/modify")) { dispatches++; return new Response("{}", { status: 401 }); }
     const payload = JSON.parse(String(init?.body));
     return new Response(JSON.stringify({ records: payload.records.map((record: { recordName: string }) => record.recordName.startsWith("List/")
-      ? { recordName: record.recordName, recordType: "List", fields: {} } : { recordName: record.recordName, serverErrorCode: "NOT_FOUND" }) }));
+      ? { recordName: record.recordName, recordType: "List", recordChangeTag: "synthetic-list-version", fields: syntheticMutableListFields() } : { recordName: record.recordName, serverErrorCode: "NOT_FOUND" }) }));
   };
   try {
     await assert.rejects(new AppleConnectionService(env, owner).mutate({ action: "create", expectedGeneration: setup.generation, listId: "List/SAFE", title: "Synthetic reminder", idempotencyKey: "11111111-1111-4111-8111-111111111111" }), AppError);
@@ -620,6 +630,171 @@ test("existing encrypted sessions discard retired catalogue state without discon
   for (const action of ["sync-catalogue", "catalogue-auto", "lists", "probe-other-zones"]) assert.equal(ControlledRead.safeParse({ action, expectedGeneration: setup.generation }).success, false);
   db.sqlite.close();
 });
+
+test("copy intent checkpoint retains only bound hashes through lease release and rejects stale or changed identity", async () => {
+  const db = new SQLiteD1(), repository = appleRepo(db), session = appleSession();
+  const setup = await repository.begin(0); await repository.commit(setup, session, "READY");
+  const saved = await repository.load(), fence = await repository.claimRead(saved.fence.generation, saved.fence.version);
+  const intent = { id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", requestFingerprint: "a".repeat(64), contentFingerprint: "b".repeat(64) };
+  assert.deepEqual(await repository.checkpointCopyIntent(fence, intent), [intent]);
+  await repository.assertWriteLease(fence);
+  assert.equal((await repository.load()).fence.version, fence.version);
+  await assert.rejects(repository.checkpointCopyIntent(fence, { ...intent, requestFingerprint: "c".repeat(64) }), hasCode("CONFLICT"));
+  const identities = (await import("../src/reminders/recurring-lifecycle.ts")).recurringIdentities();
+  const occurrence = { requestFingerprint: "d".repeat(64), sourceFingerprint: "e".repeat(64), timestamp: Date.now(), phase: "prepared" as const, ids: identities,
+    expected: ["Reminder", "Reminder", "List", "RecurrenceRule"].map((type, index) => ({ id: `${type}/${index}`, type: type as "Reminder" | "List" | "RecurrenceRule", hash: "f".repeat(64) })), retired: [] };
+  const terminal = { ...occurrence, mode: "final" as const, ids: { replicas: identities.replicas }, expected: occurrence.expected.filter((_, index) => index !== 1) };
+  assert.equal(RecurringIntentSchema.safeParse(terminal).success, true);
+  assert.equal(RecurringIntentSchema.safeParse({ ...terminal, mode: "reopen" }).success, true);
+  assert.equal(RecurringIntentSchema.safeParse({ ...terminal, mode: undefined }).success, false);
+  assert.equal(RecurringIntentSchema.safeParse({ ...terminal, ids: identities }).success, false);
+  assert.equal(RecurringIntentSchema.safeParse({ ...terminal, expected: occurrence.expected.slice(0, 3) }).success, false);
+  assert.deepEqual(RecurringIntentSchema.parse(occurrence), occurrence, "Omitting calendar zone leaves the legacy serialized intent unchanged.");
+  assert.equal(RecurringIntentSchema.safeParse({ ...terminal, recurrenceCalendarTimeZone: "Europe/London" }).success, true);
+  assert.equal(RecurringIntentSchema.safeParse({ ...terminal, recurrenceCalendarTimeZone: "+01:00" }).success, false);
+  const pairedTerminal = { ...terminal, intrinsicParentGuards: true as const, expected: [...terminal.expected,
+    { id: "Alarm/RETAINED", type: "Alarm" as const, hash: "a".repeat(64) }, { id: "AlarmTrigger/RETAINED", type: "AlarmTrigger" as const, hash: "b".repeat(64) }] };
+  assert.equal(RecurringIntentSchema.safeParse(pairedTerminal).success, true);
+  assert.equal(RecurringIntentSchema.safeParse({ ...pairedTerminal, mode: "reopen" }).success, true);
+  assert.equal(RecurringIntentSchema.safeParse({ ...pairedTerminal, intrinsicParentGuards: undefined }).success, false);
+  assert.equal(RecurringIntentSchema.safeParse({ ...pairedTerminal, expected: pairedTerminal.expected.slice(0, 4) }).success, false);
+  assert.equal(RecurringIntentSchema.safeParse({ ...pairedTerminal, recurrenceCalendarTimeZone: "Europe/London" }).success, false);
+  assert.deepEqual(RecurringIntentSchema.parse(terminal), terminal, "Legacy terminal intents retain their byte-compatible shape.");
+  const deletion = { ...pairedTerminal, mode: undefined, operation: "delete" as const, recurringDeletionScope: "all_future" as const };
+  assert.equal(RecurringIntentSchema.safeParse(deletion).success, true);
+  assert.equal(RecurringIntentSchema.safeParse({ ...deletion, recurringDeletionScope: undefined }).success, false);
+  assert.equal(RecurringIntentSchema.safeParse({ ...deletion, operation: undefined }).success, false);
+  assert.equal(RecurringIntentSchema.safeParse({ ...deletion, mode: "final" }).success, false);
+  const deleteOccurrence = { ...deletion, recurringDeletionScope: "occurrence" as const, ids: { replicas: identities.replicas, activeAlarm: identities.activeAlarm, activeTrigger: identities.activeTrigger },
+    expected: [...terminal.expected, { id: `Alarm/${identities.activeAlarm}`, type: "Alarm" as const, hash: "a".repeat(64) }, { id: `AlarmTrigger/${identities.activeTrigger}`, type: "AlarmTrigger" as const, hash: "b".repeat(64) }], retired: ["Alarm/OLD", "AlarmTrigger/OLD"] };
+  assert.equal(RecurringIntentSchema.safeParse(deleteOccurrence).success, true);
+  assert.equal(RecurringIntentSchema.safeParse({ ...deleteOccurrence, ids: identities }).success, false);
+  assert.equal(RecurringIntentSchema.safeParse({ ...deleteOccurrence, retired: [] }).success, false);
+  await repository.checkpointRecurringIntent(fence, { ...deleteOccurrence, requestFingerprint: "4".repeat(64) });
+  await assert.rejects(repository.checkpointRecurringIntent(fence, { ...deleteOccurrence, requestFingerprint: "4".repeat(64), recurringDeletionScope: "all_future" }), hasCode("CONFLICT"));
+  const dailyDeletion = { ...deletion, recurringDeletionRecipe: "all_day_daily" as const, expected: terminal.expected };
+  assert.equal(RecurringIntentSchema.safeParse(dailyDeletion).success, true);
+  assert.equal(RecurringIntentSchema.safeParse({ ...dailyDeletion, recurringDeletionScope: "occurrence" }).success, true);
+  assert.equal(RecurringIntentSchema.safeParse({ ...dailyDeletion, recurringDeletionRecipe: undefined }).success, false);
+  assert.equal(RecurringIntentSchema.safeParse({ ...dailyDeletion, ids: deleteOccurrence.ids }).success, false);
+  assert.equal(RecurringIntentSchema.safeParse({ ...dailyDeletion, retired: ["Alarm/OLD"] }).success, false);
+  assert.equal(RecurringIntentSchema.safeParse({ ...dailyDeletion, operation: undefined }).success, false);
+  await repository.checkpointRecurringIntent(fence, { ...dailyDeletion, requestFingerprint: "5".repeat(64) });
+  await assert.rejects(repository.checkpointRecurringIntent(fence, { ...dailyDeletion, requestFingerprint: "5".repeat(64), recurringDeletionRecipe: undefined }), hasCode("CONFLICT"));
+  assert.deepEqual(RecurringIntentSchema.parse(dailyDeletion), dailyDeletion, "No-end daily deletion intents retain their serialized shape.");
+  const endedDeletion = { ...dailyDeletion, recurringDeletionRecipe: "all_day_daily_ended" as const, recurringDeletionTerminal: true as const, recurrenceCalendarTimeZone: "Europe/London" };
+  assert.equal(RecurringIntentSchema.safeParse(endedDeletion).success, true);
+  assert.equal(RecurringIntentSchema.safeParse({ ...endedDeletion, recurringDeletionScope: "occurrence" }).success, true);
+  assert.equal(RecurringIntentSchema.safeParse({ ...endedDeletion, recurringDeletionScope: "occurrence", recurringDeletionTerminal: undefined }).success, true);
+  assert.equal(RecurringIntentSchema.safeParse({ ...endedDeletion, recurringDeletionTerminal: undefined }).success, false);
+  assert.equal(RecurringIntentSchema.safeParse({ ...dailyDeletion, recurringDeletionTerminal: true }).success, false);
+  assert.equal(RecurringIntentSchema.safeParse({ ...dailyDeletion, recurrenceCalendarTimeZone: "Europe/London" }).success, false);
+  assert.equal(RecurringIntentSchema.safeParse({ ...terminal, recurringDeletionTerminal: true }).success, false);
+  const endedPrepared = RecurringIntentSchema.parse({ ...endedDeletion, requestFingerprint: "6".repeat(64) });
+  await repository.checkpointRecurringIntent(fence, endedPrepared);
+  await repository.checkpointRecurringIntent(fence, { ...endedPrepared, phase: "dispatched" });
+  await repository.checkpointRecurringIntent(fence, { ...endedPrepared, phase: "confirmed" });
+  for (const change of [{ recurrenceCalendarTimeZone: "UTC" }, { recurringDeletionScope: "occurrence" as const }, { recurringDeletionTerminal: undefined }])
+    await assert.rejects(repository.checkpointRecurringIntent(fence, { ...endedDeletion, requestFingerprint: "6".repeat(64), ...change }), hasCode("CONFLICT"));
+  const endedWeeklyDelete = RecurringIntentSchema.parse({ ...deletion, recurringDeletionRecipe: "timed_weekly_ended", recurringDeletionTerminal: true });
+  assert.equal(RecurringIntentSchema.safeParse({ ...endedWeeklyDelete, recurringDeletionScope: "occurrence" }).success, true);
+  assert.equal(RecurringIntentSchema.safeParse({ ...endedWeeklyDelete, recurringDeletionTerminal: undefined }).success, false);
+  assert.equal(RecurringIntentSchema.safeParse({ ...endedWeeklyDelete, recurringDeletionScope: "occurrence", ids: deleteOccurrence.ids }).success, false);
+  assert.equal(RecurringIntentSchema.safeParse({ ...endedWeeklyDelete, recurrenceCalendarTimeZone: "Europe/London" }).success, false);
+  assert.equal(RecurringIntentSchema.safeParse({ ...deleteOccurrence, recurringDeletionRecipe: "timed_weekly_ended" }).success, true);
+  assert.deepEqual(RecurringIntentSchema.parse(deletion), deletion, "Legacy no-end weekly deletion retains its serialized shape.");
+  const endedWeeklyPrepared = { ...endedWeeklyDelete, requestFingerprint: "7".repeat(64) };
+  await repository.checkpointRecurringIntent(fence, endedWeeklyPrepared);
+  await repository.checkpointRecurringIntent(fence, { ...endedWeeklyPrepared, phase: "dispatched" });
+  await repository.checkpointRecurringIntent(fence, { ...endedWeeklyPrepared, phase: "confirmed" });
+  for (const change of [{ recurringDeletionRecipe: undefined }, { recurringDeletionTerminal: undefined }, { sourceFingerprint: "9".repeat(64) }])
+    await assert.rejects(repository.checkpointRecurringIntent(fence, { ...endedWeeklyPrepared, ...change }), hasCode("CONFLICT"));
+  const monthlyDeletion = RecurringIntentSchema.parse({ ...dailyDeletion, recurringDeletionRecipe: "all_day_last_day_monthly", requestFingerprint: "8".repeat(64) });
+  assert.equal(RecurringIntentSchema.safeParse({ ...monthlyDeletion, recurringDeletionScope: "occurrence" }).success, true);
+  for (const change of [{ recurringDeletionTerminal: true }, { recurrenceCalendarTimeZone: "UTC" }, { ids: deleteOccurrence.ids }, { retired: ["Alarm/OLD"] }, { expected: deletion.expected }])
+    assert.equal(RecurringIntentSchema.safeParse({ ...monthlyDeletion, ...change }).success, false);
+  await repository.checkpointRecurringIntent(fence, monthlyDeletion);
+  await repository.checkpointRecurringIntent(fence, { ...monthlyDeletion, phase: "dispatched" });
+  await repository.checkpointRecurringIntent(fence, { ...monthlyDeletion, phase: "confirmed" });
+  await assert.rejects(repository.checkpointRecurringIntent(fence, { ...monthlyDeletion, recurringDeletionRecipe: "all_day_daily" }), hasCode("CONFLICT"));
+  await repository.checkpointRecurringIntent(fence, occurrence);
+  const dispatched = { ...occurrence, phase: "dispatched" as const };
+  await repository.checkpointRecurringIntent(fence, dispatched);
+  await assert.rejects(repository.checkpointRecurringIntent(fence, occurrence), hasCode("CONFLICT"));
+  await assert.rejects(repository.checkpointRecurringIntent(fence, { ...dispatched, ids: { ...identities, history: crypto.randomUUID() } }), hasCode("CONFLICT"));
+  await assert.rejects(repository.checkpointRecurringIntent(fence, { ...dispatched, recurrenceCalendarTimeZone: "Europe/London" }), hasCode("CONFLICT"));
+  const confirmed = { ...dispatched, phase: "confirmed" as const };
+  await repository.checkpointRecurringIntent(fence, confirmed);
+  await repository.releaseResume(fence);
+  const restarted = appleRepo(db, owner, repository.envelopes);
+  assert.deepEqual((await restarted.load()).session.copyIntents, [intent]);
+  assert.deepEqual((await restarted.load()).session.recurringIntents?.filter(item => item.requestFingerprint === confirmed.requestFingerprint), [confirmed]);
+  assert.equal((await restarted.load()).session.recurringIntents?.find(item => item.operation === "delete")?.recurringDeletionScope, "occurrence");
+  assert.deepEqual((await restarted.load()).session.login, session.login);
+  await assert.rejects(restarted.checkpointCopyIntent(fence, { ...intent, id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb" }), hasCode("CONFLICT"));
+  const fullSaved = await restarted.load(), fullFence = await restarted.claimRead(fullSaved.fence.generation, fullSaved.fence.version);
+  const cache = Array.from({ length: 256 }, (_, index) => ({ ...occurrence, requestFingerprint: index.toString(16).padStart(64, "0"),
+    phase: index === 0 ? "confirmed" as const : "dispatched" as const, ids: { ...identities, history: crypto.randomUUID() }, timestamp: occurrence.timestamp + index }));
+  await restarted.commitResume(fullFence, { ...fullSaved.session, recurringIntents: cache }, "READY");
+  const capped = await restarted.load(), capFence = await restarted.claimRead(capped.fence.generation, capped.fence.version);
+  const retained = await restarted.checkpointRecurringIntent(capFence, occurrence);
+  assert.equal(retained.length, 256); assert.equal(retained.some(item => item.requestFingerprint === cache[0].requestFingerprint), false);
+  assert.ok(retained.some(item => item.requestFingerprint === cache[1].requestFingerprint));
+  await assert.rejects(restarted.checkpointRecurringIntent(capFence, { ...occurrence, requestFingerprint: "9".repeat(64) }), hasCode("UNSUPPORTED_FEATURE"));
+  await restarted.releaseResume(capFence);
+  await restarted.disconnect();
+  const next = await restarted.begin((await restarted.status()).generation); await restarted.commit(next, appleSession(), "READY");
+  assert.equal((await restarted.load()).session.copyIntents, undefined);
+  db.sqlite.close();
+});
+
+test("recurring prepared requests survive local dispatch gates and cannot resume past the retained next occurrence", async () => fixedClock(async clock => {
+  const nativeFetch = globalThis.fetch;
+  try {
+    for (const mode of ["budget", "lease", "overdue"] as const) {
+      const db = new SQLiteD1(), envelopes = key(), env = { ...testEnv(db, envelopes), APPLE_SESSION_RENEWAL_ENABLED: "disabled" }, repository = new AppleSessionRepository(env, owner);
+      const session = appleSession(); session.connection.remindersZoneOwner = "__defaultOwner__";
+      const setup = await repository.begin(0); await repository.commit(setup, session, "READY");
+      const listId = "List/PREPARED", reminderId = "Reminder/11111111-1111-4111-8111-111111111111", ruleId = "RecurrenceRule/PREPARED";
+      const zoneID = { zoneName: "Reminders", ownerRecordName: "__defaultOwner__" };
+      const root = { ...buildCreateReminder({ listId, idempotencyKey: "11111111-1111-4111-8111-111111111111", title: "Prepared recurring occurrence", notes: "", priority: 0, flagged: false, allDay: false,
+        dueDate: "2026-10-10T00:00:00.000Z" }), recordChangeTag: "active-before", zoneID };
+      root.fields.AllDay = { type: "INT64", value: 1 };
+      root.fields.RecurrenceRuleIDs = { type: "STRING_LIST", value: [ruleId] };
+      const records = new Map<string, unknown>([[reminderId, root], [listId, { recordName: listId, recordType: "List", recordChangeTag: "list-before", zoneID, fields: {
+        Name: { type: "STRING", value: "Prepared" }, Deleted: { type: "INT64", value: 0 }, IsGroup: { type: "INT64", value: 0 },
+        ReminderIDs: { type: "STRING", value: JSON.stringify([reminderId]) }, ResolutionTokenMap: { type: "STRING", value: JSON.stringify({ map: {} }) },
+      } }], [ruleId, { recordName: ruleId, recordType: "RecurrenceRule", recordChangeTag: "rule-before", zoneID, fields: {
+        Frequency: { type: "INT64", value: 0 }, Interval: { type: "INT64", value: 1 }, OccurrenceCount: { type: "INT64", value: 0 }, FirstDayOfTheWeek: { type: "INT64", value: 0 },
+        Imported: { type: "INT64", value: 0 }, Deleted: { type: "INT64", value: 0 }, Reminder: { type: "REFERENCE", value: { recordName: reminderId, action: "VALIDATE" } },
+      } }]]);
+      let dispatches = 0;
+      globalThis.fetch = async (value, init) => {
+        const url = new URL(String(value)), payload = JSON.parse(String(init?.body));
+        if (url.pathname.endsWith("/records/modify")) { dispatches++; return new Response("{}", { status: 503 }); }
+        return Response.json({ records: url.pathname.endsWith("/records/query") ? [root] : payload.records.map((item: { recordName: string }) => records.get(item.recordName) ?? { recordName: item.recordName, serverErrorCode: "NOT_FOUND" }) });
+      };
+      db.afterStatement = async sql => {
+        if (!sql.startsWith("UPDATE apple_session_state SET envelope = ?")) return;
+        db.afterStatement = null;
+        if (mode === "lease") db.sqlite.prepare("UPDATE apple_session_state SET resume_id = ?").run("synthetic-replaced-lease");
+        else clock.now += 32_000;
+      };
+      const args = { action: "complete" as const, expectedGeneration: setup.generation, listId, reminderId, recordChangeTag: "active-before" };
+      await assert.rejects(new AppleConnectionService(env, owner).mutate(args), hasCode("CONFLICT"));
+      const prepared = (await repository.load()).session.recurringIntents!;
+      assert.equal(prepared.length, 1); assert.equal(prepared[0].phase, "prepared"); assert.equal(dispatches, 0);
+      db.sqlite.prepare("UPDATE apple_session_state SET resume_id = NULL, resume_expires_at = NULL").run();
+      if (mode === "overdue") clock.now = Date.parse("2026-10-11T00:00:00Z") + 1;
+      await assert.rejects(new AppleConnectionService(env, owner).mutate(args), hasCode(mode === "overdue" ? "UNSUPPORTED_FEATURE" : "WRITE_OUTCOME_UNKNOWN"));
+      const retained = (await repository.load()).session.recurringIntents!;
+      assert.deepEqual(retained[0].ids, prepared[0].ids);
+      assert.equal(retained[0].phase, mode === "overdue" ? "prepared" : "dispatched");
+      assert.equal(dispatches, mode === "overdue" ? 0 : 1);
+      db.sqlite.close(); clock.now = Date.parse("2026-10-09T19:25:12.131Z");
+    }
+  } finally { globalThis.fetch = nativeFetch; }
+}));
 
 test("Apple setup and disconnect fences reject stale commits and cancellation clears only its own commit", async () => {
   const db = new SQLiteD1(); const repository = appleRepo(db);
@@ -1002,3 +1177,465 @@ test("direct all-open resumes its original list selection without rediscovery af
     assert.equal((await repository.load()).session.allOpenScan, undefined); assert.equal(replies.length, 0);
   } finally { globalThis.fetch = originalFetch; Date.now = originalNow; db.sqlite.close(); }
 });
+
+test("search resumes filtered pages honestly, binds filters and account scope, and rejects cycling Apple cursors", async () => fixedClock(async clock => {
+  const originalFetch = globalThis.fetch, originalNow = Date.now;
+  const db = new SQLiteD1(), envelopes = key(), repository = appleRepo(db, owner, envelopes), session = appleSession();
+  session.connection.remindersZoneOwner = "__defaultOwner__";
+  const setup = await repository.begin(0); await repository.commit(setup, session, "READY");
+  const env = { ...testEnv(db, envelopes) };
+  const service = () => new AppleConnectionService(env, owner);
+  const list = (id: string) => ({ recordName: id, recordType: "List", fields: { Name: { type: "STRING", value: id.slice(5) }, IsGroup: { type: "INT64", value: 0 }, Deleted: { type: "INT64", value: 0 } } });
+  const reminder = (id: string, listId: string, title: string, completed = 0, extra: { notes?: string; flagged?: boolean; priority?: number; dueDate?: string; hashtagIds?: string[]; attachmentIds?: string[] } = {}) => {
+    const fields: Record<string, unknown> = {
+      List: { type: "REFERENCE", value: { recordName: listId, action: "VALIDATE" } },
+      TitleDocument: { type: "ENCRYPTED_BYTES", value: encodeDocument(title) },
+      Completed: { type: "INT64", value: completed },
+      Deleted: { type: "INT64", value: 0 },
+    };
+    if (extra.notes !== undefined) fields.NotesDocument = { type: "ENCRYPTED_BYTES", value: encodeDocument(extra.notes) };
+    if (extra.flagged !== undefined) fields.Flagged = { type: "INT64", value: Number(extra.flagged) };
+    if (extra.priority !== undefined) fields.Priority = { type: "INT64", value: extra.priority };
+    if (extra.dueDate !== undefined) fields.DueDate = { type: "TIMESTAMP", value: Date.parse(extra.dueDate) };
+    if (extra.hashtagIds !== undefined) fields.HashtagIDs = { type: "STRING_LIST", value: extra.hashtagIds };
+    if (extra.attachmentIds !== undefined) fields.AttachmentIDs = { type: "STRING_LIST", value: extra.attachmentIds };
+    return { recordName: id, recordType: "Reminder", recordChangeTag: `version-${id}`, fields };
+  };
+  const pendingPages: { listId: string; cursor?: string; includeCompleted: number; reply: unknown }[] = [
+    { listId: "List/A", includeCompleted: 0, reply: { records: [reminder("Reminder/A-OTHER", "List/A", "unrelated")], continuationMarker: "native-a-next" } },
+    { listId: "List/A", cursor: "native-a-next", includeCompleted: 0, reply: { records: [reminder("Reminder/A-LATER", "List/A", "Target appears later")] } },
+    { listId: "List/A", includeCompleted: 0, reply: { records: [], continuationMarker: "native-expire-next" } },
+    { listId: "List/B", includeCompleted: 1, reply: { records: [
+      reminder("Reminder/B-OPEN", "List/B", "target open", 0, { flagged: true, priority: 5, dueDate: "2026-10-10T12:00:00.000Z" }),
+      reminder("Reminder/B-DONE", "List/B", "completed work", 1, { notes: "Needle appears only in notes", flagged: true, priority: 5, dueDate: "2026-10-10T12:00:00.000Z" }),
+      reminder("Reminder/B-UNFLAGGED", "List/B", "Needle unflagged", 1, { flagged: false, priority: 5, dueDate: "2026-10-10T12:00:00.000Z" }),
+      reminder("Reminder/B-WRONG-PRIORITY", "List/B", "Needle wrong priority", 1, { flagged: true, priority: 9, dueDate: "2026-10-10T12:00:00.000Z" }),
+      reminder("Reminder/B-OUTSIDE-DUE", "List/B", "Needle later", 1, { flagged: true, priority: 5, dueDate: "2026-10-11T00:00:00.000Z" }),
+    ] } },
+    { listId: "List/A", includeCompleted: 0, reply: { records: [], continuationMarker: "cycle-marker" } },
+    { listId: "List/A", cursor: "cycle-marker", includeCompleted: 0, reply: { records: [], continuationMarker: "cycle-marker" } },
+  ];
+  const relatedRecords = new Map<string, Record<string, unknown>>();
+  const zoneID = { zoneName: "Reminders", zoneType: "REGULAR_CUSTOM_ZONE", ownerRecordName: "__defaultOwner__" };
+  const relationshipIds = {
+    workA: "00000000-0000-4000-8000-000000000001", homeA: "00000000-0000-4000-8000-000000000002",
+    urlA: "00000000-0000-4000-8000-000000000003", workB: "00000000-0000-4000-8000-000000000004",
+    image: "00000000-0000-4000-8000-000000000005", homeDone: "00000000-0000-4000-8000-000000000006",
+    urlDone: "00000000-0000-4000-8000-000000000007", missing: "00000000-0000-4000-8000-000000000008",
+    ambiguousUrl: "00000000-0000-4000-8000-000000000009", unclassifiedUrl: "00000000-0000-4000-8000-00000000000a",
+    unclassifiedAttachment: "00000000-0000-4000-8000-00000000000b",
+  };
+  const related = (recordName: string, recordType: "Hashtag" | "Attachment", reminderId: string, fields: Record<string, unknown>) =>
+    relatedRecords.set(recordName, { recordName, recordType, recordChangeTag: `version-${recordName}`, zoneID, fields: {
+      ...fields, Deleted: { type: "INT64", value: 0 }, Imported: { type: "INT64", value: 0 },
+      Reminder: { type: "REFERENCE", value: { recordName: reminderId, action: "VALIDATE" } },
+    } });
+  const tag = (id: string, reminderId: string, name: string) => related(`Hashtag/${id}`, "Hashtag", reminderId, {
+    Name: { type: "STRING", value: name, isEncrypted: true }, Type: { type: "INT64", value: 0 },
+  });
+  const url = (id: string, reminderId: string, value: string) => related(`Attachment/${id}`, "Attachment", reminderId, {
+    Type: { type: "STRING", value: "URL" }, UTI: { type: "STRING", value: "public.url" },
+    URL: { type: "STRING", value, isEncrypted: true },
+  });
+  const image = (id: string, reminderId: string) => related(`Attachment/${id}`, "Attachment", reminderId, {
+    Type: { type: "STRING", value: "Image" }, UTI: { type: "STRING", value: "public.jpeg" },
+  });
+  const filteredAll = reminder("Reminder/FILTER-ALL", "List/A", "ordinary title", 0, { notes: "ordinary notes", hashtagIds: [relationshipIds.workA, relationshipIds.homeA], attachmentIds: [relationshipIds.urlA] });
+  const filteredWork = reminder("Reminder/FILTER-WORK", "List/A", "ordinary title", 0, { hashtagIds: [relationshipIds.workB] });
+  const filteredNone = reminder("Reminder/FILTER-UNTAGGED", "List/A", "https://example.test/Path", 0, {
+    notes: "https://example.test/Path", hashtagIds: [], attachmentIds: [relationshipIds.image],
+  });
+  const filteredDone = Object.assign(reminder("Reminder/FILTER-DONE", "List/A", "completed", 1, { hashtagIds: [relationshipIds.homeDone], attachmentIds: [relationshipIds.urlDone] }), {
+    created: { timestamp: Date.parse("2024-10-01T00:00:00.000Z") }, modified: { timestamp: Date.parse("2024-10-02T00:00:00.000Z") },
+  });
+  filteredDone.fields.CompletionDate = { type: "TIMESTAMP", value: Date.parse("2024-10-03T12:00:00.000Z") };
+  filteredDone.fields.DueDate = { type: "TIMESTAMP", value: Date.parse("2024-10-03T12:00:00.000Z") };
+  filteredDone.fields.StartDate = { type: "TIMESTAMP", value: Date.parse("2024-10-03T10:00:00.000Z") };
+  filteredDone.fields.Flagged = { type: "INT64", value: 1 };
+  filteredDone.fields.Priority = { type: "INT64", value: 5 };
+  tag(relationshipIds.workA, filteredAll.recordName, "work"); tag(relationshipIds.homeA, filteredAll.recordName, "home"); url(relationshipIds.urlA, filteredAll.recordName, "https://example.test/Path");
+  tag(relationshipIds.workB, filteredWork.recordName, "work"); image(relationshipIds.image, filteredNone.recordName);
+  tag(relationshipIds.homeDone, filteredDone.recordName, "home"); url(relationshipIds.urlDone, filteredDone.recordName, "https://other.test/done");
+  const requests: { path: string; body: Record<string, any> }[] = [];
+  const searchDesiredKeys = ["List", "ParentReminder", "TitleDocument", "NotesDocument", "Completed", "CompletionDate", "DueDate", "StartDate", "Priority", "Flagged", "AllDay", "Deleted", "TimeZone", "AlarmIDs", "AttachmentIDs", "HashtagIDs", "RecurrenceRuleIDs"];
+  globalThis.fetch = async (input, init) => {
+    const path = new URL(String(input)).pathname, body = JSON.parse(String(init?.body));
+    requests.push({ path, body });
+    if (path.endsWith("/records/lookup")) {
+      const ids = body.records.map((record: { recordName: string }) => record.recordName);
+      return new Response(JSON.stringify({ records: ids.map((id: string) => relatedRecords.get(id) ??
+        (id.startsWith("Hashtag/") || id.startsWith("Attachment/") ? { recordName: id, serverErrorCode: "NOT_FOUND" } : list(id))) }));
+    }
+    assert.ok(path.endsWith("/records/query"));
+    if (body.query.recordType === "Lists") return new Response(JSON.stringify({ records: [list("List/A"), list("List/B")] }));
+    assert.equal(body.query.recordType, "reminderList");
+    const listId = body.query.filterBy.find((filter: any) => filter.fieldName === "List").fieldValue.value.recordName;
+    const includeCompleted = body.query.filterBy.find((filter: any) => filter.fieldName === "includeCompleted").fieldValue.value;
+    const page = pendingPages.shift(); assert.ok(page, "Unexpected search reminder query");
+    assert.equal(listId, page.listId); assert.equal(includeCompleted, page.includeCompleted); assert.equal(body.continuationMarker, page.cursor);
+    assert.deepEqual(body.desiredKeys, searchDesiredKeys, "The search path requests only its proven normalized reminder fields.");
+    const reply = structuredClone(page.reply) as { records?: Record<string, unknown>[]; [key: string]: unknown };
+    const requested = new Set(searchDesiredKeys);
+    reply.records = reply.records?.map(record => record.recordType === "Reminder" ? {
+      ...record, fields: Object.fromEntries(Object.entries(record.fields as Record<string, unknown>).filter(([name]) => requested.has(name))),
+    } : record);
+    return new Response(JSON.stringify(reply));
+  };
+  try {
+    const first = await service().searchRemindersForMCP({ expectedGeneration: setup.generation, text: "target" });
+    assert.deepEqual(first.result.records, []); assert.equal(first.result.complete, false); assert.ok(first.result.continuation);
+    assert.equal(first.result.progress.currentListId, "List/A"); assert.equal(first.result.consistency, "live-pages-not-snapshot");
+    const saved = (await repository.load()).session.searchScan;
+    assert.equal(saved?.cursor, "native-a-next"); assert.deepEqual(saved?.listIds, ["List/A", "List/B"]);
+    assert.equal(JSON.stringify(saved).includes("A-OTHER"), false);
+    const envelope = String(db.sqlite.prepare("SELECT envelope FROM apple_session_state WHERE owner_id = ?").get(owner)?.envelope);
+    assert.equal(envelope.includes("native-a-next"), false); assert.equal(envelope.includes("A-OTHER"), false);
+
+    const beforeMismatch = requests.length;
+    await assert.rejects(service().searchRemindersForMCP({ expectedGeneration: setup.generation, text: "other", continuation: first.result.continuation }), hasCode("CONFLICT"));
+    assert.equal(requests.length, beforeMismatch, "A changed filter is rejected before Apple is queried.");
+    const later = await service().searchRemindersForMCP({ expectedGeneration: setup.generation, text: "target", continuation: first.result.continuation });
+    assert.deepEqual(later.result.records.map(record => record.id), ["Reminder/A-LATER"]);
+    assert.equal(later.result.complete, false, "The other selected list still has a page to scan.");
+    assert.equal(requests.at(-1)!.body.continuationMarker, "native-a-next");
+
+    const expiring = await service().searchRemindersForMCP({ expectedGeneration: setup.generation, text: "expired", listId: "List/A" });
+    assert.equal(expiring.result.complete, false);
+    clock.now += 600_001;
+    await assert.rejects(service().searchRemindersForMCP({ expectedGeneration: setup.generation, text: "expired", listId: "List/A", continuation: expiring.result.continuation }), hasCode("RESTART_REQUIRED"));
+    assert.equal((await repository.load()).session.searchScan, undefined);
+    clock.now -= 600_001;
+
+    const completed = await service().searchRemindersForMCP({ expectedGeneration: setup.generation, text: "needle", status: "completed", flagged: true, priority: 5,
+      dueFrom: "2026-10-10T00:00:00.000Z", dueTo: "2026-10-10T23:59:59.999Z", listId: "List/B" });
+    assert.deepEqual(completed.result.records.map(record => record.id), ["Reminder/B-DONE"]);
+    assert.equal(completed.result.complete, true); assert.equal(requests.at(-1)!.body.query.filterBy.find((filter: any) => filter.fieldName === "List").fieldValue.value.recordName, "List/B");
+    assert.equal(requests.at(-1)!.body.query.filterBy.find((filter: any) => filter.fieldName === "includeCompleted").fieldValue.value, 1);
+
+    const cycling = await service().searchRemindersForMCP({ expectedGeneration: setup.generation, text: "cycle", listId: "List/A" });
+    await assert.rejects(service().searchRemindersForMCP({ expectedGeneration: setup.generation, text: "cycle", listId: "List/A", continuation: cycling.result.continuation }), (error: unknown) => error instanceof AppError && error.code === "PROTOCOL_CHANGED");
+    assert.equal((await repository.load()).session.searchScan, undefined, "A cycling native continuation retires the unusable search token.");
+    assert.equal(pendingPages.length, 0);
+
+    const enqueue = (records: unknown[], options: { completed?: boolean; continuation?: string; cursor?: string } = {}) => pendingPages.push({
+      listId: "List/A", includeCompleted: options.completed === false ? 0 : 1,
+      ...(options.cursor ? { cursor: options.cursor } : {}),
+      reply: { records, ...(options.continuation ? { continuationMarker: options.continuation } : {}) },
+    });
+    enqueue([filteredAll, filteredWork, filteredNone]);
+    const allTags = await service().searchRemindersForMCP({ expectedGeneration: setup.generation, listId: "List/A", status: "all", tags: ["work", "home"] });
+    assert.deepEqual(allTags.result.records.map(record => record.id), ["Reminder/FILTER-ALL"], "Omitted tagMatch requires every exact name.");
+    assert.ok(!JSON.stringify(allTags.result).includes("https://example.test/Path") && !JSON.stringify(allTags.result).includes("work"));
+    assert.deepEqual(requests.filter(request => request.path.endsWith("/records/lookup")).at(-1)?.body.records.map((item: { recordName: string }) => item.recordName),
+      [`Hashtag/${relationshipIds.workA}`, `Hashtag/${relationshipIds.homeA}`, `Hashtag/${relationshipIds.workB}`], "Tag-only search hydrates candidate tags but does not fetch attachments.");
+
+    enqueue([filteredAll, filteredWork, filteredNone]);
+    const anyTags = await service().searchRemindersForMCP({ expectedGeneration: setup.generation, listId: "List/A", status: "all", tags: ["work", "home"], tagMatch: "any" });
+    assert.deepEqual(anyTags.result.records.map(record => record.id), ["Reminder/FILTER-ALL", "Reminder/FILTER-WORK"]);
+
+    enqueue([filteredAll, filteredWork, filteredNone]);
+    const untagged = await service().searchRemindersForMCP({ expectedGeneration: setup.generation, listId: "List/A", status: "all", hasTags: false });
+    assert.deepEqual(untagged.result.records.map(record => record.id), ["Reminder/FILTER-UNTAGGED"]);
+
+    enqueue([filteredAll, filteredWork, filteredNone]);
+    const urlText = await service().searchRemindersForMCP({ expectedGeneration: setup.generation, listId: "List/A", status: "all", urlText: "EXAMPLE.TEST/path" });
+    assert.deepEqual(urlText.result.records.map(record => record.id), ["Reminder/FILTER-ALL"], "URL substring is case-insensitive and comes only from the native URL attachment.");
+    assert.deepEqual(requests.filter(request => request.path.endsWith("/records/lookup")).at(-1)?.body.records.map((item: { recordName: string }) => item.recordName),
+      [`Attachment/${relationshipIds.urlA}`, `Attachment/${relationshipIds.image}`], "URL-only search does not fetch hashtags and treats other attachments as opaque.");
+
+    enqueue([filteredAll, filteredWork, filteredNone]);
+    const withoutURL = await service().searchRemindersForMCP({ expectedGeneration: setup.generation, listId: "List/A", status: "all", hasUrl: false });
+    assert.deepEqual(withoutURL.result.records.map(record => record.id), ["Reminder/FILTER-WORK", "Reminder/FILTER-UNTAGGED"]);
+
+    enqueue([filteredDone], { completed: true });
+    const combinedDone = await service().searchRemindersForMCP({ expectedGeneration: setup.generation, listId: "List/A", status: "completed", tags: ["home"], hasUrl: true });
+    assert.deepEqual(combinedDone.result.records.map(record => record.id), ["Reminder/FILTER-DONE"]);
+    assert.equal(combinedDone.result.records[0].completedDate, "2024-10-03T12:00:00.000Z");
+    assert.equal(combinedDone.result.records[0].dueDate, "2024-10-03T12:00:00.000Z");
+    assert.equal(combinedDone.result.records[0].created, "2024-10-01T00:00:00.000Z");
+    assert.equal(combinedDone.result.records[0].modified, "2024-10-02T00:00:00.000Z");
+
+    enqueue([filteredAll], { continuation: "search-hydration-next" });
+    const hydrationFirst = await service().searchRemindersForMCP({ expectedGeneration: setup.generation, listId: "List/A", status: "all", tags: ["work"] });
+    const hydrationToken = hydrationFirst.result.continuation!;
+    const beforeChangedHydration = requests.length;
+    await assert.rejects(service().searchRemindersForMCP({ expectedGeneration: setup.generation, listId: "List/A", status: "all", tags: ["home"], continuation: hydrationToken }), hasCode("CONFLICT"));
+    assert.equal(requests.length, beforeChangedHydration, "Changed hydration filters are rejected before another Apple query.");
+    enqueue([filteredWork], { cursor: "search-hydration-next" });
+    const hydrationLater = await service().searchRemindersForMCP({ expectedGeneration: setup.generation, listId: "List/A", status: "all", tags: ["work"], continuation: hydrationToken });
+    assert.deepEqual(hydrationLater.result.records.map(record => record.id), ["Reminder/FILTER-WORK"]);
+
+    enqueue([], { continuation: "search-related-error-next" });
+    const relatedErrorFirst = await service().searchRemindersForMCP({ expectedGeneration: setup.generation, listId: "List/A", status: "all", tags: ["missing"] });
+    const relatedErrorToken = relatedErrorFirst.result.continuation!;
+    const missingTag = reminder("Reminder/MISSING-TAG", "List/A", "no relation", 0, { hashtagIds: [relationshipIds.missing] });
+    enqueue([missingTag], { cursor: "search-related-error-next" });
+    await assert.rejects(service().searchRemindersForMCP({ expectedGeneration: setup.generation, listId: "List/A", status: "all", tags: ["missing"], continuation: relatedErrorToken }), hasCode("CONFLICT"));
+    assert.equal((await repository.load()).session.searchScan?.token, relatedErrorToken, "A missing relationship leaves the prior cursor available.");
+
+    const unclassifiedURLRoot = reminder("Reminder/UNCLASSIFIED-URL", "List/A", "url classification", 0, { attachmentIds: [relationshipIds.unclassifiedUrl] });
+    const unclassifiedURLFields = { URL: { type: "STRING", value: "https://example.test/unclassified", isEncrypted: true } };
+    related(`Attachment/${relationshipIds.unclassifiedUrl}`, "Attachment", unclassifiedURLRoot.recordName, unclassifiedURLFields);
+    enqueue([], { continuation: "search-unclassified-url-next" });
+    const unclassifiedURLFirst = await service().searchRemindersForMCP({ expectedGeneration: setup.generation, listId: "List/A", status: "all", urlText: "example.test/unclassified" });
+    const unclassifiedURLToken = unclassifiedURLFirst.result.continuation!;
+    enqueue([unclassifiedURLRoot], { cursor: "search-unclassified-url-next" });
+    await assert.rejects(service().searchRemindersForMCP({ expectedGeneration: setup.generation, listId: "List/A", status: "all", urlText: "example.test/unclassified", continuation: unclassifiedURLToken }), hasCode("UNSUPPORTED_FEATURE"));
+    assert.equal((await repository.load()).session.searchScan?.token, unclassifiedURLToken, "Missing URL classification leaves the prior continuation available.");
+    related(`Attachment/${relationshipIds.unclassifiedUrl}`, "Attachment", unclassifiedURLRoot.recordName, {
+      ...unclassifiedURLFields, Type: { type: "STRING", value: "URL" }, UTI: { type: "STRING", value: "public.url" },
+    });
+    enqueue([unclassifiedURLRoot], { cursor: "search-unclassified-url-next" });
+    const classifiedURLRetry = await service().searchRemindersForMCP({ expectedGeneration: setup.generation, listId: "List/A", status: "all", urlText: "example.test/unclassified", continuation: unclassifiedURLToken });
+    assert.deepEqual(classifiedURLRetry.result.records.map(record => record.id), [unclassifiedURLRoot.recordName], "Repairing classification lets the same token return the URL match.");
+
+    const ambiguousRoot = reminder("Reminder/AMBIGUOUS-URL", "List/A", "url classification", 0,
+      { attachmentIds: [relationshipIds.ambiguousUrl, relationshipIds.unclassifiedAttachment] });
+    related(`Attachment/${relationshipIds.ambiguousUrl}`, "Attachment", ambiguousRoot.recordName, {
+      Type: { type: "STRING", value: "Image" }, UTI: { type: "STRING", value: "public.jpeg" },
+      URL: { type: "STRING", value: "https://example.test/hidden", isEncrypted: true },
+    });
+    related(`Attachment/${relationshipIds.unclassifiedAttachment}`, "Attachment", ambiguousRoot.recordName, {});
+    enqueue([], { continuation: "search-ambiguous-url-next" });
+    const ambiguousFirst = await service().searchRemindersForMCP({ expectedGeneration: setup.generation, listId: "List/A", status: "all", hasUrl: false });
+    const ambiguousToken = ambiguousFirst.result.continuation!;
+    enqueue([ambiguousRoot], { cursor: "search-ambiguous-url-next" });
+    await assert.rejects(service().searchRemindersForMCP({ expectedGeneration: setup.generation, listId: "List/A", status: "all", hasUrl: false, continuation: ambiguousToken }), hasCode("UNSUPPORTED_FEATURE"));
+    assert.equal((await repository.load()).session.searchScan?.token, ambiguousToken, "A non-URL classification with an encrypted URL field leaves the prior cursor available.");
+    related(`Attachment/${relationshipIds.ambiguousUrl}`, "Attachment", ambiguousRoot.recordName, {
+      Type: { type: "STRING", value: "Image" }, UTI: { type: "STRING", value: "public.jpeg" },
+    });
+    enqueue([ambiguousRoot], { cursor: "search-ambiguous-url-next" });
+    await assert.rejects(service().searchRemindersForMCP({ expectedGeneration: setup.generation, listId: "List/A", status: "all", hasUrl: false, continuation: ambiguousToken }), hasCode("UNSUPPORTED_FEATURE"));
+    related(`Attachment/${relationshipIds.unclassifiedAttachment}`, "Attachment", ambiguousRoot.recordName, {
+      Type: { type: "STRING", value: "Image" }, UTI: { type: "STRING", value: "public.png" },
+    });
+    enqueue([ambiguousRoot], { cursor: "search-ambiguous-url-next" });
+    const nonURLRetry = await service().searchRemindersForMCP({ expectedGeneration: setup.generation, listId: "List/A", status: "all", hasUrl: false, continuation: ambiguousToken });
+    assert.deepEqual(nonURLRetry.result.records.map(record => record.id), [ambiguousRoot.recordName], "Observed JPEG and PNG classifications prove absence of a URL.");
+
+    for (const invalid of [
+      { tagMatch: "all" as const }, { tags: ["work"], hasTags: false }, { urlText: "path", hasUrl: false }, { urlText: " \t " },
+      { tags: ["work", "work"] }, { tags: Array.from({ length: 17 }, (_, index) => `tag${index}`) },
+    ]) assert.throws(() => SearchReminderInput.parse({ expectedGeneration: setup.generation, listId: "List/A", ...invalid }));
+  } finally { globalThis.fetch = originalFetch; Date.now = originalNow; db.sqlite.close(); }
+}));
+
+test("Shopping category read and move bind cursor scope and confirm native asset receipts without zone fields", async () => fixedClock(async clock => {
+  const originalFetch = globalThis.fetch;
+  const db = new SQLiteD1(), envelopes = key(), env = testEnv(db, envelopes), repository = new AppleSessionRepository(env, owner, envelopes);
+  const session = appleSession();
+  const ownedZone = { zoneName: "Reminders", zoneType: "REGULAR_CUSTOM_ZONE", ownerRecordName: "_synthetic-shopping-owner" };
+  session.connection.remindersZoneOwner = ownedZone.ownerRecordName;
+  session.renewal = { ...renewalCheckpoint(), lastValidatedAt: clock.now };
+  const setup = await repository.begin(0); await repository.commit(setup, session, "READY");
+  const service = () => new AppleConnectionService(env, owner);
+
+  const createdList = buildCreateList({ name: "Synthetic groceries", idempotencyKey: crypto.randomUUID() }, clock.now - 30_000);
+  const listId = createdList.recordName;
+  const rootWrite = buildCreateReminder({ listId, idempotencyKey: crypto.randomUUID(), title: "Whole Milk", notes: "Keep chilled", priority: 0, flagged: false, allDay: false }, clock.now - 20_000);
+  const reminderId = rootWrite.recordName, reminderUUID = reminderId.slice("Reminder/".length);
+  const otherReminderId = `Reminder/${crypto.randomUUID().toUpperCase()}`;
+  const previousCategoryId = `ListSection/${crypto.randomUUID().toUpperCase()}`;
+  const destinationCategoryId = `ListSection/${crypto.randomUUID().toUpperCase()}`;
+  const unrelatedListId = `List/${crypto.randomUUID().toUpperCase()}`;
+  const unrelatedCategoryId = `ListSection/${crypto.randomUUID().toUpperCase()}`;
+  const nativeZoneRef = { recordName: listId, zoneID: ownedZone };
+  const memberships = { minimumSupportedVersion: SHOPPING_PROTOCOL_VERSION, memberships: [
+    { memberID: reminderUUID, groupID: previousCategoryId.slice("ListSection/".length), modifiedOn: 757_382_400 },
+    { memberID: otherReminderId.slice("Reminder/".length), groupID: previousCategoryId.slice("ListSection/".length), modifiedOn: 757_382_401 },
+  ] };
+  const corrections = { lastResetDate: null, memberships: {
+    "coffee beans": { identifier: previousCategoryId.slice("ListSection/".length), modifiedOn: 757_382_399 },
+    "whole milk": { identifier: previousCategoryId.slice("ListSection/".length), modifiedOn: 757_382_401 },
+  } };
+  const membershipBytes = encodeSectionMemberships(memberships);
+  const correctionBytes = encodeGroceryCorrections(corrections);
+  const membershipAssetURL = "https://cvws.icloud-content.com/B/synthetic-current-memberships";
+  const correctionAssetURL = "https://cvws.icloud-content.com/B/synthetic-current-corrections";
+  const assetContents = new Map<string, Uint8Array>([[membershipAssetURL, membershipBytes], [correctionAssetURL, correctionBytes]]);
+  const assetReference = (fileChecksum: string, bytes: Uint8Array, downloadURL: string) => ({ type: "ASSETID", value: {
+    fileChecksum, wrappingKey: `synthetic-${fileChecksum}-key`, referenceChecksum: `synthetic-${fileChecksum}-reference`,
+    size: bytes.byteLength, downloadURL,
+  } });
+  const currentList: Record<string, any> = {
+    ...createdList, recordChangeTag: "synthetic-list-version-1", zoneID: ownedZone, fields: {
+      ...createdList.fields,
+      ShouldCategorizeGroceryItems: { ...createdList.fields.ShouldCategorizeGroceryItems, value: 1 },
+      ReminderIDs: { type: "STRING", value: JSON.stringify([reminderId, otherReminderId]) },
+      MembershipsOfRemindersInSectionsAsData: assetReference("synthetic-memberships-v1", membershipBytes, membershipAssetURL),
+      MembershipsOfRemindersInSectionsChecksum: { type: "STRING", value: await membershipsChecksum(memberships), isEncrypted: true },
+      GroceryLocalCorrectionsAsData: assetReference("synthetic-corrections-v1", correctionBytes, correctionAssetURL),
+      GroceryLocalCorrectionsChecksum: { type: "STRING", value: await groceryCorrectionsChecksum(corrections), isEncrypted: true },
+      SyntheticFutureListField: { type: "STRING", value: "preserve-this-list-field" },
+    },
+  };
+  const rootRecord: Record<string, any> = {
+    recordName: reminderId, recordType: "Reminder", recordChangeTag: "synthetic-reminder-version-1", zoneID: ownedZone,
+    parent: structuredClone(nativeZoneRef), created: { timestamp: clock.now - 20_000 }, modified: { timestamp: clock.now - 20_000 },
+    fields: structuredClone(rootWrite.fields),
+  };
+  const section = (recordName: string, parentListId: string, title: string, tag: string) => ({
+    recordName, recordType: "ListSection", recordChangeTag: tag, zoneID: ownedZone,
+    parent: { recordName: parentListId, zoneID: ownedZone },
+    fields: {
+      List: { type: "REFERENCE", value: { recordName: parentListId, action: "VALIDATE" } },
+      DisplayName: { type: "STRING", value: title }, CanonicalName: { type: "STRING", value: title.toLowerCase() },
+      Deleted: { type: "INT64", value: 0 },
+    },
+  });
+  const previousCategory = section(previousCategoryId, listId, "Pantry", "synthetic-section-version-1");
+  const destinationCategory = section(destinationCategoryId, listId, "Dairy", "synthetic-section-version-1");
+  const unrelatedCategory = section(unrelatedCategoryId, unrelatedListId, "Other list section", "synthetic-section-version-1");
+  const records = new Map<string, Record<string, any>>([
+    [listId, currentList], [reminderId, rootRecord], [previousCategoryId, previousCategory], [destinationCategoryId, destinationCategory],
+    [otherReminderId, { ...rootRecord, recordName: otherReminderId }],
+  ]);
+  const uploadedBytes = new Map<string, Uint8Array>();
+  const uploadReceipts = new Map<string, Record<string, unknown>>();
+  const requests: { host: string; path: string; method: string; body?: Record<string, any> }[] = [];
+  let modifyCount = 0;
+
+  globalThis.fetch = async (input, init) => {
+    const url = new URL(String(input)), method = init?.method ?? "GET";
+    const body = typeof init?.body === "string" ? JSON.parse(init.body) as Record<string, any> : undefined;
+    requests.push({ host: url.hostname, path: url.pathname, method, ...(body ? { body } : {}) });
+    if (url.hostname === "cvws.icloud-content.com") {
+      const bytes = assetContents.get(url.href);
+      assert.ok(bytes, "Only previously observed or uploaded synthetic Shopping assets are downloaded.");
+      const responseBody = new ArrayBuffer(bytes.byteLength);
+      new Uint8Array(responseBody).set(bytes);
+      return new Response(responseBody, { status: 200 });
+    }
+    if (url.hostname === "cws.icloud-content.com" && url.pathname.endsWith("/singleFileUpload")) {
+      assert.equal(method, "POST");
+      const field = url.searchParams.get("field"); assert.ok(field);
+      assert.ok(init?.body instanceof ArrayBuffer);
+      const bytes = new Uint8Array(init.body);
+      uploadedBytes.set(field, bytes);
+      const receipt = {
+        referenceChecksum: `synthetic-upload-reference-${field}`,
+        size: bytes.byteLength,
+        fileChecksum: `synthetic-upload-file-${field}`,
+        wrappingKey: `synthetic-upload-key-${field}`,
+        receipt: `synthetic-upload-receipt-${field}`,
+      };
+      uploadReceipts.set(field, receipt);
+      return new Response(JSON.stringify({ singleFile: receipt }), { status: 200 });
+    }
+    assert.equal(url.hostname, "p123-ckdatabasews.icloud.com");
+    assert.equal(method, "POST");
+    assert.ok(body);
+    if (url.pathname.endsWith("/records/lookup")) {
+      return new Response(JSON.stringify({ records: body.records.map((item: { recordName: string }) => {
+        const found = records.get(item.recordName);
+        assert.ok(found, "Every exact synthetic lookup is backed by the fixture map.");
+        return structuredClone(found);
+      }) }));
+    }
+    if (url.pathname.endsWith("/changes/zone")) {
+      return new Response(JSON.stringify({ zones: [{ zoneID: ownedZone, records: [destinationCategory, unrelatedCategory],
+        moreComing: true, syncToken: "synthetic-native-category-cursor" }] }));
+    }
+    if (url.pathname.endsWith("/records/query")) {
+      assert.equal(body.query.recordType, "reminderList", "The mutation checks the selected List for children before dispatch.");
+      return new Response(JSON.stringify({ records: [] }));
+    }
+    if (url.pathname.endsWith("/assets/upload")) {
+      const tokens = body.tokens as { recordName: string; fieldName: string }[];
+      return new Response(JSON.stringify({ tokens: tokens.map((token, index) => ({
+        recordName: token.recordName, fieldName: token.fieldName,
+        url: `https://cws.icloud-content.com/${710_000 + index}/singleFileUpload?field=${encodeURIComponent(token.fieldName)}`,
+      })) }));
+    }
+    if (url.pathname.endsWith("/records/modify")) {
+      modifyCount++;
+      assert.equal(body.atomic, true);
+      assert.equal(body.operations.length, 3, "The root and List update with the destination category version guard atomically.");
+      const confirmed = body.operations.map((operation: { record: { recordName: string; recordType: string; fields: Record<string, any> } }) => {
+        const before = records.get(operation.record.recordName);
+        assert.ok(before);
+        const next: Record<string, any> = {
+          ...structuredClone(before),
+          recordChangeTag: `${before.recordChangeTag}-confirmed`,
+          fields: { ...structuredClone(before.fields), ...structuredClone(operation.record.fields) },
+        };
+        if (operation.record.recordType === "List") {
+          for (const field of ["MembershipsOfRemindersInSectionsAsData", "GroceryLocalCorrectionsAsData"]) {
+            const tokenField = (operation.record.fields[field].value as Record<string, unknown>);
+            const fieldName = field as string;
+            const receipt = uploadReceipts.get(fieldName);
+            const data = uploadedBytes.get(fieldName);
+            assert.ok(receipt && data);
+            const nextURL = `https://cvws.icloud-content.com/B/synthetic-uploaded-${fieldName}`;
+            assetContents.set(nextURL, data);
+            next.fields[field] = { type: "ASSETID", value: {
+              fileChecksum: tokenField.fileChecksum, wrappingKey: tokenField.wrappingKey,
+              referenceChecksum: tokenField.referenceChecksum, size: tokenField.size, downloadURL: nextURL,
+            } };
+          }
+        }
+        records.set(operation.record.recordName, next);
+        const responseRecord = structuredClone(next);
+        delete responseRecord.zoneID;
+        return responseRecord;
+      });
+      return new Response(JSON.stringify({ records: confirmed }), { status: 200 });
+    }
+    throw new Error(`Unexpected synthetic Apple route ${url.pathname}`);
+  };
+
+  try {
+    const read = await service().readShoppingCategoriesForMCP({ expectedGeneration: setup.generation, listId, limit: 10 });
+    assert.equal(read.complete, false);
+    assert.ok(read.continuation);
+    assert.deepEqual(read.categories.map(category => category.categoryId).sort(), [destinationCategoryId, previousCategoryId].sort());
+    assert.ok(!read.categories.some(category => category.categoryId === unrelatedCategoryId), "A category from another owned List stays out of this catalogue.");
+    assert.deepEqual(read.memberships, [
+      { reminderId, categoryId: previousCategoryId },
+      { reminderId: otherReminderId, categoryId: previousCategoryId },
+    ]);
+    const cursor = read.continuation!;
+    const requestsBeforeScopeChecks = requests.length;
+    await assert.rejects(service().readShoppingCategoriesForMCP({ expectedGeneration: setup.generation, listId: unrelatedListId, continuation: cursor }), hasCode("CONFLICT"));
+    await assert.rejects(new AppleConnectionService(env, "synthetic-other-owner").readShoppingCategoriesForMCP({ expectedGeneration: setup.generation, listId, continuation: cursor }), AppError);
+    assert.equal(requests.length, requestsBeforeScopeChecks, "Wrong List and owner-scoped cursor use fail before Apple is contacted.");
+
+    const beforeSession = await repository.load();
+    const mutation = await service().setShoppingCategory({
+      expectedGeneration: setup.generation, listId, reminderId, recordChangeTag: rootRecord.recordChangeTag,
+      listRecordChangeTag: read.listRecordChangeTag, categoryId: destinationCategoryId,
+      categoryRecordChangeTag: read.categories.find(category => category.categoryId === destinationCategoryId)!.recordChangeTag,
+    });
+    assert.equal(mutation.operation, "set_category");
+    assert.equal(mutation.category.categoryId, destinationCategoryId);
+    assert.equal(mutation.category.name, "Dairy");
+    assert.equal(mutation.record.title, "Whole Milk");
+    assert.equal(mutation.record.notes, "Keep chilled");
+    assert.equal(modifyCount, 1, "The write is dispatched and confirmed once even though receipts omit zoneID.");
+    assert.equal(requests.filter(request => request.host === "cws.icloud-content.com" && request.method === "POST").length, 2);
+    const saved = await repository.load();
+    assert.equal(saved.fence.generation, beforeSession.fence.generation);
+    assert.equal(saved.session.login.expiresAt, beforeSession.session.login.expiresAt);
+    assert.equal(saved.session.categoryScan, undefined, "A successful move invalidates the earlier category cursor.");
+    const savedList = records.get(listId)!;
+    assert.equal((savedList.fields.ReminderIDs as { value: string }).value, JSON.stringify([otherReminderId, reminderId]));
+    assert.deepEqual((savedList.fields.SyntheticFutureListField as { value: string }).value, "preserve-this-list-field");
+    assert.equal((savedList.fields.MembershipsOfRemindersInSectionsChecksum as { isEncrypted: boolean }).isEncrypted, true);
+    assert.equal((savedList.fields.GroceryLocalCorrectionsChecksum as { isEncrypted: boolean }).isEncrypted, true);
+    assert.equal((JSON.parse(new TextDecoder().decode(assetContents.get(`https://cvws.icloud-content.com/B/synthetic-uploaded-MembershipsOfRemindersInSectionsAsData`)!)) as { memberships: { memberID: string; groupID: string }[] }).memberships.find(entry => entry.memberID === reminderUUID)?.groupID,
+      destinationCategoryId.slice("ListSection/".length));
+    assert.equal((JSON.parse(new TextDecoder().decode(assetContents.get(`https://cvws.icloud-content.com/B/synthetic-uploaded-GroceryLocalCorrectionsAsData`)!)) as { memberships: Record<string, { identifier: string }> }).memberships["whole milk"].identifier,
+      destinationCategoryId.slice("ListSection/".length));
+
+    const requestCountAfterMove = requests.length;
+    await assert.rejects(service().readShoppingCategoriesForMCP({ expectedGeneration: setup.generation, listId, continuation: cursor }), hasCode("CONFLICT"));
+    assert.equal(requests.length, requestCountAfterMove, "The consumed category cursor cannot resume after mutation.");
+    await assert.rejects(service().setShoppingCategory({
+      expectedGeneration: setup.generation, listId, reminderId, recordChangeTag: rootRecord.recordChangeTag,
+      listRecordChangeTag: read.listRecordChangeTag, categoryId: destinationCategoryId,
+      categoryRecordChangeTag: read.categories.find(category => category.categoryId === destinationCategoryId)!.recordChangeTag,
+    }), hasCode("CONFLICT"));
+    assert.equal(modifyCount, 1, "A stale List tag cannot start a second write.");
+  } finally { globalThis.fetch = originalFetch; db.sqlite.close(); }
+}));

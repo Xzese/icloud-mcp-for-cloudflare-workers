@@ -2,7 +2,8 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { AppError } from "../src/errors.ts";
 import { buildCreateList, buildRenameList, buildDeleteList, CreateListInput,
-  RenameListInput, DeleteListInput, requireMutableList } from "../src/reminders/list-writes.ts";
+  RenameListInput, DeleteListInput, buildUpdateListAppearance, requireMutableList } from "../src/reminders/list-writes.ts";
+import { COLOR_PRESETS, NATIVE_LIST_COLORS, readListAppearance, UpdateListAppearanceInput } from "../src/reminders/list-appearance.ts";
 import type { CloudKitRecord } from "../src/icloud/cloudkit.ts";
 
 const id = "List/11111111-2222-4333-8444-555555555555";
@@ -103,4 +104,55 @@ test("reject shared list, group, tombstone, missing tags and unsafe names", () =
   assert.throws(() => requireMutableList(missing, owner));
   assert.equal(RenameListInput.safeParse({ listId: id, recordChangeTag: "v1", name: "ok" }).success, true);
   assert.equal(DeleteListInput.safeParse({ listId: id, recordChangeTag: "v1", confirmName: "ok" }).success, true);
+});
+
+test("list appearance uses only native palette values and advances only changed appearance tokens", () => {
+  const existing = current();
+  existing.fields.FutureField = { type: "STRING", value: "opaque future value" };
+  const write = buildUpdateListAppearance({ listId: id, recordChangeTag: "v1", colorPreset: "light-blue", emoji: "🧺" }, existing, owner, 1_800_000_000_000);
+  assert.deepEqual(Object.keys(write.fields).sort(), ["BadgeEmblem", "Color", "ResolutionTokenMap"].sort());
+  assert.equal(write.recordChangeTag, "v1");
+  assert.deepEqual(JSON.parse(String(write.fields.Color.value)), NATIVE_LIST_COLORS["light-blue"]);
+  assert.equal(write.fields.BadgeEmblem.value, '{"Emoji" : "🧺"}');
+  const map = JSON.parse(String(write.fields.ResolutionTokenMap.value)).map;
+  assert.deepEqual(map.name, tokenMap().map.name);
+  assert.deepEqual(map.parentAccount, tokenMap().map.parentAccount);
+  assert.deepEqual(map.retainedNativeField, tokenMap().map.retainedNativeField);
+  assert.equal(map.color.counter, 1);
+  assert.equal(map.badgeEmblem.counter, 1);
+  assert.match(map.color.replicaID, /^[0-9A-F-]{36}$/i);
+  assert.match(map.badgeEmblem.replicaID, /^[0-9A-F-]{36}$/i);
+  assert.equal(Object.hasOwn(write.fields, "Name"), false);
+  assert.equal(Object.hasOwn(write.fields, "ReminderIDs"), false);
+  assert.equal((existing.fields.Color as { value: string }).value, "#007AFF");
+  assert.equal((existing.fields.FutureField as { value: string }).value, "opaque future value");
+
+  const emojiOnly = buildUpdateListAppearance({ listId: id, recordChangeTag: "v1", emoji: "🏷️" }, existing, owner, 1_800_000_000_000);
+  assert.deepEqual(Object.keys(emojiOnly.fields).sort(), ["BadgeEmblem", "ResolutionTokenMap"]);
+  const emojiTokens = JSON.parse(String(emojiOnly.fields.ResolutionTokenMap.value)).map;
+  assert.equal(Object.hasOwn(emojiTokens, "color"), false);
+  assert.equal(emojiTokens.badgeEmblem.counter, 1);
+  for (const invalid of [
+    { listId: id, recordChangeTag: "v1" },
+    { listId: id, recordChangeTag: "v1", colorPreset: "#ff0000" },
+    { listId: id, recordChangeTag: "v1", emoji: "shopping" },
+    { listId: id, recordChangeTag: "v1", emoji: "🧺🛒" },
+    { listId: id, recordChangeTag: "v1", emoji: "🇬" },
+    { listId: id, recordChangeTag: "v1", emoji: "🧭́" },
+  ]) assert.equal(UpdateListAppearanceInput.safeParse(invalid).success, false);
+  assert.equal(COLOR_PRESETS.length, 12);
+});
+
+test("list appearance reads recognized presets while keeping custom and unsupported values opaque", () => {
+  assert.deepEqual(readListAppearance({}), { color: { kind: "default" }, badge: { kind: "none" } });
+  const color = JSON.stringify(NATIVE_LIST_COLORS.orange);
+  const reorderedColor = JSON.stringify(Object.fromEntries(Object.entries(JSON.parse(color)).reverse()));
+  assert.deepEqual(readListAppearance({
+    Color: { type: "STRING", value: reorderedColor },
+    BadgeEmblem: { type: "STRING", value: '{"Emoji" : "🔖"}' },
+  }), { color: { kind: "preset", preset: "orange" }, badge: { kind: "emoji", emoji: "🔖" } });
+  assert.deepEqual(readListAppearance({ Color: { type: "STRING", value: '{"red":0.12,"custom":true}' } }).color, { kind: "custom" });
+  assert.deepEqual(readListAppearance({ Color: { type: "ENCRYPTED_BYTES", value: "opaque" }, BadgeEmblem: { type: "STRING", value: "not-json" } }), {
+    color: { kind: "unsupported" }, badge: { kind: "unsupported" },
+  });
 });

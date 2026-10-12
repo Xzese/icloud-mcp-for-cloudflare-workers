@@ -45,7 +45,7 @@ export async function runControlledLifecycleChecks(invoke, { listId, generation,
     return invoke(name, args, Math.min(40_000, deadline - Date.now()));
   };
   const verify = (record, completed, deleted = false) => {
-    requireTest(record?.id === reminderId && record.listId === listId && record.title === title && record.notes === "Temporary local create/edit acceptance item." && record.priority === 5 && record.flagged === true && record.completed === completed && record.deleted === deleted && typeof record.recordChangeTag === "string" && record.recordChangeTag.length > 0, "The retained test item no longer matches its synthetic content. Stop; no unrelated item will be modified.");
+    requireTest(record?.id === reminderId && (deleted ? record.listId === null : record.listId === listId) && record.title === title && record.notes === "Temporary local create/edit acceptance item." && record.priority === 5 && record.flagged === true && record.completed === completed && record.deleted === deleted && typeof record.recordChangeTag === "string" && record.recordChangeTag.length > 0, "The retained test item no longer matches its synthetic content. Stop; no unrelated item will be modified.");
     requireTest(completed ? typeof record.completedDate === "string" && Number.isFinite(Date.parse(record.completedDate)) : record.completedDate === null, "The completion timestamp did not match the requested state.");
     return record;
   };

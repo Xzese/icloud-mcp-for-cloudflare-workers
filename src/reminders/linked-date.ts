@@ -93,6 +93,29 @@ export function dueDateNonce(encoded: unknown) {
   if (!Number.isFinite(nonce) || Math.abs(nonce) > Number.MAX_SAFE_INTEGER) throw new AppError("UNSUPPORTED_FEATURE", "The due-date nonce exceeds supported numeric precision.");
   return nonce;
 }
+/** Inspect retained root pairs independently of completion state or mutations. */
+export function inspectRootAbsoluteDatePair(graph: SchedulingGraph, owner: string) {
+  const reminder = normalizeReminder(graph.reminder, owner);
+  const alarm = graph.records.find(record => record.recordName === reminder.alarmIds?.[0]);
+  const trigger = graph.records.find(record => record.recordType === "AlarmTrigger");
+  const rules = graph.records.filter(record => record.recordType === "RecurrenceRule");
+  if (!graph.complete || reminder.deleted !== false || reminder.completed === null || reminder.parentReminderId !== null || reminder.startDate !== null ||
+    reminder.allDay !== false || !reminder.dueDate || !reminder.timeZone || reminder.alarmIds?.length !== 1 || rules.length > 1 ||
+    graph.records.length !== 3 + rules.length || !alarm || alarm.recordType !== "Alarm" || !trigger ||
+    Object.keys(alarm.fields).some(key => !["AlarmUID", "DueDateResolutionTokenAsNonce", "Reminder", "TriggerID", "Imported", "Deleted"].includes(key)) ||
+    Object.keys(trigger.fields).some(key => !["DateComponentsData", "Type", "Alarm", "Imported", "Deleted"].includes(key)) ||
+    referenceField(alarm, "Reminder", "Reminder", owner) !== reminder.id || referenceField(trigger, "Alarm", "Alarm", owner) !== alarm.recordName ||
+    ![trigger.recordName, trigger.recordName.slice(13)].includes(String(field(alarm, "TriggerID", "STRING"))) ||
+    field(trigger, "Type", "STRING") !== "Date" || field(alarm, "AlarmUID", "STRING") !== alarm.recordName.slice(6))
+    throw new AppError("UNSUPPORTED_FEATURE", "The retained graph is not one ordinary bidirectional timed root date pair.");
+  for (const record of [alarm, trigger]) if (!record.recordChangeTag || record.deleted || field(record, "Deleted", "INT64") !== 0 || field(record, "Imported", "INT64") !== 0)
+    throw new AppError("CONFLICT", "A retained absolute-date participant changed or was deleted.", 409);
+  const components = decodeDateComponents(field(trigger, "DateComponentsData", "BYTES"));
+  if (canonicalJSON(components) !== canonicalJSON(dateComponents(reminder.dueDate, reminder.timeZone, Object.hasOwn(components, "nanosecond"))) ||
+    field(alarm, "DueDateResolutionTokenAsNonce", "DOUBLE") !== dueDateNonce(field(graph.reminder, "ResolutionTokenMap", "STRING")))
+    throw new AppError("CONFLICT", "The retained reminder due date, nonce and absolute trigger disagree.", 409);
+  return [alarm, trigger];
+}
 export function linkedDatePlan(graph: SchedulingGraph, write: CloudKitWriteRecord, owner: string) {
   const reminder = normalizeReminder(graph.reminder, owner);
   const due = write.fields.DueDate ? write.fields.DueDate.value : reminder.dueDate === null ? null : Date.parse(reminder.dueDate);

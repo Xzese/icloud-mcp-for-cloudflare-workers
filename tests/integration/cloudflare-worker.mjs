@@ -8,11 +8,15 @@ import { mkdtemp, readFile, readdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { resolve, join } from "node:path";
 import { parse } from "smol-toml";
-import { verifyReminderQueue } from "./reminder-queue.mjs";
+import { verifyRequestDrivenJobs } from "./reminder-jobs.mjs";
 const root = resolve(new URL("../..", import.meta.url).pathname);
 const server = join(root, "dist/server");
 const config = parse(await readFile(join(root, "wrangler.generated.toml"), "utf8"));
 assert.equal(config.assets.run_worker_first, true);
+assert.equal(config.queues, undefined);
+assert.equal(config.triggers, undefined);
+assert.equal(Object.hasOwn(config.vars ?? {}, "REMINDER_JOB_EXECUTION_MODE"), false);
+assert.equal(Object.hasOwn(config.vars ?? {}, "REMINDER_JOB_QUEUE_NAME"), false);
 const directory = await mkdtemp(join(tmpdir(), "reminders-access-acceptance-"));
 const origin = "https://worker.example.test";
 const issuer = "https://synthetic-team.cloudflareaccess.com";
@@ -57,6 +61,6 @@ try {
   assert.equal(mcp.status, 200); const response = await mcp.json();
   assert.equal(response.result.structuredContent.writeEnabled, false);
   assert.equal(response.result.structuredContent.state, "DISCONNECTED");
-  await verifyReminderQueue(options, signed);
-  console.log(JSON.stringify({ result: "passed", runtime: "local-workerd", standaloneBundle: true, checks: ["verified-access-identity", "forged-header-denial", "static-asset-auth", "owner-isolation", "dashboard-and-MCP-routing"] }));
+  await verifyRequestDrivenJobs(options, signed);
+  console.log(JSON.stringify({ result: "passed", runtime: "local-workerd", standaloneBundle: true, checks: ["verified-access-identity", "forged-header-denial", "static-asset-auth", "owner-isolation", "dashboard-and-MCP-routing", "request-driven-job-continuation"] }));
 } finally { await worker.dispose(); await rm(directory, { recursive: true, force: true }); await mock.close(); }

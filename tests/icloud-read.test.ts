@@ -3,8 +3,11 @@ import assert from "node:assert/strict";
 import { AppleHTTP, APPLE_USER_AGENT, validatedAppleURL } from "../src/transport/apple-http.ts";
 import { CookieJar } from "../src/transport/cookie-jar.ts";
 import { encodeDocument } from "../src/reminders/crdt.ts";
+import { omitField } from "../src/lib/omit-field.ts";
+import { matchesReminderSearch, SearchFilters } from "../src/reminders/search.ts";
 import { AppError } from "../src/errors.ts";
 import { CloudKitRateLimitedError, CloudKitRemindersClient, normalizeList, normalizeReminder, type CloudKitConnection } from "../src/icloud/cloudkit.ts";
+import { normalizeReminderTag, normalizeURLAttachment } from "../src/reminders/organization.ts";
 
 const connection: CloudKitConnection = {
   dsid: "123456789",
@@ -14,17 +17,19 @@ const connection: CloudKitConnection = {
   cloudKitURL: "https://p01-ckdatabasews.icloud.com/database/1/com.apple.reminders/production/private",
 };
 
-type MockResponse = { status?: number; headers?: Record<string, string>; body: unknown };
+type MockResponse = { status?: number; headers?: Record<string, string>; body: unknown | ((request: CapturedRequest) => unknown) };
 type CapturedRequest = { url: URL; method: string | undefined; headers: Headers; body: Record<string, unknown> };
 
 function clientWith(responses: MockResponse[], metadata: CloudKitConnection = connection) {
   const requests: CapturedRequest[] = [];
   const http = new AppleHTTP(new CookieJar(), async (input, init) => {
     const url = new URL(String(input));
-    requests.push({ url, method: init?.method, headers: new Headers(init?.headers), body: JSON.parse(String(init?.body)) as Record<string, unknown> });
+    const request = { url, method: init?.method, headers: new Headers(init?.headers), body: JSON.parse(String(init?.body)) as Record<string, unknown> };
+    requests.push(request);
     const next = responses.shift();
     assert.ok(next, `unexpected request to ${url.pathname}`);
-    return new Response(JSON.stringify(next.body), { status: next.status ?? 200, headers: next.headers });
+    const body = typeof next.body === "function" ? next.body(request) : next.body;
+    return new Response(JSON.stringify(body), { status: next.status ?? 200, headers: next.headers });
   });
   return { api: new CloudKitRemindersClient(http, metadata), requests };
 }
@@ -109,6 +114,54 @@ test("Reminders zone discovery and list query use the pinned private CloudKit re
     zoneID: { zoneName: "Reminders", zoneType: "REGULAR_CUSTOM_ZONE" },
     resultsLimit: 20,
   });
+});
+
+test("search projection preserves normalized output and filters while default reminder reads retain opaque fields", async () => {
+  const desiredKeys = ["List", "ParentReminder", "TitleDocument", "NotesDocument", "Completed", "CompletionDate", "DueDate", "StartDate", "Priority", "Flagged", "AllDay", "Deleted", "TimeZone", "AlarmIDs", "AttachmentIDs", "HashtagIDs", "RecurrenceRuleIDs"];
+  const record = {
+    ...reminderRecord("Needle in the title"),
+    recordName: "Reminder/PROJECTED-DONE", recordChangeTag: "projected-tag",
+    created: { timestamp: 1_728_000_000_000 }, modified: { timestamp: 1_728_000_123_000 },
+    fields: {
+      ...reminderRecord("Needle in the title").fields,
+      ParentReminder: { type: "REFERENCE", value: { recordName: "Reminder/PARENT", action: "VALIDATE" } },
+      Completed: { type: "INT64", value: 1 },
+      CompletionDate: { type: "TIMESTAMP", value: 1_728_100_000_000 },
+      DueDate: { type: "TIMESTAMP", value: 1_728_000_000_000 },
+      StartDate: { type: "TIMESTAMP", value: 1_727_900_000_000 },
+      Priority: { type: "INT64", value: 5 }, Flagged: { type: "INT64", value: 1 },
+      AllDay: { type: "INT64", value: 0 }, TimeZone: { type: "STRING", value: "Europe/London" },
+      CreationDate: { type: "TIMESTAMP", value: 1_700_000_000_000 },
+      LastModifiedDate: { type: "TIMESTAMP", value: 1_728_000_123_000 },
+      Imported: { type: "INT64", value: 0 }, AssignmentIDs: { type: "UNKNOWN_LIST", value: [] },
+      ResolutionTokenMap: { type: "STRING", value: "opaque-resolution-map" },
+    },
+  };
+  const project = (keys: string[]) => ({ ...record, fields: Object.fromEntries(Object.entries(record.fields).filter(([key]) => keys.includes(key))) });
+  const full = clientWith([{ body: { records: [record] } }]);
+  const projected = clientWith([{ body: (request: CapturedRequest) => {
+    assert.deepEqual(request.body.desiredKeys, desiredKeys);
+    return { records: [project(request.body.desiredKeys as string[])] };
+  } }]);
+  const fullPage = await full.api.queryRemindersPage({ listId: "List/LIST-A", includeCompleted: true });
+  const projectedPage = await projected.api.queryRemindersPage({ listId: "List/LIST-A", includeCompleted: true, projection: "search" });
+  assert.equal(Object.hasOwn(full.requests[0].body, "desiredKeys"), false, "Default family reads keep the full CloudKit record.");
+  assert.deepEqual(projected.requests[0].body.desiredKeys, desiredKeys);
+  assert.equal(fullPage.records.length, 1); assert.equal(projectedPage.records.length, 1);
+  const fullReminder = normalizeReminder(fullPage.records[0] as Extract<(typeof fullPage.records)[number], { recordType: string }>, "__defaultOwner__");
+  const projectedReminder = normalizeReminder(projectedPage.records[0] as Extract<(typeof projectedPage.records)[number], { recordType: string }>, "__defaultOwner__");
+  assert.deepEqual(omitField(projectedReminder, "raw"), omitField(fullReminder, "raw"));
+  assert.equal(projectedReminder.created, new Date(record.created.timestamp).toISOString());
+  assert.equal(projectedReminder.modified, new Date(record.modified.timestamp).toISOString());
+  const filters = SearchFilters.parse({ text: "needle", status: "completed", flagged: true, priority: 5,
+    dueFrom: "2024-10-04T00:00:00.000Z", dueTo: "2024-10-05T00:00:00.000Z" });
+  assert.equal(matchesReminderSearch(projectedReminder, filters), true);
+  assert.equal(matchesReminderSearch(fullReminder, filters), true);
+  assert.ok("raw" in fullReminder && (fullReminder.raw.fields as Record<string, unknown>).ResolutionTokenMap);
+  assert.ok((fullReminder.raw.fields as Record<string, unknown>).CustomFutureField, "Full page reads retain opaque fields for version-guarded family checks.");
+  assert.ok("raw" in projectedReminder && !Object.hasOwn(projectedReminder.raw.fields as Record<string, unknown>, "ResolutionTokenMap"));
+  assert.ok(!Object.hasOwn(projectedReminder.raw.fields as Record<string, unknown>, "CreationDate"));
+  assert.ok(!Object.hasOwn(projectedReminder.raw.fields as Record<string, unknown>, "CustomFutureField"));
 });
 
 test("compound subtask pages deduplicate only canonical-JSON-equivalent records and reject conflicting copies", async () => {
@@ -197,6 +250,27 @@ test("query pages expose partial per-record errors and continuation; normalizers
   const versions = [{ ...listRecord(), recordChangeTag: "new-version" }, { ...listRecord(), recordChangeTag: "old-version" }];
   const duplicate = clientWith([{ body: { records: versions } }]);
   await assert.rejects(duplicate.api.queryPage({ recordType: "List" }), AppError);
+});
+
+test("organization normalizers expose only observed URL metadata and active tags with a matching reminder backlink", () => {
+  const reminderId = "Reminder/REM-1";
+  const url = { recordName: "Attachment/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", recordType: "Attachment", recordChangeTag: "url-v1",
+    zoneID: { zoneName: "Reminders", zoneType: "REGULAR_CUSTOM_ZONE", ownerRecordName: "__defaultOwner__" }, raw: {}, fields: {
+      Type: { type: "STRING", value: "URL" }, UTI: { type: "STRING", value: "public.url" }, Imported: { type: "INT64", value: 0 }, Deleted: { type: "INT64", value: 0 },
+      URL: { type: "STRING", value: "https://example.test/reminder", isEncrypted: true }, AssetURL: { type: "STRING", value: "https://signed.invalid/secret" },
+      Reminder: { type: "REFERENCE", value: { recordName: reminderId, action: "VALIDATE" } },
+    } };
+  const hashtag = { recordName: "Hashtag/bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", recordType: "Hashtag", recordChangeTag: "tag-v1",
+    zoneID: { zoneName: "Reminders", zoneType: "REGULAR_CUSTOM_ZONE", ownerRecordName: "__defaultOwner__" }, raw: {}, fields: {
+      CreationDate: { type: "TIMESTAMP", value: 1 }, Type: { type: "INT64", value: 0 }, Imported: { type: "INT64", value: 0 }, Deleted: { type: "INT64", value: 0 },
+      Name: { type: "STRING", value: "home", isEncrypted: true }, Reminder: { type: "REFERENCE", value: { recordName: reminderId, action: "VALIDATE" } },
+    } };
+  assert.deepEqual(normalizeURLAttachment(url, reminderId, "__defaultOwner__"), { id: url.recordName, url: "https://example.test/reminder" });
+  assert.deepEqual(normalizeReminderTag(hashtag, reminderId, "__defaultOwner__"), { id: hashtag.recordName, name: "home" });
+  assert.equal(JSON.stringify(normalizeURLAttachment(url, reminderId, "__defaultOwner__")).includes("signed.invalid"), false);
+  const asset = { ...url, fields: { ...url.fields, Type: { type: "STRING", value: "Asset" }, UTI: { type: "STRING", value: "public.data" } } };
+  assert.throws(() => normalizeURLAttachment(asset, reminderId, "__defaultOwner__"), AppError);
+  assert.throws(() => normalizeReminderTag({ ...hashtag, fields: { ...hashtag.fields, Reminder: { type: "REFERENCE", value: { recordName: "Reminder/FOREIGN" } } } }, reminderId, "__defaultOwner__"), AppError);
 });
 
 test("experimental plural Lists query bootstraps the validated private zone and accepts singular List records", async () => {
