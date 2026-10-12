@@ -304,7 +304,8 @@ test("frequency edits and existing early offsets preserve private metadata and v
   const plainGraph = await loadSchedulingGraph(values[0], owner, lookup(values));
   const sourceId = "Reminder/00000000-0000-4000-8000-000000000011";
   const source: CloudKitRecord = { ...structuredClone(values[0]), recordName: sourceId, recordChangeTag: "source-before", fields: { ...values[0].fields,
-    DueDateDeltaAlertsData: { type: "ENCRYPTED_BYTES", value: b64(utf8(JSON.stringify({ ...privatePayload, reminderIdentifier: sourceId.slice(9) }))) } } };
+    DueDateDeltaAlertsData: { type: "ENCRYPTED_BYTES", value: b64(utf8(JSON.stringify({ ...privatePayload, reminderIdentifier: sourceId.slice(9),
+      dueDateDeltaAlerts: [{ ...privatePayload.dueDateDeltaAlerts[0], acknowledgedDate: 800_000_100.25 }] }))) } } };
   delete source.fields.AlarmIDs; delete source.fields.RecurrenceRuleIDs;
   const witnessedGraph = await attachEarlyReminderWitness(plainGraph, source);
   assert.notEqual(witnessedGraph.fingerprint, plainGraph.fingerprint);
@@ -316,9 +317,62 @@ test("frequency edits and existing early offsets preserve private metadata and v
   assert.notEqual(createdPayload.dueDateDeltaAlerts[0].identifier, privatePayload.dueDateDeltaAlerts[0].identifier);
   assert.equal(createdPayload.dueDateDeltaAlerts[0].creationDate, now / 1000 - 978_307_200);
   assert.equal(createdPayload.dueDateDeltaAlerts[0].dueDateDeltaUnit, 2); assert.equal(createdPayload.dueDateDeltaAlerts[0].dueDateDeltaCount, -2);
+  assert.equal(createdPayload.dueDateDeltaAlerts[0].acknowledgedDate, undefined, "A new alert never inherits its metadata source's acknowledgement.");
   assert.ok(creation.guards.some(record => record.recordName === sourceId && record.recordChangeTag === "source-before"));
   const foreignSource = structuredClone(source); foreignSource.fields.List = { type: "REFERENCE", value: { recordName: "List/OTHER", action: "VALIDATE", zoneID } };
   assert.throws(() => planReminderUpdate({ ...witnessedGraph, earlyReminderWitness: foreignSource }, { ...request(values[0]), changes: { earlyReminder: { unit: "days", count: 2 } } }, owner, now), hasCode("CONFLICT"));
+});
+
+test("date moves preserve acknowledged early alerts and the native monthly final-selection rule without enabling offset or recurrence edits", async () => {
+  const values = records();
+  const alert = { identifier: "00000000-0000-4000-8000-000000000009", creationDate: 800_000_000.125,
+    acknowledgedDate: 800_000_100.25, dueDateDeltaUnit: 2, dueDateDeltaCount: -1, minimumSupportedAppVersion: 0 };
+  const payload = { reminderIdentifier: values[0].recordName.slice(9), accountIdentifier: "00000000-0000-4000-8000-000000000010",
+    minimumSupportedVersion: 20230430, dueDateDeltaAlerts: [alert] };
+  const earlyField = { type: "ENCRYPTED_BYTES", value: b64(utf8(JSON.stringify(payload, null, 2))) };
+  values[0].fields.DueDateDeltaAlertsData = earlyField;
+  Object.assign(values[3].fields, { Frequency: { type: "INT64", value: 2 },
+    DaysOfTheMonth: { type: "BYTES", value: b64(utf8("[28,29]")) }, SetPositions: { type: "BYTES", value: b64(utf8("[-1]")) } });
+  const before = structuredClone(values), graph = await loadSchedulingGraph(values[0], owner, lookup(values));
+  const input = { ...request(values[0]), changes: { dueDate: "2027-10-14T09:00:00+01:00", timeZone: "Europe/London" } };
+  const plan = planReminderUpdate(graph, input, owner, now + 1000);
+  assert.ok(plan.supported); assert.equal(plan.operationCount, 4);
+  assert.equal(plan.after.dueDate, "2027-10-14T08:00:00.000Z");
+  assert.deepEqual(plan.before.earlyReminder, { count: 1, unit: "days" });
+  assert.deepEqual(plan.after.earlyReminder, plan.before.earlyReminder);
+  assert.deepEqual(plan.before.recurrence, { frequency: "monthly", interval: 1, endDate: null, monthDays: [28, 29], setPositions: [-1] });
+  assert.deepEqual(plan.after.recurrence, plan.before.recurrence);
+  assert.equal(plan.write.fields.DueDateDeltaAlertsData, undefined, "Even JSON formatting and acknowledgement bytes stay untouched.");
+  assert.equal(plan.write.fields.Completed, undefined);
+  assert.equal(plan.dependencies.some(record => record.recordType === "RecurrenceRule"), false);
+  assert.ok(plan.guards.some(record => record.recordName === ruleId && record.recordChangeTag === "rule-before"));
+  assert.deepEqual(values, before, "Preview never changes the captured graph.");
+  assert.throws(() => readRecurrence(values[3]), hasCode("UNSUPPORTED_FEATURE"));
+  for (const changes of [{ recurrence: { frequency: "monthly" as const, interval: 2 } }, { allDay: true, dueDate: "2027-10-14T00:00:00Z" },
+    { earlyReminder: { unit: "hours" as const, count: 1 } }]) {
+    const refused = planReminderUpdate(graph, { ...input, changes }, owner, now);
+    assert.equal(refused.supported, false); assert.equal(refused.operationCount, 0);
+  }
+  for (const invalid of [
+    { ...payload, dueDateDeltaAlerts: [{ ...alert, acknowledgedDate: "yesterday" }] },
+    { ...payload, dueDateDeltaAlerts: [{ ...alert, futureField: true }] },
+    { ...payload, reminderIdentifier: "00000000-0000-4000-8000-000000000099" },
+    { ...payload, dueDateDeltaAlerts: [{ ...alert, dueDateDeltaUnit: 99 }] },
+  ]) {
+    const altered = structuredClone(values); altered[0].fields.DueDateDeltaAlertsData = { type: "ENCRYPTED_BYTES", value: b64(utf8(JSON.stringify(invalid))) };
+    const refused = planReminderUpdate(await loadSchedulingGraph(altered[0], owner, lookup(altered)), input, owner, now);
+    assert.equal(refused.supported, false); assert.equal(refused.operationCount, 0);
+    assert.match(refused.unsupportedReason!, /acknowledgedDate|unreviewed fields|reminderIdentifier|dueDateDeltaUnit/);
+  }
+  const altered = structuredClone(values); altered[3].fields.SetPositions = { type: "BYTES", value: b64(utf8("[1]")) };
+  assert.equal(planReminderUpdate(await loadSchedulingGraph(altered[0], owner, lookup(altered)), input, owner, now).supported, false);
+  for (const malformed of ["missing-days", "non-string-positions", "non-finite-positions"]) {
+    const altered = structuredClone(values);
+    if (malformed === "missing-days") delete altered[3].fields.DaysOfTheMonth;
+    else altered[3].fields.SetPositions = { type: "BYTES", value: malformed === "non-string-positions" ? [b64(utf8("[-1]"))] : b64(utf8("[-1e400]")) };
+    const refused = planReminderUpdate(await loadSchedulingGraph(altered[0], owner, lookup(altered)), input, owner, now);
+    assert.equal(refused.supported, false); assert.equal(refused.operationCount, 0);
+  }
 });
 
 test("child date scheduling protects the exact same-list open parent and rejects cross-list or unavailable parents", async () => {
