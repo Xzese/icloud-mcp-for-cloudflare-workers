@@ -141,7 +141,7 @@ interface StateRow extends SessionFence {
 }
 type FenceRow = SessionFence;
 
-function configuredEnvelopes(env: RuntimeEnv) {
+export function configuredEnvelopes(env: RuntimeEnv) {
   if (!env.ENCRYPTION_KEY_ID || !env.ENCRYPTION_KEYS_JSON) throw new AppError("CONFIGURATION_REQUIRED", "The server-only encryption secret must be configured before Apple sessions can be stored.", 503);
   let keys: unknown;
   try { keys = JSON.parse(env.ENCRYPTION_KEYS_JSON); }

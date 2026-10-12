@@ -1,5 +1,11 @@
 import { AppError, WriteOutcomeUnknownError, requireValue as requireInput } from "../errors.ts";
 import type { CloudKitWriteRecord } from "../reminders/writes.ts";
+import { decodeDateComponents, type LinkedDateWrite } from "../reminders/linked-date.ts";
+import { LOCATION_ENCRYPTED_FIELDS, validLocationMutation } from "../reminders/location-alarm.ts";
+import { validRecurrenceMutation, validRecurrenceCreation } from "../reminders/recurrence.ts";
+import { earlyReminderPayload } from "../reminders/early-reminder.ts";
+import { schedulingOperation, type SchedulingWrite } from "../reminders/scheduling-plan.ts";
+import { canonicalJSON } from "../lib/canonical.ts";
 import { decodeDocument } from "../reminders/crdt.ts";
 import { AppleHTTP, validatedAppleURL, appleWebHeaders } from "../transport/apple-http.ts";
 
@@ -265,7 +271,7 @@ function dateField(record: CloudKitRecord, key: string): string | null {
   return date.toISOString();
 }
 
-function referenceField(record: CloudKitRecord, key: string, type: string, expectedOwner: string): string | null {
+export function referenceField(record: CloudKitRecord, key: string, type: string, expectedOwner: string): string | null {
   const value = readField(record, key, ["REFERENCE"]);
   if (value === undefined || value === null) return null;
   const reference = object(value, `Apple returned a malformed ${key} relationship.`);
@@ -527,7 +533,8 @@ export class CloudKitRemindersClient {
     }
     if (response.status === 429) {
       const retryText = response.headers.get("retry-after");
-      const retry = retryText && /^\d+(?:\.\d+)?$/.test(retryText) ? Number(retryText) : null;
+      const retry = retryText && /^\d+(?:\.\d+)?$/.test(retryText) ? Number(retryText) :
+        retryText && Number.isFinite(Date.parse(retryText)) ? Math.max(0, (Date.parse(retryText) - Date.now()) / 1000) : null;
       throw new CloudKitRateLimitedError(retry !== null && Number.isFinite(retry) ? retry : null);
     }
     if (response.status !== 200) {
@@ -566,35 +573,222 @@ export class CloudKitRemindersClient {
     return result;
   }
 
-  async modifyReminder(operationType: "create" | "update", record: CloudKitWriteRecord): Promise<CloudKitRecord> {
+  async modifyReminder(operationType: "create" | "update", record: CloudKitWriteRecord, beforeDispatch?: () => Promise<void>): Promise<CloudKitRecord> {
+    return (await this.modifyRecords([{ operationType, record }], beforeDispatch))[0];
+  }
+
+  async modifyRecords(operations: { operationType: "create" | "update"; record: CloudKitWriteRecord }[], beforeDispatch?: () => Promise<void>, versionGuards: CloudKitRecord[] = []): Promise<CloudKitRecord[]> {
+    for (const { operationType, record } of operations) this.validateWrite(operationType, record);
+    return await this.executeRecords(operations, beforeDispatch, versionGuards) as CloudKitRecord[];
+  }
+
+  async modifyLinkedDate(root: CloudKitWriteRecord, dependencies: LinkedDateWrite[], beforeDispatch?: () => Promise<void>, versionGuards: CloudKitRecord[] = []) {
+    this.validateWrite("update", root);
+    requireInput(dependencies.length === 2 && dependencies.filter(record => record.recordType === "Alarm").length === 1 &&
+      dependencies.filter(record => record.recordType === "AlarmTrigger").length === 1, "A linked date update requires exactly one alarm and one trigger.");
+    for (const record of dependencies) {
+      requestedRecordName(record.recordName, [record.recordType]);
+      requireInput(record.recordName.length <= 255 && typeof record.recordChangeTag === "string" && record.recordChangeTag.length > 0 &&
+        record.recordChangeTag.length <= 512 && Object.keys(record.fields).length === 1, "Linked date updates require exact bounded versions and only the date field.");
+      if (record.recordType === "Alarm") {
+        const field = record.fields.DueDateResolutionTokenAsNonce;
+        requireInput(field?.type === "DOUBLE" && typeof field.value === "number" && Number.isFinite(field.value) &&
+          Math.abs(field.value) <= Number.MAX_SAFE_INTEGER, "The date alarm nonce must be a finite bounded double.");
+      } else {
+        const field = record.fields.DateComponentsData;
+        requireInput(field?.type === "BYTES", "The date trigger must use encoded date components.");
+        try { decodeDateComponents(field.value); }
+        catch { throw new AppError("VALIDATION_ERROR", "The date trigger components are invalid.", 400); }
+      }
+    }
+    requireInput(versionGuards.length <= 1 && versionGuards.every(record => record.recordType === "RecurrenceRule"), "Date updates may only guard one unchanged recurrence rule.");
+    return await this.executeRecords([{ operationType: "update", record: root },
+      ...dependencies.map(record => ({ operationType: "update" as const, record }))], beforeDispatch, versionGuards) as CloudKitRecord[];
+  }
+
+  async modifyScheduling(root: CloudKitWriteRecord, dependencies: SchedulingWrite[], beforeDispatch?: () => Promise<void>, versionGuards: CloudKitRecord[] = []) {
+    const links = new Set(["AlarmIDs", "RecurrenceRuleIDs", "DueDateDeltaAlertsData"]);
+    this.validateWrite("update", { ...root, fields: Object.fromEntries(Object.entries(root.fields).filter(([key]) => !links.has(key))) });
+    if (root.fields.DueDateDeltaAlertsData) {
+      requireInput(root.fields.DueDateDeltaAlertsData.type === "ENCRYPTED_BYTES", "Early reminder writes require the observed encrypted-bytes field.");
+      if (root.fields.DueDateDeltaAlertsData.value !== null) earlyReminderPayload({ ...root, raw: {} });
+    }
+    for (const key of ["AlarmIDs", "RecurrenceRuleIDs"]) if (root.fields[key]) {
+      const field = root.fields[key];
+      requireInput(Array.isArray(field.value) && (field.type === "UNKNOWN_LIST" && field.value.length === 0 ||
+        field.type === "STRING_LIST" && field.value.length <= (key === "AlarmIDs" ? 2 : 1) && new Set(field.value).size === field.value.length && field.value.every(id => typeof id === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id))), "Scheduling links require a bounded observed relationship shape.");
+    }
+    const allCreates = dependencies.filter(record => record.operationType === "create");
+    const ruleCreates = allCreates.filter(record => record.recordType === "RecurrenceRule");
+    if (ruleCreates.length) requireInput(ruleCreates.length === 1 && canonicalJSON(root.fields.RecurrenceRuleIDs?.value) === canonicalJSON([ruleCreates[0].recordName.slice(15)]) && !versionGuards.some(record => record.recordType === "RecurrenceRule"), "Creating recurrence requires one new rule and its exact root link.");
+    const creates = allCreates.filter(record => record.recordType !== "RecurrenceRule");
+    if (creates.length) {
+      const alarms = creates.filter(record => record.recordType === "Alarm"), triggers = creates.filter(record => record.recordType === "AlarmTrigger");
+      const rootIds = root.fields.AlarmIDs?.value;
+      requireInput(alarms.length >= 1 && alarms.length <= 2 && triggers.length === alarms.length && creates.length === alarms.length * 2 &&
+        Array.isArray(rootIds) && alarms.every(alarm => rootIds.includes(alarm.recordName.slice(6))) &&
+        rootIds.every(id => [...dependencies, ...versionGuards].some(record => record.recordType === "Alarm" && record.recordName.slice(6) === id)), "New alarm pairs require complete root links and version protection for existing alarms.");
+      requireInput(new Set(triggers.map(trigger => trigger.fields.Type?.value)).size === triggers.length, "At most one date and one location pair may be created.");
+    }
+    const locationRetired = dependencies.filter(record => record.locationRetirement);
+    if (locationRetired.length) {
+      const pair = locationRetired[0].locationRetirement!;
+      requireInput(locationRetired.length === 2 && locationRetired.every(record => canonicalJSON(record.locationRetirement) === canonicalJSON(pair)) &&
+        locationRetired.some(record => record.recordType === "Alarm" && record.recordName === pair.alarmId) &&
+        locationRetired.some(record => record.recordType === "AlarmTrigger" && record.recordName === pair.triggerId) &&
+        Array.isArray(root.fields.AlarmIDs?.value) && !root.fields.AlarmIDs.value.includes(pair.alarmId.slice(6)), "Location retirement requires the complete exact-tag pair and root unlink.");
+    }
+    const retired = dependencies.filter(record => record.fields.Deleted?.value === 1);
+    const retiredDate = dependencies.filter(record => record.operationType === "delete");
+    if (retiredDate.length) {
+      const retained = root.fields.AlarmIDs?.value;
+      requireInput(retiredDate.length === 2 && retiredDate[0].recordType === "AlarmTrigger" && retiredDate[1].recordType === "Alarm" &&
+        Array.isArray(retained) && !retained.includes(retiredDate[1].recordName.slice(6)), "Retiring a date alarm requires the complete pair and root unlink in the same atomic group.");
+      for (const id of retained) {
+        const alarm = versionGuards.find(record => record.recordType === "Alarm" && record.recordName.slice(6) === id);
+        const triggerUid = (alarm?.fields.TriggerID as { value?: unknown })?.value;
+        const trigger = versionGuards.find(record => record.recordType === "AlarmTrigger" && (record.recordName.slice(13) === triggerUid || record.recordName === triggerUid));
+        requireInput(alarm && trigger && referenceField(alarm, "Reminder", "Reminder", this.expectedOwner) === root.recordName && referenceField(trigger, "Alarm", "Alarm", this.expectedOwner) === alarm.recordName &&
+          (alarm.fields.DueDateResolutionTokenAsNonce as { value?: unknown })?.value === 0 && (trigger.fields.Type as { value?: unknown })?.value === "Location", "Every retained alarm must be an unchanged version-guarded location pair.");
+      }
+    }
+    if (retired.some(record => record.recordType === "RecurrenceRule")) requireInput(canonicalJSON(root.fields.RecurrenceRuleIDs?.value) === "[]", "Retiring recurrence requires its root unlink in the same atomic group.");
+    for (const record of dependencies) {
+      requestedRecordName(record.recordName, [record.recordType]);
+      requireInput(["Alarm", "AlarmTrigger", "RecurrenceRule"].includes(record.recordType) && record.recordName.length <= 255, "Unsupported scheduling identity.");
+      const create = record.operationType === "create";
+      requireInput(!record.locationRetirement || !create && record.operationType !== "delete" && record.fields.Deleted?.value === 1, "Location retirement metadata only applies to paired soft updates.");
+      requireInput(create ? record.recordChangeTag === undefined : typeof record.recordChangeTag === "string" && record.recordChangeTag.length > 0 && record.recordChangeTag.length <= 512, "Scheduling updates require exact version tags; creates must not carry one.");
+      const keys = Object.keys(record.fields);
+      for (const [key, field] of Object.entries(record.fields)) {
+        const encrypted = record.recordType === "AlarmTrigger" && LOCATION_ENCRYPTED_FIELDS.includes(key as typeof LOCATION_ENCRYPTED_FIELDS[number]);
+        requireInput((encrypted ? field.isEncrypted === true : field.isEncrypted === undefined) &&
+          Object.keys(field).every(name => name === "type" || name === "value" || encrypted && name === "isEncrypted"), "Unsupported scheduling field encryption envelope.");
+      }
+      if (record.operationType === "delete") {
+        requireInput(["Alarm", "AlarmTrigger"].includes(record.recordType) && keys.length === 0, "Only exact-tag alarm/trigger retirement can delete records; deletion cannot carry fields.");
+      } else if (!create && record.fields.Deleted) {
+        requireInput(record.fields.Deleted.type === "INT64" && record.fields.Deleted.value === 1 &&
+          (record.recordType === "RecurrenceRule" && !record.locationRetirement && keys.every(key => key === "Deleted" || key === "Reminder") ||
+            record.locationRetirement && (record.recordType === "Alarm" && keys.length === 2 && keys.includes("Reminder") || record.recordType === "AlarmTrigger" && keys.length === 1)) &&
+          (!record.fields.Reminder || record.fields.Reminder.type === "REFERENCE" && record.fields.Reminder.value === null), "Unsupported scheduling retirement.");
+      } else if (!create && record.recordType === "RecurrenceRule") {
+        requireInput(validRecurrenceMutation(record.fields), "Unsupported recurrence mutation.");
+      } else if (!create && record.recordType === "Alarm") {
+        requireInput(keys.length === 1 && record.fields.DueDateResolutionTokenAsNonce?.type === "DOUBLE" && typeof record.fields.DueDateResolutionTokenAsNonce.value === "number" && Number.isFinite(record.fields.DueDateResolutionTokenAsNonce.value) && Math.abs(record.fields.DueDateResolutionTokenAsNonce.value) <= Number.MAX_SAFE_INTEGER, "Unsupported alarm mutation.");
+      } else if (!create && record.recordType === "AlarmTrigger") {
+        requireInput(keys.length === 1 && record.fields.DateComponentsData?.type === "BYTES" || validLocationMutation(record.fields), "Unsupported trigger mutation.");
+        if (record.fields.DateComponentsData) decodeDateComponents(record.fields.DateComponentsData.value);
+      } else if (record.recordType === "RecurrenceRule") {
+        requireInput(validRecurrenceCreation(record.fields) && record.fields.Reminder?.type === "REFERENCE" &&
+          canonicalJSON(record.fields.Reminder.value) === canonicalJSON({ recordName: root.recordName, action: "VALIDATE" }) &&
+          Object.values(record.fields).every(field => field.value !== null), "Unsupported recurrence creation template.");
+      } else {
+        const location = record.recordType === "AlarmTrigger" && record.fields.Type?.value === "Location";
+        const expected = record.recordType === "Alarm" ? ["AlarmUID", "TriggerID", "DueDateResolutionTokenAsNonce", "Reminder", "Imported", "Deleted"] : location ? ["ReferenceFrameString", "Radius", "Type", "Proximity", "Address", "Alarm", "Imported", "Title", "Latitude", "Deleted", "Longitude", "LocationUID"] : ["DateComponentsData", "Type", "Alarm", "Imported", "Deleted"];
+        requireInput(keys.length === expected.length && keys.every(key => expected.includes(key)) &&
+          record.fields.Imported?.type === "INT64" && record.fields.Imported.value === 0 && record.fields.Deleted?.type === "INT64" && record.fields.Deleted.value === 0, "Unsupported scheduling creation template.");
+        if (record.recordType === "Alarm") {
+          const trigger = creates.find(item => item.recordType === "AlarmTrigger" && item.recordName.slice(13) === record.fields.TriggerID?.value);
+          requireInput(record.fields.AlarmUID.type === "STRING" && record.fields.AlarmUID.value === record.recordName.slice(6) && record.fields.TriggerID.type === "STRING" && record.fields.TriggerID.value === trigger?.recordName.slice(13) &&
+            record.fields.Reminder.type === "REFERENCE" && canonicalJSON(record.fields.Reminder.value) === canonicalJSON({ recordName: root.recordName, action: "VALIDATE" }) &&
+            record.fields.DueDateResolutionTokenAsNonce.type === "DOUBLE" && typeof record.fields.DueDateResolutionTokenAsNonce.value === "number" && Number.isFinite(record.fields.DueDateResolutionTokenAsNonce.value) && (trigger?.fields.Type?.value !== "Location" || record.fields.DueDateResolutionTokenAsNonce.value === 0), "Unsupported alarm creation.");
+        } else {
+          const alarm = creates.find(item => item.recordType === "Alarm" && item.fields.TriggerID?.value === record.recordName.slice(13));
+          requireInput(alarm && record.fields.Type.type === "STRING" && record.fields.Alarm.type === "REFERENCE" && canonicalJSON(record.fields.Alarm.value) === canonicalJSON({ recordName: alarm.recordName, action: "VALIDATE" }), "Unsupported trigger creation references.");
+          if (location) {
+            requireInput(record.fields.ReferenceFrameString.type === "STRING" && record.fields.ReferenceFrameString.value === "1" &&
+              record.fields.LocationUID.type === "STRING" && typeof record.fields.LocationUID.value === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(record.fields.LocationUID.value) &&
+              validLocationMutation(Object.fromEntries(Object.entries(record.fields).filter(([key]) => ["Radius", "Proximity", "Address", "Title", "Latitude", "Longitude"].includes(key)))), "Unsupported location trigger creation.");
+          } else {
+            requireInput(record.fields.Type.value === "Date" && record.fields.DateComponentsData.type === "BYTES", "Unsupported date trigger creation.");
+            decodeDateComponents(record.fields.DateComponentsData.value);
+          }
+        }
+      }
+    }
+    return this.executeRecords([{ operationType: "update", record: root }, ...dependencies.map(schedulingOperation)], beforeDispatch, versionGuards);
+  }
+
+  private async executeRecords(operations: { operationType: "create" | "update" | "delete"; record: { recordName: string; recordType: string; recordChangeTag?: string; fields?: Record<string, unknown> } }[],
+    beforeDispatch?: () => Promise<void>, versionGuards: CloudKitRecord[] = []): Promise<CloudKitRecordItem[]> {
+    requireInput(operations.length > 0 && operations.length + versionGuards.length <= 32, "An atomic write requires mutations and guards within its record budget.");
+    const guards = structuredClone(versionGuards);
+    const guardOperations = guards.map(record => {
+      requireInput(["Reminder", "Alarm", "AlarmTrigger", "RecurrenceRule"].includes(record.recordType) && record.recordName.startsWith(`${record.recordType}/`) &&
+        record.recordName.length <= 255 && !record.deleted, "A version guard requires an exact live linked record identity.");
+      requireInput(record.zoneID?.zoneName === "Reminders" &&
+        [this.expectedOwner, DEFAULT_OWNER].includes(record.zoneID.ownerRecordName ?? this.expectedOwner) &&
+        (record.zoneID.zoneType === undefined || record.zoneID.zoneType === REMINDERS_ZONE.zoneType),
+      "A version guard requires the authenticated private Reminders zone.");
+      requireInput(typeof record.recordChangeTag === "string" && record.recordChangeTag.length > 0 && record.recordChangeTag.length <= 512,
+        "A version guard requires its exact bounded Apple change tag.");
+      requestedRecordName(record.recordName, ["Reminder", "Alarm", "AlarmTrigger", "RecurrenceRule"]);
+      const deleted = object(record.fields.Deleted, "A version guard requires an explicitly observed Deleted field.");
+      requireInput(deleted.type === "INT64" && deleted.value === 0, "A version guard can only reassert an observed nondeleted linked record.");
+      return { operationType: "update" as const, record: { recordName: record.recordName, recordType: record.recordType,
+        recordChangeTag: record.recordChangeTag, fields: { Deleted: { type: "INT64", value: 0 } } } };
+    });
+    const payload = structuredClone({ zoneID: this.requestZone, atomic: true, operations: [...operations, ...guardOperations] });
+    const group = payload.operations;
+    requireInput(new Set(group.map(operation => operation.record.recordName)).size === group.length, "An atomic write requires exactly one mutation or guard per record.");
+    requireInput(new TextEncoder().encode(JSON.stringify(payload)).length <= MAX_REQUEST_BYTES, "The reminder write exceeded its byte budget.");
+    await beforeDispatch?.();
+    try {
+      const result = await this.post("/records/modify", payload);
+      const page = pageRecords(result.records, group.length, 32, this.expectedOwner);
+      if (page.recordErrors.length) {
+        requireValue(page.recordErrors.length === group.length && page.records.length === 0 &&
+          new Set(page.recordErrors.map(error => error.recordName)).size === group.length &&
+          page.recordErrors.every(error => group.some(operation => operation.record.recordName === error.recordName)), "Apple returned inconsistent atomic write errors.");
+        const codes = page.recordErrors.map(error => error.serverErrorCode.toUpperCase());
+        const conflict = codes.some(code => ["CONFLICT", "SERVER_RECORD_CHANGED", "ALREADY_EXISTS"].includes(code));
+        const rejectedConflictGroup = conflict && codes.every(code => ["CONFLICT", "SERVER_RECORD_CHANGED", "ALREADY_EXISTS", "BATCH_REQUEST_FAILED", "ATOMIC_ERROR"].includes(code));
+        requireValue(rejectedConflictGroup || new Set(codes).size === 1, "Apple returned mixed atomic write errors.");
+        parseTopLevelError({ serverErrorCode: rejectedConflictGroup ? "CONFLICT" : codes[0], recordName: group[0].record.recordName }, { path: "/records/modify", upstreamStatus: 200, hasSessionCookie: this.http.jar.header(this.endpoint).length > 0 });
+      }
+      requireValue(page.records.length === group.length, "Apple omitted an atomic write confirmation.");
+      return group.map(({ operationType, record }) => {
+        const confirmed = page.records.find(item => item.recordName === record.recordName);
+        if (operationType === "delete") {
+          requireValue(confirmed && confirmed.deleted === true && !("recordType" in confirmed) && Object.keys(confirmed.raw).length === 2 && confirmed.raw.recordName === record.recordName && confirmed.raw.deleted === true, "Apple returned an invalid scheduling deletion confirmation.");
+          return confirmed;
+        }
+        requireValue(confirmed && "recordType" in confirmed && confirmed.recordType === record.recordType && !confirmed.deleted && typeof confirmed.recordChangeTag === "string" && confirmed.recordChangeTag.length > 0, "Apple returned an invalid reminder write confirmation.");
+        if (operationType === "update") requireValue(confirmed.recordChangeTag !== record.recordChangeTag, "Apple did not advance the reminder version.");
+        const guarded = guards.find(guard => guard.recordName === record.recordName);
+        if (guarded) requireValue(canonicalJSON(confirmed.fields) === canonicalJSON(guarded.fields), "Apple changed the fields of a version-guarded dependency.");
+        return confirmed;
+      });
+    } catch (error) {
+      if (error instanceof AppError && ["REAUTH_REQUIRED", "FORBIDDEN", "RATE_LIMITED", "CONFLICT"].includes(error.code)) throw error;
+      if (error instanceof AppError && error.code === "PROTOCOL_CHANGED" && error.message === "Apple rejected the reminder write fields. No automatic retry was attempted.") throw error;
+      throw new WriteOutcomeUnknownError(group[0].record.recordName);
+    }
+  }
+
+  private validateWrite(operationType: "create" | "update", record: CloudKitWriteRecord): void {
     requireInput(operationType === "create" || operationType === "update", "Only reminder creation and editing are supported.");
     requireInput(this.owner !== undefined, "Discover the authenticated Reminders zone before writing.");
     requireInput(record.recordType === "Reminder" && record.recordName.length <= 255, "Only bounded Reminder records can be written.");
     requestedRecordName(record.recordName, ["Reminder"]);
-    const allowedFields = new Set(["TitleDocument", "NotesDocument", "Priority", "Flagged", "DueDate", "TimeZone", "AllDay", "Completed", "CompletionDate", "Deleted", "LastModifiedDate", "ResolutionTokenMap", ...(operationType === "create" ? ["Completed", "CompletionDate", "CreationDate", "Deleted", "Imported", "List"] : [])]);
+    const allowedFields = new Set(["TitleDocument", "NotesDocument", "Priority", "Flagged", "DueDate", "TimeZone", "AllDay", "Completed", "CompletionDate", "Deleted", "ParentReminder", "LastModifiedDate", "ResolutionTokenMap", ...(operationType === "create" ? ["Completed", "CompletionDate", "CreationDate", "Deleted", "Imported", "List"] : [])]);
     requireInput(Object.keys(record.fields).length > 0 && Object.keys(record.fields).every(key => allowedFields.has(key)), "The reminder write contains unsupported fields.");
     if (operationType === "update") requireInput(typeof record.recordChangeTag === "string" && record.recordChangeTag.length > 0 && record.recordChangeTag.length <= 512 && record.parent === undefined, "Reminder edits require an exact change tag and cannot move lists.");
     else requireInput(record.recordChangeTag === undefined && record.parent?.recordName.startsWith("List/"), "Reminder creation requires its list parent.");
-    const payload = { zoneID: this.requestZone, atomic: true, operations: [{ operationType, record }] };
-    // Pre-dispatch bounds are validation errors, not ambiguous write outcomes.
-    requireInput(new TextEncoder().encode(JSON.stringify(payload)).length <= MAX_REQUEST_BYTES, "The reminder write exceeded its byte budget.");
-    try {
-      const result = await this.post("/records/modify", payload);
-      const page = pageRecords(result.records, 1, 1, this.expectedOwner);
-      if (page.recordErrors.length) {
-        requireValue(page.recordErrors.length === 1 && page.recordErrors[0].recordName === record.recordName && page.records.length === 0, "Apple returned an unrelated write error.");
-        parseTopLevelError({ serverErrorCode: page.recordErrors[0].serverErrorCode, recordName: record.recordName }, { path: "/records/modify", upstreamStatus: 200, hasSessionCookie: this.http.jar.header(this.endpoint).length > 0 });
+    for (const [key, field] of Object.entries(record.fields)) {
+      const expected = ["TitleDocument", "NotesDocument", "TimeZone", "ResolutionTokenMap"].includes(key) ? "STRING" : key === "List" || key === "ParentReminder" ? "REFERENCE" : key.endsWith("Date") ? "TIMESTAMP" : "INT64";
+      if (key === "ParentReminder") {
+        requireInput(field.type === "REFERENCE" && (field.value === null ? operationType === "update" :
+          field.value !== null && typeof field.value === "object" && !Array.isArray(field.value) && "recordName" in field.value &&
+          typeof field.value.recordName === "string" && "action" in field.value && field.value.action === "VALIDATE" &&
+          Object.keys(field.value).length === 2 && field.value.recordName !== record.recordName), "A parent update requires an exact validated Reminder reference or an explicit detach.");
+        if (field.value !== null && typeof field.value === "object" && "recordName" in field.value) requestedRecordName(field.value.recordName, ["Reminder"]);
+        continue;
       }
-      requireValue(page.records.length === 1, "Apple omitted the reminder write confirmation.");
-      const confirmed = page.records[0];
-      requireValue("recordType" in confirmed && confirmed.recordType === "Reminder" && confirmed.recordName === record.recordName && !confirmed.deleted && typeof confirmed.recordChangeTag === "string" && confirmed.recordChangeTag.length > 0, "Apple returned an invalid reminder write confirmation.");
-      if (operationType === "update") requireValue(confirmed.recordChangeTag !== record.recordChangeTag, "Apple did not advance the reminder version.");
-      return confirmed;
-    } catch (error) {
-      if (error instanceof AppError && ["REAUTH_REQUIRED", "FORBIDDEN", "RATE_LIMITED", "CONFLICT"].includes(error.code)) throw error;
-      // Explicit bad-field rejections above are also definite failures.
-      if (error instanceof AppError && error.code === "PROTOCOL_CHANGED" && error.message === "Apple rejected the reminder write fields. No automatic retry was attempted.") throw error;
-      throw new WriteOutcomeUnknownError(record.recordName);
+      requireInput(field.type === expected && (expected === "STRING" ? typeof field.value === "string" || (key === "TimeZone" && field.value === null) :
+        expected === "REFERENCE" ? field.value !== null && typeof field.value === "object" && "recordName" in field.value && field.value.recordName === record.parent?.recordName :
+        Number.isSafeInteger(field.value) || (expected === "TIMESTAMP" && field.value === null)), "The reminder write has an unsupported field shape.");
     }
   }
 
@@ -659,8 +853,18 @@ export class CloudKitRemindersClient {
   }
 
   async lookup(recordNames: string[], listSummary = false): Promise<CloudKitLookupResult> {
+    return this.lookupInternal(recordNames, ["List", "Reminder"], listSummary);
+  }
+
+  async lookupSchedulingRecords(recordNames: string[]): Promise<CloudKitLookupResult> {
+    requireInput(this.owner !== undefined && recordNames.length <= 32, "Scheduling lookup requires a discovered private zone and a bounded graph.");
+    return this.lookupInternal(recordNames, ["Reminder", "Alarm", "AlarmTrigger", "RecurrenceRule"], false);
+  }
+
+
+  private async lookupInternal(recordNames: string[], allowedTypes: string[], listSummary: boolean): Promise<CloudKitLookupResult> {
     requireInput(Array.isArray(recordNames) && recordNames.length >= 1 && recordNames.length <= MAX_PAGE_SIZE, "The CloudKit lookup size is outside the supported limit.");
-    const requestedRecordNames = recordNames.map((name) => requestedRecordName(name, ["List", "Reminder"]));
+    const requestedRecordNames = recordNames.map((name) => requestedRecordName(name, allowedTypes));
     requireInput(!listSummary || requestedRecordNames.every(name => name.startsWith("List/")), "Only list lookups can use the list-summary projection.");
     requireInput(new Set(requestedRecordNames).size === requestedRecordNames.length, "The CloudKit lookup contains duplicate record names.");
     const result = await this.post("/records/lookup", {
@@ -829,13 +1033,20 @@ export class CloudKitRemindersClient {
     if (continuation) payload.continuationMarker = continuation;
     // Upstream does not define whether resultsLimit includes auxiliary records.
     // Bound the flattened response independently; follow Apple's continuation.
-    const page = this.queryResponse(await this.post("/records/query", payload), MAX_COMPOUND_RECORDS, continuation, MAX_COMPOUND_RECORDS);
+    const page = this.queryResponse(await this.post("/records/query", payload), MAX_COMPOUND_RECORDS, continuation, MAX_COMPOUND_RECORDS, false, true);
+    const unique = new Map<string, CloudKitRecordItem>();
     for (const record of page.records) {
+      const previous = unique.get(record.recordName);
+      if (previous) {
+        requireValue(canonicalJSON(previous.raw) === canonicalJSON(record.raw), "Apple returned conflicting duplicate records in a compound reminder page.");
+        continue;
+      }
+      unique.set(record.recordName, record);
       if ("recordType" in record && record.recordType === "Reminder") {
         requireValue(normalizeReminder(record, this.expectedOwner).listId === listId, "Apple returned a reminder linked to a different list.");
       }
     }
-    return page;
+    return { ...page, records: [...unique.values()] };
   }
 
   private queryResponse(result: Record<string, unknown>, limit: number, requestedContinuation: string | null, absoluteLimit = MAX_PAGE_SIZE, allowRepeatedContinuation = false, allowDuplicates = false): CloudKitPage {

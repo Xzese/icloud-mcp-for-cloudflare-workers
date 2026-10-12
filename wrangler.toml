@@ -27,6 +27,11 @@ APPLE_SESSION_RETENTION_WRITES = ""
 APPLE_SESSION_RETENTION_MIGRATION_JSON = ""
 APPLE_SESSION_RENEWAL_ENABLED = ""
 APPLE_SESSION_CHECK_INTERVAL_MS = "21600000"
+REMINDER_JOB_EXECUTION_MODE = ""
+REMINDER_JOB_QUEUE_NAME = ""
+
+# Optional standalone Queue delivery is configured only in the ignored operator
+# config. See docs/reminder-jobs.md for the producer, consumer and outbox schedule.
 
 [observability]
 enabled = true

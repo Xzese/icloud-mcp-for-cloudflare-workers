@@ -1,0 +1,38 @@
+{
+  "provenance": "Invented graphs for fail-closed tests, not captured Apple scheduling evidence.",
+  "liveVerified": false,
+  "zoneOwner": "synthetic-private-owner",
+  "records": [
+    {
+      "recordName": "Reminder/OPEN-RECURRING",
+      "recordType": "Reminder",
+      "recordChangeTag": "synthetic-open-version",
+      "zoneID": { "zoneName": "Reminders", "ownerRecordName": "synthetic-private-owner" },
+      "fields": {
+        "List": { "type": "REFERENCE", "value": { "recordName": "List/SYNTHETIC", "action": "VALIDATE" } },
+        "Completed": { "type": "INT64", "value": 0 },
+        "Deleted": { "type": "INT64", "value": 0 },
+        "DueDate": { "type": "TIMESTAMP", "value": 1787990400000 },
+        "TimeZone": { "type": "STRING", "value": "Europe/London" },
+        "AllDay": { "type": "INT64", "value": 0 },
+        "RecurrenceRuleIDs": { "type": "STRING_LIST", "value": ["RecurrenceRule/SYNTHETIC"] }
+      }
+    },
+    {
+      "recordName": "RecurrenceRule/SYNTHETIC",
+      "recordType": "RecurrenceRule",
+      "recordChangeTag": "synthetic-rule-version",
+      "zoneID": { "zoneName": "Reminders", "ownerRecordName": "synthetic-private-owner" },
+      "fields": { "UnverifiedSchedulingField": { "type": "STRING", "value": "unknown semantics" } }
+    }
+  ],
+  "requestedChange": { "dueDate": "2026-10-10T09:00:00+01:00" },
+  "expected": { "supported": false, "modifyRequests": 0 },
+  "completedHistoryCase": {
+    "historicalId": "Reminder/COMPLETED-HISTORY",
+    "activeSuccessorId": "Reminder/ACTIVE-SUCCESSOR",
+    "activeDueDate": "2026-11-12T09:00:00+00:00",
+    "requestedNextDate": "2027-01-10T09:00:00+00:00",
+    "expected": "Explicitly target the successor; never edit, reopen or complete history to advance a series."
+  }
+}

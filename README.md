@@ -71,6 +71,11 @@ Review Git history before publishing a repository that previously contained priv
 | `complete_reminder` | Complete one open reminder using its current version. |
 | `reopen_reminder` | Reopen one completed reminder and clear its completion date. |
 | `delete_reminder` | Soft-delete one open or completed reminder using its current version. |
+| `prepare_reminder_update` | Preview an exact simple edit or supported timed recurring/absolute-alarm date update. |
+| `create_reminder_job`, `append_reminder_job_items` | Stage encrypted, bounded immutable bulk manifests with stable UUID keys. |
+| `preview_reminder_job`, `start_reminder_job` | Seal/review and accept a manifest without executing Apple mutations. |
+| `get_reminder_job`, `cancel_reminder_job` | Read ordered progress or stop future dispatch; cancellation is not rollback. |
+| `resume_reminder_job`, `continue_reminder_job` | Resume the same authorized scope and execute/reconcile at most three items per request. |
 
 Tools return `structuredContent` plus a text copy for client compatibility. Every tool advertises
 a typed output schema for successful results and describes its parameters in the input schema.
@@ -96,17 +101,43 @@ is no separate write approval flag. Review [the write protocol and limitations](
 `connection_status` reports `writeEnabled` and the create/update/complete/reopen/delete
 capabilities based on the current connection state.
 
+[Durable jobs](docs/reminder-jobs.md) default to authenticated continuation on both deployment targets.
+Simple bulk creation is a normal ready-account capability once the additive job schema is
+installed; no feature flag is required. Timed absolute-alarm date updates, including the active
+occurrence of a recurring reminder, are also permanent ready-account capabilities.
+Bulk deletion of simple reminders is permanent too: each item gets the single-delete exact-version and
+subtask checks, and a subtask attached natively during commit is reported, not cascaded. Standalone Workers can opt into a strictly configured
+Queue consumer and durable outbox recovery schedule; Sites remains request-driven. See
+[the linked-date recipe and live evidence](docs/linked-record-protocol.md#permanent-in-place-absolute-date-updates)
+for exact scope, preservation rules and remaining unsupported transitions.
+
 Use `get_reminder_lists` to select a list and `get_reminders` to obtain reminder IDs and current
 version tags. Creates need a new UUID `idempotencyKey` for each distinct reminder; reuse that
 same key and content after an uncertain result. Updates need the last-read `recordChangeTag`
 and a nonempty `changes` object. `get_reminder` reads the exact current item, including completed
 or soft-deleted state, without scanning history. Only specified fields change. Supported fields are title, notes,
-priority, flag, due date, time zone and all-day status. Date edits on recurring or alarmed
-reminders are refused. Completion, reopening and deletion refuse recurring, alarmed and nested
-reminders, and send one tagged record update. They do not detect parents or implement subtask
-cascades; use Apple's app for parent/subtask workflows. Deletion sets Apple's `Deleted` marker
-with a normal update; no hard-delete or restore tool is exposed. Moving lists and linked-record
-editing are excluded.
+priority, flag, due date, time zone and all-day status, plus bounded custom recurrence creation,
+editing and removal, early reminders and location alarm creation, editing and removal. Scheduling updates support
+one absolute date alarm, optionally one location alarm and one known recurrence. Linked date clearing and explicit
+timed/all-day conversion retire the old date-alarm pair atomically. Subtask scheduling guards
+the exact open parent in the same list. See [supported recipes](docs/linked-record-protocol.md)
+for required inputs and refusal boundaries. Completion, reopening and deletion refuse recurring, alarmed and nested
+reminders and observed parents, and send one tagged record update. A bounded complete-list
+child check fails closed on errors or unfinished pagination; it does not prove protection
+against newly added, unreferenced children. No subtask cascades are supported. Use Apple's app
+for parent/child lifecycle actions. Deletion sets Apple's `Deleted` marker
+with a normal update; no hard-delete or restore tool is exposed. Moving lists, arbitrary linked-record
+editing and recurrence anchor changes are excluded. New early reminders use an exact-version
+witness from another native early reminder in the same list to obtain Apple's account metadata;
+the connector never derives that identifier from credentials or zone owners.
+
+The `create_subtask` and `set_reminder_parent` tools create undated children, move a
+simple childless reminder under a root, reparent it or return it to top level.
+They are permanent ready-account capabilities; `capabilities.subtasks` reports session availability.
+They require same-list, open, undated, non-recurring/un-alarmed nodes and exact child/destination
+tags, with affected parents guarded in one atomic group. Deeper nesting and cascades remain
+unsupported; simple bulk-create jobs still reject parent inputs. See
+[subtask contracts and limits](docs/write-access.md#subtask-relationships).
 
 `CONFLICT` requires a fresh read and review. `WRITE_OUTCOME_UNKNOWN` means Apple may have saved
 the change: read the indicated reminder before retrying, and never choose a new creation key
@@ -124,7 +155,7 @@ includes a command that creates, edits, completes, reopens and deletes only its 
 | Encryption | Operator-provided Worker secret | Operator-provided Worker secret |
 | MCP registration | Site-hosted plugin at `/mcp` | Register `/mcp` as a custom OAuth MCP connection. |
 
-No R2 bucket, Workers KV, Queue, Durable Object, Apple developer application or OpenAI API key is
+No R2 bucket, Workers KV, Durable Object, Apple developer application or OpenAI API key is
 used by this implementation. Your Cloudflare plan must support the CPU/memory needs of the login
 cryptography and your Access configuration; validate those limits in your deployment.
 
@@ -209,7 +240,7 @@ configuration with Wrangler as a substitute for Sites publication.
    the main checkout, and reconcile any unsaved Site-source changes before preparing another copy.
    The build packages `schema.sql` in Sites'
    expected SQL initialization layout; Sites provisions the logical D1 binding and applies it.
-   `schema.sql` is the only schema source: no Drizzle installation or migration generation is needed.
+   Fresh-install `schema.sql` and the additive SQL migration need no Drizzle installation or migration generation.
 3. Obtain the published HTTPS origin. In the Site's runtime settings, set `APP_ORIGIN` to that exact
    origin and `ENCRYPTION_KEY_ID` to `primary`. Generate the key ring locally:
 
@@ -473,7 +504,8 @@ src/
   auth/              Apple authentication and direct reminder reads
   crypto/            Protocol cryptography and encrypted storage envelopes
   icloud/            CloudKit transport and record normalization
-  persistence/       Native D1 session storage
+  persistence/       Native D1 session and encrypted job storage
+  jobs/              Durable manifests, lifecycle and bounded request-driven runner
   platform/          Sites and Cloudflare authentication adapters
   reminders/         Reminder document codec and bounded write schemas/payloads
   transport/         Bounded Apple HTTP and WebSocket transports
@@ -500,10 +532,10 @@ Deployment preparation produces ignored `wrangler.generated.toml`. The minimal
 `wrangler.build.toml` isolates framework builds from production settings. Vite generates
 `dist/server/wrangler.json` internally; that generated file is not an editable source configuration.
 
-The source contains one application table, `apple_session_state`. The Worker uses native D1
-prepared statements. The Sites build derives its platform SQL package from `schema.sql`; it does
-not keep a separate schema history. The schema file initializes a fresh database; future changes
-to an existing database need an explicit upgrade plan rather than replaying setup as an upgrade.
+The source contains `apple_session_state` and the additive encrypted job ledger. The Worker uses
+native D1 prepared statements. The Sites build derives its platform SQL package from `schema.sql`.
+Fresh databases use that definition; existing databases apply `migrations/0001_reminder_jobs.sql`
+using the [documented upgrade path](docs/reminder-jobs.md), without resetting session data.
 
 Run the checks before contributing:
 

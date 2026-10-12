@@ -68,6 +68,17 @@ test("deployment preparation preserves source when the Site differs or edits are
   } finally { await rm(directory, { recursive: true, force: true }); }
 });
 
+test("public configuration needs no bulk-create or subtask rollout flags", async () => {
+  const { directory } = await fixture();
+  try {
+    const file = path.join(directory, "wrangler.toml");
+    const source = await readFile(file, "utf8");
+    assert.ok(!source.includes("REMINDER_SUBTASKS_ENABLED"));
+    assert.ok(!source.includes("REMINDER_BULK_CREATE_ENABLED"));
+    await checkPublic(directory);
+  } finally { await rm(directory, { recursive: true, force: true }); }
+});
+
 test("deployment preparation cannot follow a tracked source symlink into private files", async () => {
   const { directory, destination } = await fixture();
   try {

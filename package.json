@@ -18,6 +18,7 @@
     "test:worker": "node tests/integration/worker.mjs",
     "test:local": "node tests/integration/local-icloud.mjs",
     "test:icloud-write": "node scripts/dev/validate-local-reminder-writes.mjs",
+    "evidence:reminder": "node scripts/dev/capture-reminder-evidence.mjs",
     "fixtures:generate": "python3 tests/fixtures/generate.py",
     "verify:artifact": "node scripts/build/verify-artifact.mjs",
     "notices:generate": "node scripts/release/generate-notices.mjs",

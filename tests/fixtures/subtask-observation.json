@@ -1,0 +1,34 @@
+{
+  "source": "authorized-synthetic-apple-api-experiment",
+  "completeRawRecords": false,
+  "appleAppRelationshipObservation": {
+    "action": "move-existing-open-reminder-under-root",
+    "parentVersionChanged": true,
+    "parentChildCountOrIdFieldObserved": false,
+    "newParentFields": ["AlarmIDs", "HashtagIDs", "RecurrenceRuleIDs", "AssignmentIDs", "AttachmentIDs"],
+    "childParentField": {
+      "type": "REFERENCE",
+      "value": { "recordName": "Reminder/SYNTHETIC-PARENT", "action": "VALIDATE" }
+    },
+    "listOwnershipUnchanged": true
+  },
+  "connectorAcceptance": {
+    "createConfirmed": true,
+    "matchingReplayWithoutModify": true,
+    "reparentConfirmed": true,
+    "detachWithNullReferenceConfirmed": true,
+    "attachConfirmed": true,
+    "affectedParentMarkerGuardsAccepted": true,
+    "parentCompleteFieldsPreserved": true,
+    "staleParentInputRejectedDuringPreflight": true,
+    "staleChildInputRejectedDuringPreflight": true,
+    "observedParentLifecycleRefused": true,
+    "originalChildAndRecurringRecordsUnchanged": true,
+    "generationAndSessionDeadlineUnchanged": true,
+    "connectorCreatedTargetsSoftDeleted": true
+  },
+  "nativePostPreparationParentRaceProven": false,
+  "unreferencedNewChildRaceSafetyProven": false,
+  "bulkDeleteEnabled": false,
+  "linkedSchedulingEnabled": false
+}

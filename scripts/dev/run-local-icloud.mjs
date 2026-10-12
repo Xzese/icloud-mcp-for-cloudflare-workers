@@ -9,7 +9,11 @@ import { createLocalPushRelay } from "./local-icloud-push.mjs";
 
 const root = resolve(new URL("../..", import.meta.url).pathname);
 if (process.argv.length > 2) throw new Error("Use npm run dev:icloud.");
-const state = join(root, ".sites-runtime/local-icloud");
+const state = process.env.LOCAL_ICLOUD_STATE_DIR ? resolve(process.env.LOCAL_ICLOUD_STATE_DIR) : join(root, ".sites-runtime/local-icloud");
+if (process.env.LOCAL_ICLOUD_STATE_DIR) {
+  const existing = await stat(join(state, "keys.json"));
+  if (!existing.isFile()) throw new Error("The explicit local state directory must contain its existing keys.json; no replacement login will be created.");
+}
 await mkdir(state, { recursive: true, mode: 0o700 });
 await chmod(state, 0o700);
 const configPath = join(state, "keys.json");
@@ -47,6 +51,7 @@ const worker = new Miniflare({
       bindings: { APP_ORIGIN: origin, REMINDERS_OWNER_ID: keys.owner, ENCRYPTION_KEY_ID: "local-live", ENCRYPTION_KEYS_JSON: JSON.stringify({ "local-live": keys.key }), LIVE_APPLE_CONNECTION_APPROVED: "controlled-device-v2", APPLE_CRYPTO_REVIEW_APPROVED: "device-proof-v2",
         APPLE_SESSION_RETENTION_WRITES: process.env.APPLE_SESSION_RETENTION_WRITES ?? "",
         APPLE_SESSION_RENEWAL_ENABLED: process.env.APPLE_SESSION_RENEWAL_ENABLED ?? "",
+        LOCAL_REMINDER_EVIDENCE_ENABLED: process.env.LOCAL_REMINDER_EVIDENCE_ENABLED ?? "",
         APPLE_SESSION_CHECK_INTERVAL_MS: process.env.APPLE_SESSION_CHECK_INTERVAL_MS ?? "21600000" },
       d1Databases: { DB: "isolated-local-icloud" },
       assets: { directory: join(root, "dist/client"), routerConfig: { has_user_worker: true } },

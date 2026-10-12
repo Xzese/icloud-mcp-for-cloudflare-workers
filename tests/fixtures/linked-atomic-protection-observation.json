@@ -1,0 +1,46 @@
+{
+  "source": "authorized-synthetic-apple-api-experiment",
+  "observedAt": "2026-10-10",
+  "description": "Projection of three controlled marker-only experiments on the known open original and its existing alarm, trigger and recurrence rule. This contains outcome and error-count observations, not complete Apple records or a scheduling recipe.",
+  "guard": {
+    "operationType": "update",
+    "exactVersionRequired": true,
+    "fields": { "Deleted": { "type": "INT64", "value": 0 } },
+    "allDependencyFieldsPreserved": true,
+    "acceptedWriteAdvancesVersion": true
+  },
+  "scenarios": [
+    {
+      "dependencyType": "Alarm",
+      "validGuardAccepted": true,
+      "staleGuardRejected": true,
+      "groupFieldsAndVersionsUnchangedAfterRejection": true,
+      "errorCounts": { "CONFLICT": 1, "ATOMIC_ERROR": 3 }
+    },
+    {
+      "dependencyType": "AlarmTrigger",
+      "validGuardAccepted": true,
+      "staleGuardRejected": true,
+      "groupFieldsAndVersionsUnchangedAfterRejection": true,
+      "errorCounts": { "CONFLICT": 1, "ATOMIC_ERROR": 3 }
+    },
+    {
+      "dependencyType": "RecurrenceRule",
+      "validGuardAccepted": true,
+      "staleGuardRejected": true,
+      "groupFieldsAndVersionsUnchangedAfterRejection": true,
+      "errorCounts": { "CONFLICT": 1, "ATOMIC_ERROR": 3 }
+    }
+  ],
+  "groupRecordCount": 4,
+  "guardedDependencyCount": 3,
+  "probeMutation": "nondeleted-marker",
+  "historicalNormalizedStateAndVersionUnchanged": true,
+  "activeDueDate": "2027-01-10T09:00:00.000Z",
+  "activeTimeZone": "Europe/London",
+  "sessionGenerationAndAbsoluteExpiryPreserved": true,
+  "schedulingFieldsRewritten": false,
+  "writableRecipeApproved": false,
+  "oldAlarmRetirementProven": false,
+  "unreferencedChildRaceProtectionProven": false
+}

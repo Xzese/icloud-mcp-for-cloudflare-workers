@@ -1,6 +1,9 @@
 import { z } from "zod";
 import { AppError, requireValue } from "../errors.ts";
 import { normalizeReminder, type CloudKitRecord } from "../icloud/cloudkit.ts";
+import { RecurrenceChanges } from "./recurrence.ts";
+import { LocationAlarmChange } from "./location-alarm.ts";
+import { EarlyReminder } from "./early-reminder.ts";
 import { encodeDocument } from "./crdt.ts";
 
 // Write fields and resolution-token shapes follow pyicloud's MIT-licensed Reminders _writes.py and _protocol.py pinned references.
@@ -64,10 +67,10 @@ const notes = z.string().max(16_000).refine(safeText, "Notes cannot contain unsa
 const dueDate = z.string().max(64).refine(validIsoDateTime, "Due date must be a valid ISO 8601 date-time with an explicit offset.");
 const timeZone = z.string().min(1).max(128).refine(validTimeZone, "Time zone must be a valid IANA time-zone identifier.");
 const priority = z.union([z.literal(0), z.literal(1), z.literal(5), z.literal(9)]).describe("0: none; 1: high; 5: medium; 9: low.");
-const nullableDueDate = dueDate.nullable().describe("Valid ISO 8601 date-time with an explicit offset. Null clears the due date and, unless overridden, its time zone and all-day marker.");
-const nullableTimeZone = timeZone.nullable().describe("IANA time-zone identifier, such as Europe/London; null clears it. Required with a due date for all-day reminders.");
+const nullableDueDate = dueDate.nullable().describe("Valid ISO 8601 date-time with an explicit offset. All-day conversion uses the requested calendar date at midnight UTC. Null clears a simple date and its calendar metadata; clearing a linked date preserves calendar metadata and retires its known alarm and recurrence.");
+const nullableTimeZone = timeZone.nullable().describe("IANA time-zone identifier, such as Europe/London; null clears it. Required for timed conversion; omit it for all-day conversion, which removes the stored zone.");
 const flagged = z.boolean().describe("Whether the reminder is flagged.");
-const allDay = z.boolean().describe("Whether the due date is all-day. True requires a due date and time zone. Omitted update fields stay unchanged.");
+const allDay = z.boolean().describe("Whether the due date is all-day. Creation requires a due date and time zone. Conversion requires an explicit midnight-UTC calendar date and removes the stored zone. Omitted update fields stay unchanged.");
 
 export const ReminderChanges = z.object({
   title,
@@ -77,6 +80,9 @@ export const ReminderChanges = z.object({
   dueDate: nullableDueDate,
   timeZone: nullableTimeZone,
   allDay,
+  locationAlarm: LocationAlarmChange.nullable().describe("Create one location alarm with full place, proximity and radius; edit supplied existing metadata; null removes the location alarm."),
+  earlyReminder: EarlyReminder.nullable().describe("Create one minute/hour/day/week/month early reminder using an exact same-list private metadata source, or edit an existing offset while preserving its private metadata. Null removes an existing early reminder."),
+  recurrence: RecurrenceChanges.nullable().describe("Create or edit one known recurrence; null removes it: hourly/daily/weekly/monthly/yearly frequency and interval, weekly ISO weekdays, monthly dates or ordinal weekday, yearly months, and an explicit end instant. Omitted compatible patterns and endDate stay unchanged."),
 }).partial().strict();
 
 export const CreateReminderInput = z.object({
@@ -164,10 +170,17 @@ function existingResolutionMap(current: CloudKitRecord): Record<string, unknown>
   return map;
 }
 
-function updateResolutionTokenMap(current: CloudKitRecord, fieldNames: readonly string[], nowMs: number): string {
+export function updateResolutionTokenMap(current: CloudKitRecord, fieldNames: readonly string[], nowMs: number): string {
   const map = existingResolutionMap(current);
   const modificationTime = nowMs / 1000 - APPLE_EPOCH_SECONDS;
-  for (const fieldName of fieldNames) map[fieldName] = newResolutionToken(modificationTime);
+  for (const fieldName of new Set(fieldNames)) {
+    const existing = map[fieldName] as { counter: number; modificationTime: number; replicaID: string } | undefined;
+    if (!existing) map[fieldName] = newResolutionToken(modificationTime);
+    else {
+      if (!Number.isSafeInteger(existing.counter + 1)) throw new AppError("PROTOCOL_CHANGED", "The existing resolution counter cannot be advanced safely.");
+      map[fieldName] = { ...existing, counter: existing.counter + 1, modificationTime: Math.max(modificationTime, existing.modificationTime) };
+    }
+  }
   const encoded = JSON.stringify({ map });
   if (Object.keys(map).length > 512 || new TextEncoder().encode(encoded).length > MAX_RESOLUTION_MAP_BYTES) {
     throw new AppError("PROTOCOL_CHANGED", "The updated reminder ResolutionTokenMap exceeds the supported budget.");
@@ -175,7 +188,7 @@ function updateResolutionTokenMap(current: CloudKitRecord, fieldNames: readonly 
   return encoded;
 }
 
-function assertOwnedReminder(record: CloudKitRecord, expectedOwner: string): void {
+export function assertOwnedReminder(record: CloudKitRecord, expectedOwner: string): void {
   const recordOwner = record.zoneID?.ownerRecordName;
   if (recordOwner !== undefined && recordOwner !== DEFAULT_OWNER && recordOwner !== expectedOwner) {
     throw new AppError("FORBIDDEN", "The reminder belongs to a different CloudKit owner.", 403);
@@ -245,7 +258,7 @@ function sameDate(left: string | null, right: string | null): boolean {
   return appleTimestamp(left) === appleTimestamp(right);
 }
 
-export function buildUpdateReminder(input: UpdateReminderInputData, current: CloudKitRecord, expectedOwner: string, nowMs = Date.now()): CloudKitWriteRecord {
+export function buildReminderFieldUpdate(input: UpdateReminderInputData, current: CloudKitRecord, expectedOwner: string, nowMs = Date.now()): CloudKitWriteRecord {
   const parsed = UpdateReminderInput.parse(input);
   validateNow(nowMs);
   const changes = parsed.changes;
@@ -259,23 +272,26 @@ export function buildUpdateReminder(input: UpdateReminderInputData, current: Clo
   if (changes.dueDate !== undefined) nextDue = changes.dueDate;
   if (changes.timeZone !== undefined) nextZone = changes.timeZone;
   if (changes.allDay !== undefined) nextAllDay = changes.allDay;
-  if (changes.dueDate === null) {
+  const linked = (reminder.alarmIds?.length ?? 0) > 0 || (reminder.recurrenceRuleIds?.length ?? 0) > 0 || Object.hasOwn(current.fields, "DueDateDeltaAlertsData");
+  if (changes.dueDate === null && !linked) {
     if (changes.allDay === undefined && nextAllDay) nextAllDay = false;
     if (changes.timeZone === undefined) nextZone = null;
   }
   // Apple can retain AllDay=1 on an undated reminder. Preserve that existing
   // state for unrelated edits; validate dependencies when changing date fields.
-  if (changes.dueDate !== undefined || changes.timeZone !== undefined || changes.allDay !== undefined) requireAllDayValues(nextAllDay, nextDue, nextZone);
+  const nativeAllDay = reminder.allDay === true && nextAllDay && nextZone === null && changes.timeZone === undefined && nextDue !== null;
+  if (nativeAllDay && changes.dueDate !== undefined) requireValue(changes.dueDate !== null && changes.dueDate.endsWith("Z") && Date.parse(changes.dueDate) % 86_400_000 === 0, "An all-day date without a stored zone requires an explicit midnight-UTC calendar date.");
+  if ((changes.dueDate !== undefined || changes.timeZone !== undefined || changes.allDay !== undefined) && !nativeAllDay && !(changes.allDay === true && reminder.allDay === false) && !(changes.dueDate === null && linked)) requireAllDayValues(nextAllDay, nextDue, nextZone);
 
   const dateChanged = !sameDate(reminder.dueDate, nextDue);
   const zoneChanged = (reminder.timeZone ?? null) !== nextZone;
   const allDayChanged = (reminder.allDay ?? false) !== nextAllDay;
-  if ((dateChanged || zoneChanged || allDayChanged) && ((reminder.recurrenceRuleIds?.length ?? 0) > 0 || (reminder.alarmIds?.length ?? 0) > 0)) {
-    throw new AppError("UNSUPPORTED_FEATURE", "Due date, time zone, and all-day updates are unavailable for recurring or alarmed reminders.");
-  }
 
   const fields: CloudKitWriteRecord["fields"] = {};
   const tokenFields: string[] = [];
+  if (changes.recurrence !== undefined) tokenFields.push("recurrenceRuleIDs");
+  if (changes.earlyReminder !== undefined) tokenFields.push("dueDateDeltaAlertsData");
+  if (changes.locationAlarm !== undefined) tokenFields.push("lastModifiedDate");
   const change = (key: string, tokenName: string, type: string, value: unknown) => {
     fields[key] = { type, value };
     tokenFields.push(tokenName);
@@ -292,6 +308,17 @@ export function buildUpdateReminder(input: UpdateReminderInputData, current: Clo
   tokenFields.push("lastModifiedDate");
   fields.ResolutionTokenMap = { type: "STRING", value: updateResolutionTokenMap(current, tokenFields, nowMs) };
   return { recordName: parsed.reminderId, recordType: "Reminder", recordChangeTag: parsed.recordChangeTag, fields };
+}
+
+export function buildUpdateReminder(input: UpdateReminderInputData, current: CloudKitRecord, expectedOwner: string, nowMs = Date.now()): CloudKitWriteRecord {
+  if (input.changes.recurrence !== undefined || input.changes.earlyReminder !== undefined || input.changes.locationAlarm !== undefined) throw new AppError("UNSUPPORTED_FEATURE", "Recurrence edits require a complete versioned scheduling plan.");
+  const write = buildReminderFieldUpdate(input, current, expectedOwner, nowMs);
+  const reminder = normalizeReminder(current, expectedOwner);
+  if (["DueDate", "TimeZone", "AllDay"].some(key => Object.hasOwn(write.fields, key)) &&
+    ((reminder.recurrenceRuleIds?.length ?? 0) > 0 || (reminder.alarmIds?.length ?? 0) > 0)) {
+    throw new AppError("UNSUPPORTED_FEATURE", "Linked date updates require a complete, versioned alarm/trigger plan, not a single-record write.");
+  }
+  return write;
 }
 
 export function buildLifecycleReminder(action: ReminderLifecycleAction, input: ReminderTargetInputData, current: CloudKitRecord, expectedOwner: string, nowMs = Date.now()): CloudKitWriteRecord {
@@ -318,7 +345,7 @@ export function buildLifecycleReminder(action: ReminderLifecycleAction, input: R
   return { recordName: parsed.reminderId, recordType: "Reminder", recordChangeTag: parsed.recordChangeTag, fields };
 }
 
-export function matchesCreatedReminder(input: CreateReminderInputData, current: CloudKitRecord, expectedOwner: string): boolean {
+export function matchesCreatedReminder(input: CreateReminderInputData, current: CloudKitRecord, expectedOwner: string, expectedParentId: string | null = null): boolean {
   const parsed = CreateReminderInput.parse(input);
   try {
     assertOwnedReminder(current, expectedOwner);
@@ -327,6 +354,7 @@ export function matchesCreatedReminder(input: CreateReminderInputData, current: 
     return reminder.listId === parsed.listId
       && reminder.completed === false
       && reminder.deleted === false
+      && reminder.parentReminderId === expectedParentId
       && reminder.title === parsed.title
       && (reminder.notes ?? "") === parsed.notes
       && reminder.priority === parsed.priority
