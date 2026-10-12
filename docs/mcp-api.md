@@ -359,12 +359,21 @@ own tools because those changes have different native graph effects.
 | `dueDate: null` | Clears a simple date plus its zone/all-day marker unless explicitly overridden. Known linked clearing retires the date pair and recurrence, removes early reminders and preserves a supported location alarm/calendar metadata. |
 | Timed ↔ all-day conversion | All-day conversion requires the desired date at midnight UTC with `Z`, removes the stored zone/date pair and removes hourly recurrence. Timed conversion requires explicit date and zone. Supported location pairs and early payloads are preserved. |
 | `recurrence` or `null` | Creates/edits/removes one known rule. Supply `frequency` and `interval` (1–999), optionally one compatible day/month pattern and explicit-offset `endDate`; null end removes it. Compatible omitted patterns/end remain; frequency changes clear incompatible patterns. No arbitrary RRULE, count/exception or anchor reinterpretation. |
-| `earlyReminder: { unit, count }` or `null` | Creates/edits/removes one minutes/hours/days/weeks/months offset (count 1–10,080). Creation discovers and exact-version guards a native early-reminder metadata witness in the same list; it never guesses Apple's private account identifier. Existing private metadata is preserved. |
+| `earlyReminder: { unit, count }` or `null` | Creates/edits/removes one minutes/hours/days/weeks/months offset (count 1–10,080). Creation discovers and exact-version guards a native early-reminder metadata witness in the same list; it never guesses Apple's private account identifier or copies the source's acknowledgement. Existing private metadata is preserved. An existing finite `acknowledgedDate` is recognised and its bytes stay untouched during a date move; changing that acknowledged offset needs a separate native recipe. |
 | `locationAlarm` or `null` | Creates one alarm from full resolved `place` (title, address, latitude, longitude), `proximity` (`arriving`/`leaving`) and positive `radiusMeters` (at most 1,000,000); supplied metadata edits the existing one, null removes it. The connector does not geocode text or choose a dropdown result. |
 
 Recurrence frequencies are hourly/daily/weekly/monthly/yearly. Patterns are weekly ISO
 `weekdays` (Monday 1–Sunday 7), monthly `monthDays` (1–31) or one
 `ordinalWeekday: { weekday, ordinal }` (-1 last or 1–5), or yearly `months` (1–12).
+Date-only moves can also preserve the observed interval-one monthly rule with
+`DaysOfTheMonth: [28,29]`, `SetPositions: [-1]` and no end. The preview reports
+`monthDays: [28,29]` and read-only `setPositions: [-1]`, retaining the native selection
+rather than reporting two independent monthly occurrences. The exact rule is guarded
+in the atomic group and its fields are unchanged. Omit `recurrence` and `allDay` for
+this recipe; editing/clearing the special rule or converting its date remains refused.
+Unsupported early-payload diagnostics identify the rejected field path or reminder
+identity without returning private account identifiers or payload values.
+
 Hourly needs a timed date. The supported date graph can contain one absolute-date pair,
 one location pair and one known recurrence; child scheduling guards the exact open
 same-list root. Multiple same-type alarms, unknown relative payloads/schedules and repeated

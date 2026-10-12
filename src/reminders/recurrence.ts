@@ -31,7 +31,9 @@ export const RecurrenceChanges = z.object(recurrenceFields).strict().superRefine
   if (input.weekdays !== undefined && input.frequency !== "weekly") context.addIssue({ code: z.ZodIssueCode.custom, path: ["weekdays"], message: "Weekdays require weekly frequency." });
   if ((input.monthDays !== undefined || input.ordinalWeekday !== undefined) && input.frequency !== "monthly") context.addIssue({ code: z.ZodIssueCode.custom, message: "Month days and ordinal weekdays require monthly frequency." });
 });
-export const RecurrenceSummary = z.object({ ...recurrenceFields, endDate: endDate.nullable() }).strict();
+export const RecurrenceSummary = z.object({ ...recurrenceFields, endDate: endDate.nullable(),
+  setPositions: z.tuple([z.literal(-1)]).optional().describe("Read-only native final selection from monthDays; preserved during date moves, never inferred or accepted as an edit."),
+}).strict();
 export type RecurrenceInput = z.infer<typeof RecurrenceChanges>;
 export type RecurrenceState = z.infer<typeof RecurrenceSummary>;
 const WeekEntries = z.array(z.object({ dayOfTheWeek: z.number().int().min(1).max(7), weekNumber: z.number().int().min(-1).max(5) }).strict()).min(1).max(7);
@@ -88,6 +90,24 @@ export function readRecurrence(record: CloudKitRecord): RecurrenceState {
     }
   }
   return result;
+}
+
+/** Date moves preserve this observed native monthly rule; recurrence edits remain strict. */
+export function readPreservedRecurrence(record: CloudKitRecord): RecurrenceState {
+  if (!Object.hasOwn(record.fields, "SetPositions")) return readRecurrence(record);
+  const base = { ...record, fields: Object.fromEntries(Object.entries(record.fields).filter(([key]) => key !== "SetPositions")) };
+  const recurrence = readRecurrence(base);
+  if (recurrence.frequency !== "monthly" || recurrence.interval !== 1 || recurrence.endDate !== null ||
+    !Array.isArray(recurrence.monthDays) || canonicalJSON(recurrence.monthDays) !== "[28,29]") {
+    throw new AppError("UNSUPPORTED_FEATURE", "The recurrence SetPositions shape is outside the observed monthly date-preservation recipe.");
+  }
+  const encoded = field(record, "SetPositions", "BYTES");
+  if (typeof encoded !== "string") throw new AppError("UNSUPPORTED_FEATURE", "The recurrence SetPositions must be bounded base64 UTF-8 JSON.");
+  let positions: unknown;
+  try { positions = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(unb64(encoded, 8192))); }
+  catch { throw new AppError("UNSUPPORTED_FEATURE", "The recurrence SetPositions must be bounded base64 UTF-8 JSON."); }
+  if (!Array.isArray(positions) || positions.length !== 1 || positions[0] !== -1) throw new AppError("UNSUPPORTED_FEATURE", "The recurrence SetPositions value is outside the observed final-selection recipe.");
+  return { ...recurrence, setPositions: [-1] };
 }
 
 /** Separate completion recipe: never relax the ordinary recurrence-edit reader. */

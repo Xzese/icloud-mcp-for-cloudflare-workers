@@ -1,5 +1,5 @@
 import { AppError, WriteOutcomeUnknownError } from "../errors.ts";
-import { readRecurrence, recurrenceEdit, recurrenceCreation } from "./recurrence.ts";
+import { readRecurrence, readPreservedRecurrence, recurrenceEdit, recurrenceCreation } from "./recurrence.ts";
 import { inspectLocationAlarms, locationFields, LocationAlarmSummary } from "./location-alarm.ts";
 import { earlyReminderPayload, editEarlyReminder, createEarlyReminder } from "./early-reminder.ts";
 import { b64, utf8 } from "../crypto/bytes.ts";
@@ -40,7 +40,8 @@ export function schedulingPlan(graph: SchedulingGraph, write: CloudKitWriteRecor
   const rule = graph.records.find(record => record.recordType === "RecurrenceRule");
   if (rule) {
     live(rule);
-    readRecurrence(rule);
+    if (changes.recurrence !== undefined || changes.allDay !== undefined || changes.dueDate === null) readRecurrence(rule);
+    else readPreservedRecurrence(rule);
     if (referenceField(rule, "Reminder", "Reminder", owner) !== reminder.id) throw new AppError("PROTOCOL_CHANGED", "The recurrence belongs to a different reminder.");
   }
   let dependencies: SchedulingWrite[] = [], guards: CloudKitRecord[] = [];
@@ -50,7 +51,7 @@ export function schedulingPlan(graph: SchedulingGraph, write: CloudKitWriteRecor
     linkedDatePlan(dateGraph, currentWrite, owner);
   } else if (dateGraph.records.length !== (rule ? 2 : 1) + (graph.schedulingParent ? 1 : 0)) throw new AppError("UNSUPPORTED_FEATURE", "The graph contains unexpected scheduling participants.");
   const afterAllDay = changes.allDay ?? reminder.allDay;
-  const hourlyRule = rule && readRecurrence(rule).frequency === "hourly" ? rule : undefined;
+  const hourlyRule = rule && readPreservedRecurrence(rule).frequency === "hourly" ? rule : undefined;
   if (afterAllDay === true && changes.recurrence?.frequency === "hourly") throw new AppError("VALIDATION_ERROR", "Hourly recurrence requires a timed date and cannot be created or edited on an all-day date.", 400);
   if (hourlyRule && changes.allDay === true && changes.recurrence) throw new AppError("VALIDATION_ERROR", "All-day conversion removes hourly recurrence; change its frequency in a separate reviewed request.", 400);
   if (hourlyRule && reminder.allDay === true && changes.allDay !== false && changes.dueDate !== null && changes.recurrence === undefined) throw new AppError("UNSUPPORTED_FEATURE", "The current hourly/all-day combination is outside the observed native recipe.");

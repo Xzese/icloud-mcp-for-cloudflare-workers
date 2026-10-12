@@ -9,7 +9,7 @@ type EarlyUnitCode = 0 | 1 | 2 | 3 | 4;
 const UUID = z.string().uuid();
 const Payload = z.object({
   reminderIdentifier: UUID, accountIdentifier: UUID, minimumSupportedVersion: z.literal(20230430),
-  dueDateDeltaAlerts: z.array(z.object({ creationDate: z.number().finite(), identifier: UUID, dueDateDeltaUnit: z.union([z.literal(0), z.literal(1), z.literal(2), z.literal(3), z.literal(4)]),
+  dueDateDeltaAlerts: z.array(z.object({ creationDate: z.number().finite(), acknowledgedDate: z.number().finite().optional(), identifier: UUID, dueDateDeltaUnit: z.union([z.literal(0), z.literal(1), z.literal(2), z.literal(3), z.literal(4)]),
     dueDateDeltaCount: z.number().int().min(-10_080).max(-1), minimumSupportedAppVersion: z.literal(0) }).strict()).length(1),
 }).strict();
 function earlyUnitCode(unit: z.infer<typeof EarlyReminder>["unit"]): EarlyUnitCode {
@@ -24,8 +24,12 @@ export function earlyReminderPayload(record: CloudKitRecord) {
   try { decoded = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(unb64(field.value, 8192))); }
   catch { throw new AppError("UNSUPPORTED_FEATURE", "The early reminder payload is not bounded UTF-8 JSON."); }
   const parsed = Payload.safeParse(decoded);
-  if (!parsed.success || parsed.data.reminderIdentifier.toUpperCase() !== record.recordName.slice(9).toUpperCase()) {
-    throw new AppError("UNSUPPORTED_FEATURE", "The early reminder payload has unsupported shape, identity or units.");
+  if (!parsed.success) {
+    const issue = parsed.error.issues[0], path = issue.path.join(".") || "root";
+    throw new AppError("UNSUPPORTED_FEATURE", `The early reminder payload has ${issue.code === "unrecognized_keys" ? "unreviewed fields" : "an unsupported value"} at ${path}.`);
+  }
+  if (record.recordType !== "Reminder" || !record.recordName.startsWith("Reminder/") || parsed.data.reminderIdentifier.toUpperCase() !== record.recordName.slice(9).toUpperCase()) {
+    throw new AppError("UNSUPPORTED_FEATURE", "The early reminder payload reminderIdentifier does not match the exact reminder identity.");
   }
   return parsed.data;
 }
@@ -56,6 +60,7 @@ export function createEarlyReminder(
 }
 export function editEarlyReminder(record: CloudKitRecord, input: z.infer<typeof EarlyReminder>) {
   const payload = earlyReminderPayload(record);
+  if (payload.dueDateDeltaAlerts[0].acknowledgedDate !== undefined) throw new AppError("UNSUPPORTED_FEATURE", "Editing an acknowledged early reminder offset requires a separate native recipe; its acknowledgement can be preserved during a date move.");
   const unit = earlyUnitCode(input.unit);
   if (payload.dueDateDeltaAlerts[0].dueDateDeltaCount === -input.count && payload.dueDateDeltaAlerts[0].dueDateDeltaUnit === unit) throw new AppError("VALIDATION_ERROR", "The early reminder is unchanged.", 400);
   payload.dueDateDeltaAlerts[0].dueDateDeltaCount = -input.count;

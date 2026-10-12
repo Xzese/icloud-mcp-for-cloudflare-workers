@@ -158,7 +158,10 @@ and a nonempty `changes` object. `get_reminder` reads the exact current item, in
 or soft-deleted state, without scanning history. Only specified fields change. Supported fields are title, notes,
 priority, flag, due date, time zone and all-day status, plus bounded custom recurrence creation,
 editing and removal, early reminders and location alarm creation, editing and removal. Scheduling updates support
-one absolute date alarm, optionally one location alarm and one known recurrence. Linked date clearing and explicit
+one absolute date alarm, optionally one location alarm and one known recurrence. Date moves also preserve
+Apple's acknowledged early-alert metadata and the observed monthly final-selection rule for days 28/29;
+editing that acknowledgement-bearing offset or special recurrence still requires a separate native recipe.
+Linked date clearing and explicit
 timed/all-day conversion retire the old date-alarm pair atomically. Subtask scheduling guards
 the exact open parent in the same list. See [supported recipes](docs/linked-record-protocol.md)
 for required inputs and refusal boundaries. Completion and reopening support ordinary one-level

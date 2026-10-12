@@ -518,3 +518,22 @@ Europe/London, and a subsequent newly created one-day early reminder appeared wi
 station and 400-metre radius intact. An intervening stale preparation was refused before
 dispatch; the later change used freshly read state and a new preparation. These checks verify
 stored schedules and native editor parity, not actual notification delivery.
+
+### Acknowledged early alerts and preserved monthly selection
+
+Native stored early alerts can include a finite `acknowledgedDate` alongside their
+creation date, identity and offset. This optional metadata does not invalidate the
+single-alert format. A date/time-zone move leaves the entire encrypted-bytes field
+untouched, including its acknowledgement and JSON representation. Offset edits with
+this metadata remain refused until a separate native edit recipe is established.
+Creation may use such a payload as a versioned same-list account-metadata witness,
+but never copies its acknowledgement into the newly created alert.
+
+Another observed native rule has monthly frequency, interval one, no end,
+`DaysOfTheMonth: [28,29]` and `SetPositions: [-1]`. Date moves preserve this exact
+rule under its version guard. The preview includes read-only `setPositions: [-1]`
+so it does not misrepresent the selection as two independent monthly occurrences.
+Recurrence edits, date clearing and all-day conversion keep the stricter ordinary
+rule reader; this preservation recipe does not enable those operations or other
+unverified `SetPositions` patterns. Rejected payloads identify a field path or an
+identity mismatch without disclosing private account metadata or payload values.
