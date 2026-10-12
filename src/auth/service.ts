@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { CreateListInput, RenameListInput, DeleteListInput, buildCreateList, buildRenameList, buildDeleteList, requireMutableList, type ListOperation } from "../reminders/list-writes.ts";
 import { AppError, WriteOutcomeUnknownError } from "../errors.ts";
 import { omitField } from "../lib/omit-field.ts";
 import type { RuntimeEnv } from "../platform/sites.ts";
@@ -125,6 +126,18 @@ function sameWitnessSnapshot(left: CloudKitRecord, right: CloudKitRecord) {
     canonicalJSON(left.fields) === canonicalJSON(right.fields);
 }
 
+function ownedListRecord(record: CloudKitRecord, owner: string): CloudKitRecord {
+  const scoped = bindToAuthenticatedReminderZone(record, { zoneName: "Reminders", zoneType: "REGULAR_CUSTOM_ZONE", ownerRecordName: owner }, owner);
+  if (!scoped || scoped.recordType !== "List") throw new AppError("FORBIDDEN", "The requested record is not an owned private Reminders list.", 403);
+  return scoped;
+}
+
+function requireEmptyListMetadata(record: CloudKitRecord) {
+  const list = normalizeList(record);
+  if (list.count !== null && list.count !== 0 || list.reminderIds === null || list.reminderIds.length !== 0)
+    throw new AppError("UNSUPPORTED_FEATURE", "Only lists with explicitly empty membership and no nonzero count can be deleted.");
+}
+
 function verifyWriteFields(write: CloudKitWriteRecord, confirmed: CloudKitRecord, current: CloudKitRecord, owner: string, listId: string) {
   const reminder = normalizeReminder(confirmed, owner);
   const before = normalizeReminder(current, owner);
@@ -182,8 +195,8 @@ export class AppleConnectionService {
       capabilities: { liveRead: readsAvailable, controlledRead: readsAvailable, listReminders: readsAvailable, allOpenReminders: readsAvailable, search: false, create: writesAvailable, update: writesAvailable, complete: writesAvailable, reopen: writesAvailable, delete: writesAvailable,
         prepareUpdate: readsAvailable, linkedScheduling: writesAvailable, reminderJobs: jobsAvailable, bulkCreate: writesAvailable && jobsAvailable, bulkDelete: writesAvailable && jobsAvailable,
         autonomousJobs: jobsAvailable && jobExecutionMode(this.env) === "queue", jobExecutionMode: jobExecutionMode(this.env),
-        subtasks: writesAvailable },
-      mcpTools: ["connection_status", "get_reminder_lists", "get_reminders", "get_reminder", "get_all_open_reminders", "create_reminder", "create_subtask", "set_reminder_parent", "update_reminder", "complete_reminder", "reopen_reminder", "delete_reminder", "prepare_reminder_update", ...JOB_TOOLS],
+        subtasks: writesAvailable, createList: writesAvailable, renameList: writesAvailable, deleteList: writesAvailable },
+      mcpTools: ["connection_status", "get_reminder_lists", "get_reminders", "get_reminder", "get_all_open_reminders", "create_reminder", "create_subtask", "set_reminder_parent", "get_reminder_list", "create_reminder_list", "rename_reminder_list", "delete_reminder_list", "update_reminder", "complete_reminder", "reopen_reminder", "delete_reminder", "prepare_reminder_update", ...JOB_TOOLS],
       message: !gates.enabled ? appleDisabledMessage(gates) : actionMessage ?? (session.state === "READY"
         ? "You can read, create, edit, complete, reopen and delete reminders. Use current IDs and version tags."
         : session.state === "DEVICE_APPROVAL_PENDING"
@@ -609,6 +622,116 @@ export class AppleConnectionService {
       throw error;
     }
   }
+  async readListForMutation(expectedGeneration: number, listId: string) {
+    const valid = RenameListInput.shape.listId.safeParse(listId);
+    if (!valid.success) throw new AppError("VALIDATION_ERROR", "Supply an exact listId.", 400);
+    return this.operation(expectedGeneration, "read-only", async (http, saved, repository, fence) => {
+      const client = new CloudKitRemindersClient(http.http, saved.session.connection);
+      if (client.remindersZoneOwner === undefined && !(await client.listZones()).available)
+        throw new AppError("PROTOCOL_CHANGED", "No owned Reminders zone is available.");
+      const found = await client.lookup([listId]);
+      const current = ownedListRecord(writeLookupRecord(found, listId, false)!, client.remindersZoneOwner!);
+      const list = normalizeList(current, false);
+      if (list.deleted !== true) requireMutableList(current, client.remindersZoneOwner!);
+      else if (list.isGroup !== false || !list.title || !current.recordChangeTag)
+        throw new AppError("UNSUPPORTED_FEATURE", "The retired list identity could not be verified.");
+      await repository.commitResume(fence, appleSuccess({ ...saved.session,
+        connection: { ...saved.session.connection, remindersZoneOwner: client.remindersZoneOwner },
+        auth: http.snapshot() }), "READY");
+      return { generation: fence.generation, list: {
+        id: list.id, title: list.title, color: list.color, count: list.count,
+        isGroup: list.isGroup, deleted: list.deleted, recordChangeTag: current.recordChangeTag!,
+      } };
+    });
+  }
+
+  async mutateList(action: ListOperation, value: unknown) {
+    requireAppleEnabled(this.env);
+    const generation = z.number().int().nonnegative().safe();
+    const common = { expectedGeneration: generation };
+    const schema = action === "create" ? CreateListInput.extend(common).strict() :
+      action === "rename" ? RenameListInput.extend(common).strict() : DeleteListInput.extend(common).strict();
+    const parsed = schema.safeParse(value);
+    if (!parsed.success) throw new AppError("VALIDATION_ERROR", "Provide a valid list operation with current session generation.", 400);
+    const input = parsed.data as Record<string, unknown>;
+    const targetId = action === "create" ? `List/${String(input.idempotencyKey).toUpperCase()}` : String(input.listId);
+    let applied = false;
+    try {
+      return await this.operation(Number(input.expectedGeneration), "mutation-preparation", async (http, saved, repository, fence, stage) => {
+        const client = new CloudKitRemindersClient(http.http, saved.session.connection);
+        if (client.remindersZoneOwner === undefined && !(await client.listZones()).available)
+          throw new AppError("PROTOCOL_CHANGED", "No owned Reminders zone is available.");
+        const owner = client.remindersZoneOwner!;
+        const found = await client.lookup([targetId]);
+        const observed = writeLookupRecord(found, targetId, action === "create");
+        const current = observed ? ownedListRecord(observed, owner) : null;
+        let replayed = false;
+        let confirmed: CloudKitRecord;
+        if (action === "create") {
+          const create = CreateListInput.parse(omitField(input, "expectedGeneration"));
+          if (current) {
+            const existing = requireMutableList(current, owner);
+            if (existing.title !== create.name) throw new AppError("CONFLICT", "This list creation key already belongs to a different list.", 409);
+            confirmed = current;
+            replayed = true;
+          } else {
+            const write = buildCreateList(create);
+            confirmed = await client.modifyList("create", write, async () => {
+              stage.dispatch(); await repository.assertWriteLease(fence);
+            });
+            stage.confirm(); applied = true;
+          }
+        } else {
+          if (!current) throw new AppError("CONFLICT", "The requested list was not found.", 409);
+          const write = action === "rename" ? buildRenameList(RenameListInput.parse(omitField(input, "expectedGeneration")), current, owner) :
+            buildDeleteList(DeleteListInput.parse(omitField(input, "expectedGeneration")), current, owner);
+          if (action === "delete") {
+            // A list count alone is insufficient: query every page including completed reminders.
+            requireEmptyListMetadata(current);
+            let continuation: string | null = null;
+            const seen = new Set<string>();
+            for (let pageIndex = 0; pageIndex < 25; pageIndex++) {
+              const page = await client.queryRemindersPage({ listId: targetId, includeCompleted: true, limit: 200, continuation });
+              if (page.recordErrors.length) throw new AppError("UNSUPPORTED_FEATURE", "Could not verify that the list is empty.");
+              if (page.records.some(record => "recordType" in record && record.recordType === "Reminder" && !record.deleted))
+                throw new AppError("UNSUPPORTED_FEATURE", "Only completely empty lists can be deleted.");
+              if (page.paginationComplete && page.continuation === null) { continuation = null; break; }
+              if (!page.continuation || seen.has(page.continuation)) throw new AppError("UNSUPPORTED_FEATURE", "List contents could not be checked completely.");
+              continuation = page.continuation; seen.add(continuation);
+            }
+            if (continuation) throw new AppError("UNSUPPORTED_FEATURE", "The list needs more than 25 pages to check.");
+            // Check for concurrent list metadata changes directly before dispatch.
+            const latest = ownedListRecord(writeLookupRecord(await client.lookup([targetId]), targetId, false)!, owner);
+            requireMutableList(latest, owner, String(input.recordChangeTag));
+            requireEmptyListMetadata(latest);
+          }
+          confirmed = await client.modifyList("update", write, async () => {
+            stage.dispatch(); await repository.assertWriteLease(fence);
+          });
+          stage.confirm(); applied = true;
+        }
+        const result = normalizeList(confirmed, false);
+        if (action === "delete" ? result.deleted !== true : result.title !== String(input.name) || result.deleted === true)
+          throw new WriteOutcomeUnknownError(targetId, action === "create" ? String(input.idempotencyKey) : undefined);
+        await repository.commitResume(fence, appleSuccess({
+          ...omitField(saved.session, "allOpenScan"),
+          savedLists: (saved.session.savedLists ?? []).filter(list => list.id !== targetId),
+          directListSnapshot: undefined,
+          connection: { ...saved.session.connection, remindersZoneOwner: owner },
+          auth: http.snapshot(),
+        }), "READY");
+        return { generation: fence.generation, operation: action, replayed, list: {
+          id: result.id, title: result.title, color: result.color, count: result.count,
+          isGroup: result.isGroup, deleted: result.deleted, recordChangeTag: confirmed.recordChangeTag ?? null,
+        }, writesEnabled: true, ...(action === "create" ? { idempotencyKey: input.idempotencyKey } : {}) };
+      });
+    } catch (error) {
+      if (applied || error instanceof WriteOutcomeUnknownError)
+        throw new WriteOutcomeUnknownError(targetId, action === "create" ? String(input.idempotencyKey) : undefined);
+      throw error;
+    }
+  }
+
   private async operation<T>(expectedGeneration: number, mode: OperationMode, run: (http: AppleAuthHTTP, saved: Awaited<ReturnType<AppleSessionRepository["load"]>>, repository: AppleSessionRepository, fence: ResumeFence, stage: OperationStage) => Promise<T>, budget = appleRequestBudget()) {
     requireAppleEnabled(this.env);
     const repository = new AppleSessionRepository(this.env, this.owner);

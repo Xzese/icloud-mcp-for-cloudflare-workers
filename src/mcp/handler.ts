@@ -1,6 +1,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
 import { z } from "zod";
+import { CreateListInput, RenameListInput, DeleteListInput } from "../reminders/list-writes.ts";
 import { AppleConnectionService, ControlledRead } from "../auth/service.ts";
 import { publicError } from "../errors.ts";
 import { omitField } from "../lib/omit-field.ts";
@@ -10,7 +11,7 @@ import { PrepareUpdateInput, PreparedUpdateInput } from "../reminders/preparatio
 import { CreateSubtaskInput, SetReminderParentInput } from "../reminders/subtasks.ts";
 import { ReminderJobService } from "../jobs/service.ts";
 import { CreateJob, AppendJob, PreviewJob, StartJob, GetJob, JobIdentity, JobOutput } from "../jobs/schemas.ts";
-import { ExpectedGenerationInput, ListsOutput, RemindersPageOutput, AllOpenOutput, ReminderLookupOutput, MutationOutput, ConnectionStatusOutput, PrepareUpdateOutput } from "./schemas.ts";
+import { ExpectedGenerationInput, ListsOutput, RemindersPageOutput, AllOpenOutput, ReminderLookupOutput, MutationOutput, ConnectionStatusOutput, PrepareUpdateOutput, ListMutationOutput, ExactListOutput } from "./schemas.ts";
 
 export async function handleMCP(request: Request, env: RuntimeEnv, owner: string) {
   const server = new McpServer({ name: "hosted-icloud-reminders", version: "0.1.0" });
@@ -81,6 +82,40 @@ export async function handleMCP(request: Request, env: RuntimeEnv, owner: string
       return toolError(error);
     }
   };
+  server.registerTool("get_reminder_list", {
+    title: "Get one current iCloud reminder list and version",
+    description: "Look up an owned private non-group list by exact listId, including its soft-deleted state for uncertain-outcome reconciliation. Return its current name, observed count (which may be absent), and recordChangeTag for rename or empty-list deletion. No mutation occurs.",
+    inputSchema: z.object({ expectedGeneration, listId: RenameListInput.shape.listId }).strict(),
+    outputSchema: ExactListOutput, annotations: readAnnotations,
+  }, async args => {
+    try {
+      const apple = new AppleConnectionService(env, owner);
+      const generation = args.expectedGeneration ?? (await apple.status()).generation;
+      const result = await apple.readListForMutation(generation, args.listId);
+      return { structuredContent: result, content: [{ type: "text" as const, text: JSON.stringify(result) }] };
+    } catch (error) { return toolError(error); }
+  });
+  for (const entry of [
+    { name: "create_reminder_list", action: "create" as const, schema: CreateListInput,
+      description: "Create a new standard owned private iCloud Reminders list with a stable UUID idempotencyKey and name. Keep the same key after WRITE_OUTCOME_UNKNOWN and read the exact list before retrying. A matching existing list returns without another write." },
+    { name: "rename_reminder_list", action: "rename" as const, schema: RenameListInput,
+      description: "Rename an owned, non-group private Reminders list using its exact listId and current recordChangeTag from get_reminder_list. Conflicts require a fresh read and review. This cannot rename a shared list." },
+    { name: "delete_reminder_list", action: "delete" as const, schema: DeleteListInput,
+      description: "Soft-delete an owned private Reminders list ONLY when it is fully verified empty, including completed records, and its current title matches confirmName. This is destructive. A stale tag or incomplete pagination fails. WRITE_OUTCOME_UNKNOWN requires a fresh read, not automatic retry. Nonempty list deletion is not supported." },
+  ]) {
+    server.registerTool(entry.name, {
+      title: entry.name.replaceAll("_", " "), description: entry.description,
+      inputSchema: entry.schema.extend({ expectedGeneration }).strict(), outputSchema: ListMutationOutput,
+      annotations: { readOnlyHint: false, destructiveHint: entry.action !== "create", idempotentHint: true, openWorldHint: true },
+    }, async (args: (z.infer<typeof CreateListInput> | z.infer<typeof RenameListInput> | z.infer<typeof DeleteListInput>) & { expectedGeneration?: number }) => {
+      try {
+        const apple = new AppleConnectionService(env, owner);
+        const generation = args.expectedGeneration ?? (await apple.status()).generation;
+        const result = await apple.mutateList(entry.action, { ...args, expectedGeneration: generation });
+        return { structuredContent: result, content: [{ type: "text" as const, text: JSON.stringify(result) }] };
+      } catch (error) { return toolError(error); }
+    });
+  }
   server.registerTool("create_reminder", {
     title: "Create an iCloud reminder",
     description: "Create one open reminder in listId from get_reminder_lists. Requires the authenticated owner and a ready Apple session. Supply a new UUID idempotencyKey for each distinct reminder and keep that same key and input when retrying an uncertain creation; the UUID determines the Apple record ID and prevents duplicate items. Supports title, notes, priority (0 none, 1 high, 5 medium, 9 low), flagged, dueDate with an explicit ISO 8601 offset, timeZone and allDay. An all-day reminder requires a date and time zone. No alarms, recurrence, attachments, subtasks or completion changes are created. WRITE_OUTCOME_UNKNOWN means Apple may have committed: inspect the supplied reminderId and reuse the same idempotencyKey, never create a second key for that attempt. Returned replayed=true means the matching existing item was read and no new write was sent.",

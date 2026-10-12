@@ -93,6 +93,10 @@ Use the IDs returned by `get_reminder_lists`. `get_reminders` accepts `includeCo
 call `get_all_open_reminders` again with that value and combine the returned records. Inspect errors
 before retrying and respect any `retryAfterSeconds`. A partial result is not the entire collection.
 
+## List management
+
+The MCP tools `get_reminder_list`, `create_reminder_list`, `rename_reminder_list`, and `delete_reminder_list` manage standard owned private lists. Creation, rename and empty-list deletion were verified through the live Apple Reminders app. Deletion requires explicitly empty membership, complete checks including completed reminders, and the current name and version tag. Review the native protocol, reconciliation rules and concurrent-membership limit in [docs/list-management.md](docs/list-management.md).
+
 ## Reminder write access
 
 Creation, editing, completion, reopening and soft deletion are available to the authenticated

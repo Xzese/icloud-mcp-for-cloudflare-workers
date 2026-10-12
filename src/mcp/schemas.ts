@@ -92,6 +92,24 @@ export function MutationOutput(action: "create" | "update" | "complete" | "reope
   return action === "create" || action === "create_subtask" ? result.extend({ idempotencyKey: z.string().uuid() }).strict() : result;
 }
 
+export const ExactListOutput = z.object({
+  generation: counter,
+  list: z.object({ id: z.string(), title: text, color: text, count: counter.nullable(),
+    isGroup: flag, deleted: flag, recordChangeTag: z.string() }).strict(),
+}).strict();
+
+export const ListMutationOutput = z.object({
+  generation: counter,
+  operation: z.enum(["create", "rename", "delete"]),
+  replayed: z.boolean(),
+  list: z.object({
+    id: z.string(), title: text, color: text, count: counter.nullable(),
+    isGroup: flag, deleted: flag, recordChangeTag: text,
+  }).strict(),
+  writesEnabled: z.literal(true),
+  idempotencyKey: z.string().uuid().optional(),
+}).strict();
+
 export const ConnectionStatusOutput = z.object({
   generation: counter,
   version: counter,
@@ -126,6 +144,7 @@ export const ConnectionStatusOutput = z.object({
     bulkCreate: z.boolean(), bulkDelete: z.boolean(), autonomousJobs: z.boolean(),
     jobExecutionMode: z.enum(["request-driven", "queue"]),
     subtasks: z.boolean(),
+    createList: z.boolean(), renameList: z.boolean(), deleteList: z.boolean(),
   }).strict(),
   mcpTools: z.array(z.string()),
   message: z.string(),

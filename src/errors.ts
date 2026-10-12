@@ -21,10 +21,14 @@ export class AppError extends Error {
 
 export class WriteOutcomeUnknownError extends AppError {
   readonly reminderId: string;
+  readonly listId?: string;
   readonly idempotencyKey?: string;
   constructor(reminderId: string, idempotencyKey?: string) {
-    super("WRITE_OUTCOME_UNKNOWN", "Apple may have saved the reminder, but this request could not confirm the result. Read the reminder before trying another change. For creation, reuse the same idempotencyKey; never generate another ID for this attempt.", 503, false);
+    super("WRITE_OUTCOME_UNKNOWN", reminderId.startsWith("List/")
+      ? "Apple may have saved the list change, but this request could not confirm the result. Use get_reminder_list with this exact listId before trying another change. For creation, retain the same idempotencyKey; never generate another ID for this attempt."
+      : "Apple may have saved the reminder, but this request could not confirm the result. Read the reminder before trying another change. For creation, reuse the same idempotencyKey; never generate another ID for this attempt.", 503, false);
     this.reminderId = reminderId;
+    if (reminderId.startsWith("List/")) this.listId = reminderId;
     this.idempotencyKey = idempotencyKey;
   }
 }
@@ -33,7 +37,7 @@ export function publicError(error: unknown, requestId: string) {
   const e = error instanceof AppError ? error : new AppError(
     "UPSTREAM_UNAVAILABLE", "This operation could not be completed. Try the connection again.", 503, true,
   );
-  return { code: e.code, message: e.message, retryable: e.retryable, requestId, ...(e instanceof WriteOutcomeUnknownError ? { reminderId: e.reminderId, ...(e.idempotencyKey ? { idempotencyKey: e.idempotencyKey } : {}) } : {}) };
+  return { code: e.code, message: e.message, retryable: e.retryable, requestId, ...(e instanceof WriteOutcomeUnknownError ? { ...(e.listId ? { listId: e.listId } : { reminderId: e.reminderId }), ...(e.idempotencyKey ? { idempotencyKey: e.idempotencyKey } : {}) } : {}) };
 }
 
 export function requireValue(condition: unknown, message: string): asserts condition {
