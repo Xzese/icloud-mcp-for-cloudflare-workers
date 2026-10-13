@@ -11,6 +11,7 @@ import { encodeDocument } from "../../src/reminders/crdt.ts";
 import { randomBytes } from "node:crypto";
 import { verifyReminderWrites } from "./reminder-writes.mjs";
 import { verifySessionRetention } from "./session-retention.mjs";
+import { verifyDrive } from "./drive.mjs";
 import { JOB_TOOLS } from "../../src/jobs/schemas.ts";
 const SEARCH_REMINDER_KEYS = ["List", "ParentReminder", "TitleDocument", "NotesDocument", "Completed", "CompletionDate", "DueDate", "StartDate", "Priority", "Flagged", "AllDay", "Deleted", "TimeZone", "AlarmIDs", "AttachmentIDs", "HashtagIDs", "RecurrenceRuleIDs"];
 const root = resolve(new URL("../..", import.meta.url).pathname);
@@ -538,6 +539,8 @@ try {
   console.log(JSON.stringify({ type: "synthetic-performance", liveAppleData: false, measurements: [knownMetric, directListsMetric, directOpenInitialMetric, directOpenResumeMetric].map(({ name, elapsedMs, pathCounts }) => ({ name, elapsedMs, pathCounts })) }));
   const writeAcceptance = await verifyReminderWrites(options);
   const retentionAcceptance = await verifySessionRetention(options);
+  const driveAcceptance = await verifyDrive(options);
+  console.log(JSON.stringify({ result: "passed", checks: driveAcceptance.checks, liveAppleValidated: false }));
   console.log(JSON.stringify({ result: "passed", checks: retentionAcceptance.checks, liveAppleValidated: false }));
   console.log(JSON.stringify({ result: "passed", runtime: "local-workerd", productionBundle: true, checks: ["owner-denial", "origin-CSRF", "removed-feasibility-surfaces", "stateless-MCP", "nonce-CSP", "gated-auth-no-state", "unverified-Apple-success-rejected", "dedicated-credential-document", "encrypted-session-cold-start", "legacy-envelope-restores-without-disconnect", "removed-history-actions", "saved-lists-display-only-snapshot", "direct-current-lists-pagination", "known-list-exact-authorization", "known-list-read-without-history", "direct-all-open-retry-and-frozen-resume", "all-open-continuation-replay-rejected", "restored-cookie-compound-read", "single-and-batch-list-authorization", "two-list-concurrent-read", "completion-removes-open-reminder", "failed-batch-drains-lease", "batch-auth-invalidation", "disconnect-rejects-read", ...writeAcceptance.checks], liveAppleValidated: false }));
 } finally {

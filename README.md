@@ -1,4 +1,4 @@
-# iCloud Reminders MCP Server for Cloudflare Workers
+# iCloud for Cloudflare Worker
 
 <p align="center">
   <a href="https://github.com/Xzese/icloud-reminders-mcp-for-cloudflare-workers/stargazers"><img src="https://img.shields.io/github/stars/Xzese/icloud-reminders-mcp-for-cloudflare-workers?style=flat-square" alt="Stars"></a>
@@ -9,17 +9,19 @@
   <a href="https://github.com/Xzese/icloud-reminders-mcp-for-cloudflare-workers/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue?style=flat-square" alt="MIT License"></a>
 </p>
 
-A remote MCP server for your iCloud Reminders, with a private connection dashboard. Reads are
-enabled after connecting, along with creation, editing, completion, reopening and deletion.
+A remote MCP server and private dashboard for iCloud, with configurable **Reminders** and
+**iCloud Drive** access. The owner chooses each service and its permissions. Reminders keeps
+its existing read and write defaults. **Drive is off by default** and requires separate Apple service approval.
 Deploy it through **ChatGPT Sites** or to your own **Cloudflare Worker** protected by Cloudflare
 Access and Managed OAuth. No containers, Python runtime, KV namespace or Durable Objects are required.
 
 The browser performs the Apple password proof exchange. The Worker stores Apple session cookies,
-tokens, list summaries and reminder pagination state encrypted with AES-256-GCM in D1. Reminder contents
-are fetched from Apple when requested and are not cached in D1.
+tokens, list summaries, pagination state and private Drive operation receipts encrypted with
+AES-256-GCM in D1. Reminder contents and Drive file bodies are fetched on demand and are not
+cached in D1. Service preferences are ordinary owner-scoped configuration.
 
 **Experimental, unofficial integration.** This project uses Apple's undocumented web protocols,
-not Sign in with Apple or an official Reminders API. The login page is served by your deployment;
+not Sign in with Apple or an official public iCloud API. The login page is served by your deployment;
 you must trust its browser code with your password input. Cryptographic reference tests are not an
 independent security audit. Reminder reads and mutations use unofficial Apple protocols;
 review the supported fields and limitations before using them.
@@ -27,6 +29,7 @@ review the supported fields and limitations before using them.
 ## Table of contents
 
 - [Public source, private deployments](#public-source-private-deployments)
+- [iCloud service options](#icloud-service-options)
 - [Tools](#tools)
 - [Reminder write access](#reminder-write-access)
 - [Resources and configuration](#resources-and-configuration)
@@ -44,7 +47,7 @@ review the supported fields and limitations before using them.
 ## Public source, private deployments
 
 This repository publishes source under the MIT License. It does not provide a shared public
-Reminders service. Each operator creates their own private deployment, database, access policy
+iCloud service. Each operator creates their own private deployment, database, access policy
 and encryption keys. One deployment is restricted to one explicitly bound owner and one Apple
 session. Do not configure it as a multi-tenant service or share the owner's MCP connection.
 
@@ -57,16 +60,85 @@ verification codes, session exports, real CloudKit records or signed asset URLs.
 `npm run public-config:check` also rejects private/generated files accidentally tracked by Git.
 Review Git history before publishing a repository that previously contained private metadata.
 
+## iCloud service options
+
+Only **Reminders** and **iCloud Drive** are implemented and configurable today.
+
+| Implemented service | Available operations | Dashboard options |
+| --- | --- | --- |
+| Reminders | Read/search lists and reminders; create, edit, complete, reopen and delete supported reminders; supported list and organisation operations | Enable/disable; read; write |
+| iCloud Drive | Browse/search folders and files; read/preview/download; upload new files; create folders; rename and move ordinary owned items | Enable/disable; browse; contents; upload; organise |
+
+### Potential improvements
+
+The upstream iCloud web-protocol client contains references for these additional services.
+They are **potential improvements only**, not confirmed work in progress, scheduled features,
+or supported options in this project. They have no dashboard switches or MCP tools here.
+
+| Potential service | Capabilities worth investigating | Upstream evidence |
+| --- | --- | --- |
+| Calendar | Read calendars, date-range events and event details | [Calendar client](https://github.com/timlaing/pyicloud/blob/e2e44ab875d47dab4475096021da60030f26c35e/pyicloud/services/calendar.py) |
+| Contacts | Browse contacts stored in iCloud | [Contacts client](https://github.com/timlaing/pyicloud/blob/e2e44ab875d47dab4475096021da60030f26c35e/pyicloud/services/contacts.py) |
+| Photos | Browse albums/assets and download photo versions | [Photos client](https://github.com/timlaing/pyicloud/blob/e2e44ab875d47dab4475096021da60030f26c35e/pyicloud/services/photos.py) |
+| Notes | Read folders/notes and export notes or download attachments; upstream reference is read-oriented | [Notes client](https://github.com/timlaing/pyicloud/blob/fb56ed6652f2d99ca8dc3cf515f7db0b319fcf1d/pyicloud/services/notes/service.py) |
+| Find My | Read device inventory, status and location, with explicit controls for location access | [Find My client](https://github.com/timlaing/pyicloud/blob/fb56ed6652f2d99ca8dc3cf515f7db0b319fcf1d/pyicloud/services/findmyiphone.py) |
+| Hide My Email | List, create and manage aliases where the account is eligible | [Alias client](https://github.com/timlaing/pyicloud/blob/fb56ed6652f2d99ca8dc3cf515f7db0b319fcf1d/pyicloud/services/hidemyemail.py) |
+
+These clients can share account authentication, but each service needs its own endpoint policy,
+data model, permissions, consent handling and live validation. Notes and Hide My Email were
+checked at the newer upstream revision linked above, not this project's older provenance pin.
+A Drive folder belonging to Notes or Mail does not establish access to notes or mailboxes.
+
+### Configure the implemented services
+
+Open **Services** on the dashboard to save your agent's permissions. Each service has an
+on/off switch; Reminders has read/write controls, and Drive has **browse**, **contents**
+(read/download), **upload**, and **organise** (create folders, rename, move) controls.
+Drive browse is required for the other Drive operations. Upload does not grant file-content
+reading. These choices are enforced for dashboard, HTTP and MCP calls, including cached tools.
+Saved preferences and actual Apple readiness are shown separately.
+
+To start: apply migrations `0002_service_settings.sql` and `0003_drive_operations.sql`, save
+Drive permissions, connect Apple, select **Approve Drive access**, approve on your trusted
+device and check approval. For Drive-only use, disable Reminders before connecting. Changing
+settings or refreshing status never initiates Apple consent. Refresh your MCP client's tool
+list after changing permissions.
+
+Drive supports browsing folders, finding names within a selected folder tree, reading files,
+private downloads, uploading new files, creating folders, and renaming/moving ordinary owned
+files and folders. It excludes deletion, content replacement, sharing, packages and app-library
+operations. Search is bounded and explicitly reports incomplete results.
+
+- Inline MCP full reads/uploads: **64 KiB** of decoded bytes, UTF-8 or base64.
+- Text previews: **8 KiB** of leading UTF-8 bytes, with explicit truncation, for files up to 64 MiB.
+- Dashboard/HTTP uploads and private downloads: **64 MiB** (67,108,864 bytes), with a five-minute transfer timeout.
+- Downloads require owner authentication. A returned URL is not a public share or an attachment
+  automatically available to every MCP client; use the dashboard if the client cannot fetch it.
+- Retain each write's UUID `operationId`. After a timeout or `WRITE_OUTCOME_UNKNOWN`, inspect
+  the same operation before trying again. Never automatically use a fresh key.
+
+**Drive is experimental.** Live checks on one retained Apple account verified browsing,
+name search, reads, uploads/downloads, folder creation, rename and move on 13 October 2026.
+Read [the Drive guide](docs/icloud-drive.md) for measured live transfer boundaries, every tool,
+exact HTTP transfer steps, consent troubleshooting, limits, migration and
+rollback instructions. The [extension research/design](docs/icloud-services-plan.md) records
+upstream protocol evidence and the intended service architecture.
+
 ## Tools
 
-Read the [MCP and API reference](docs/mcp-api.md) for **every tool's inputs, results,
+Read the [MCP and API reference](docs/mcp-api.md) and [Drive guide](docs/icloud-drive.md) for **tool inputs, results,
 behaviour and rationale**, including how recurring completion, reopening, deletion and
 subtask actions follow the observed Apple Reminders lifecycle. The reference distinguishes
 native behaviour from connector safeguards and links the supporting live evidence and limits.
 
 | Tool | Behaviour |
 | --- | --- |
-| `connection_status` | Report connection state, session generation and tool availability; does not contact Apple. |
+| `connection_status` | Report account/service readiness, saved permissions, session generation and tool availability; does not contact Apple. |
+| `list_icloud_drive_items`, `get_icloud_drive_item`, `search_icloud_drive` | Browse exact metadata and search names within a selected folder tree. |
+| `read_icloud_drive_file`, `download_icloud_drive_file` | Read bounded text/base64 or prepare a private authenticated download. |
+| `upload_icloud_drive_file`, `create_icloud_drive_folder` | Add new files or folders using retained operation UUIDs. |
+| `rename_icloud_drive_item`, `move_icloud_drive_item` | Organise owned items using current etags. |
+| `get_icloud_drive_operation` | Inspect a retained operation without replaying an uncertain write. |
 | `get_reminder_lists` | Query current selectable private-zone lists directly, without historical scanning. |
 | `get_reminders` | Authorize an exact `listId` live, then fetch one current page without catalogue synchronization; open reminders by default. |
 | `get_all_open_reminders` | Discover selectable lists once per operation, then fetch open reminders with resumable per-list pages. |
@@ -226,8 +298,8 @@ includes a command that creates, edits, completes, reopens and deletes only its 
 | MCP registration | Site-hosted plugin at `/mcp` | Register `/mcp` as a custom OAuth MCP connection. |
 
 No R2 bucket, Workers KV, Durable Object, Apple developer application or OpenAI API key is
-used by this implementation. Your Cloudflare plan must support the CPU/memory needs of the login
-cryptography and your Access configuration; validate those limits in your deployment.
+used by this implementation. Your Cloudflare plan must support the CPU/memory needs of login
+cryptography, streamed file hashing and your Access configuration; validate those limits in your deployment.
 
 | Runtime setting | Purpose |
 | --- | --- |
@@ -275,6 +347,15 @@ For an explicitly approved live account investigation using the existing dashboa
 npm run build
 npm run dev:icloud
 ```
+
+The local launcher enables new 30-day sessions by default. Their deadline is fixed from
+device verification; saved-token renewal does not extend it. Set
+`APPLE_SESSION_RETENTION_WRITES=` explicitly only to test the legacy one-day writer.
+Existing one-day sessions require the owner-authorised retention migration described below.
+Both the launcher and migration accept `LOCAL_ICLOUD_STATE_DIR` to reuse an existing private
+state directory and its keys without creating a replacement login.
+`LOCAL_ICLOUD_PORT` selects a different loopback port (default `5173`); pass the same port
+to the migration command so it can check that the server is stopped.
 
 The live launcher creates a separate encrypted local session and explicitly enables the controlled
 login protocol. It listens only on IPv4 loopback, enforces a private local cookie and strips supplied
@@ -605,7 +686,9 @@ Deployment preparation produces ignored `wrangler.generated.toml`. The minimal
 The source contains `apple_session_state` and the additive encrypted job ledger. The Worker uses
 native D1 prepared statements. The Sites build derives its platform SQL package from `schema.sql`.
 Fresh databases use that definition; existing databases apply `migrations/0001_reminder_jobs.sql`
-using the [documented upgrade path](docs/reminder-jobs.md), without resetting session data.
+using the [documented upgrade path](docs/reminder-jobs.md), followed by the service settings and
+Drive migrations in the [Drive guide](docs/icloud-drive.md#database-upgrade-and-rollback), without
+resetting session data.
 
 Run the checks before contributing:
 

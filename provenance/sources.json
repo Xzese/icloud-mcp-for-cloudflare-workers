@@ -108,6 +108,14 @@
           "destinations": [
             "src/icloud/cloudkit.ts"
           ]
+        },
+        {
+          "path": "pyicloud/services/drive.py",
+          "role": "Drive metadata, consent and upload protocol reference; no Python runtime",
+          "destinations": [
+            "src/icloud/drive.ts",
+            "src/transport/drive-http.ts"
+          ]
         }
       ]
     },
@@ -117,6 +125,21 @@
       "license": "MIT",
       "copyright": "Petr Chesnokov",
       "role": "application scope and operation reference; no application service port yet"
+    },
+    {
+      "repository": "https://github.com/rclone/rclone",
+      "revision": "4f19e9cd6f442282d7fa8d5fdbd28ebb68be1131",
+      "license": "MIT",
+      "copyright": "Copyright (C) 2012 by Nick Craig-Wood",
+      "files": [
+        {
+          "path": "backend/iclouddrive/api/drive.go",
+          "role": "Drive mutation envelopes and finalization response protocol reference",
+          "destinations": [
+            "src/icloud/drive.ts"
+          ]
+        }
+      ]
     }
   ],
   "fixtureGenerator": "tests/fixtures/generate.py",

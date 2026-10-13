@@ -14,11 +14,13 @@ import { SESSION_RETENTION_MS } from "../../src/auth/apple/policy.ts";
 const apply = process.argv.length === 3 && process.argv[2] === "--apply-owner-approval";
 if (process.argv.length !== 2 && !apply) throw new Error("Use session:retention:local [--apply-owner-approval].");
 const root = resolve(new URL("../..", import.meta.url).pathname);
-const state = join(root, ".sites-runtime/local-icloud");
+const state = process.env.LOCAL_ICLOUD_STATE_DIR ? resolve(process.env.LOCAL_ICLOUD_STATE_DIR) : join(root, ".sites-runtime/local-icloud");
+const port = Number(process.env.LOCAL_ICLOUD_PORT ?? "5173");
+if (!Number.isInteger(port) || port < 1024 || port > 65535) throw new Error("LOCAL_ICLOUD_PORT must be an unprivileged TCP port.");
 // Refuse to run beside an incompatible development reader. Do not query its
 // status endpoint: an old loader could delete a retained eligible envelope.
 await new Promise((resolve, reject) => {
-  const socket = createConnection({ host: "127.0.0.1", port: 5173 });
+  const socket = createConnection({ host: "127.0.0.1", port });
   socket.once("connect", () => { socket.destroy(); reject(new Error("Stop the local Worker and drain its operations before migration.")); });
   socket.once("error", error => { socket.destroy(); if (error.code === "ECONNREFUSED") resolve(); else reject(error); });
   socket.setTimeout(3000, () => { socket.destroy(); reject(new Error("Could not establish that the old local reader is stopped.")); });
@@ -59,7 +61,7 @@ const entries = await readdir(serverRoot, { recursive: true, withFileTypes: true
 const entrypoint = join(serverRoot, "index.js");
 const modules = [{ type: "ESModule", path: entrypoint }, ...entries.filter(entry => entry.isFile() && /\.(js|mjs)$/.test(entry.name) &&
   join(entry.parentPath, entry.name) !== entrypoint).map(entry => ({ type: "ESModule", path: join(entry.parentPath, entry.name) }))];
-const origin = "http://127.0.0.1:5173";
+const origin = `http://127.0.0.1:${port}`;
 let appleRequests = 0;
 const options = {
   name: "local-reminders-app", modulesRoot: serverRoot, modules,

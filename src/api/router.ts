@@ -7,6 +7,17 @@ import { AppleConnectionService, ControlledRead, ResumeRequest } from "../auth/s
 import { appleGates, requireAppleEnabled } from "../auth/gates.ts";
 import { credentialDocument, credentialScript } from "../auth/credential-page.ts";
 import { ReminderJobService } from "../jobs/service.ts";
+import { z } from "zod";
+import { ServiceSettingsRepository } from "../persistence/service-settings.ts";
+import { ServiceSettingsSchema } from "../services/settings.ts";
+import { DriveService } from "../drive/service.ts";
+import { DriveConsent, INLINE_REQUEST_BYTES, INLINE_UPLOAD_GUIDANCE } from "../drive/schemas.ts";
+
+async function readJSON(request: Request, limit = 12_288): Promise<unknown> {
+  const bytes = await limitedBytes(new Response(request.body, { headers: request.headers }), limit);
+  try { return JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes)); }
+  catch { throw new AppError("VALIDATION_ERROR", "Provide a valid JSON request.", 400); }
+}
 
 const json = (data: unknown, status = 200) => Response.json(data, { status, headers: { "cache-control": "private, no-store", "x-content-type-options": "nosniff" } });
 export async function applicationRoute(request: Request, env: RuntimeEnv, credentialJS?: string): Promise<Response | null> {
@@ -34,6 +45,9 @@ export async function applicationRoute(request: Request, env: RuntimeEnv, creden
       return await handleMCP(request, env, owner);
     }
     if (request.method === "GET") {
+      if (path === "/api/settings") return json(await new ServiceSettingsRepository(env, owner).load());
+      const download = /^\/api\/drive\/downloads\/([a-f0-9-]{36})$/i.exec(path);
+      if (download) return await new DriveService(env, owner).downloadContent(z.string().uuid().parse(download[1]), request.signal);
       if (path === "/api/auth/config") return json(appleGates(env));
       if (path === "/api/connection") return json(await new AppleConnectionService(env, owner).status());
       const job = /^\/api\/reminder-jobs\/([a-f0-9-]{36})$/i.exec(path);
@@ -44,7 +58,39 @@ export async function applicationRoute(request: Request, env: RuntimeEnv, creden
       }
     }
     if (request.method === "POST") {
+      const uploadContent = /^\/api\/drive\/uploads\/([a-f0-9-]{36})\/content$/i.exec(path);
+      if (uploadContent) {
+        // Binary transfers retain the owner/origin checks without the JSON-only
+        // content type restriction used by ordinary dashboard actions.
+        if (!env.APP_ORIGIN || request.headers.get("origin") !== env.APP_ORIGIN || new URL(request.url).origin !== env.APP_ORIGIN) throw new AppError("FORBIDDEN", "Use the private application origin for uploads.", 403);
+        if (request.headers.get("content-type") !== "application/octet-stream") throw new AppError("VALIDATION_ERROR", "Upload an application/octet-stream body.", 400);
+        const body = request.body ?? new ReadableStream<Uint8Array>({ start(controller) { controller.close(); } });
+        return json(await new DriveService(env, owner).uploadContent(z.string().uuid().parse(uploadContent[1]), body, request.signal));
+      }
       requireSameOrigin(request, env);
+      if (path === "/api/settings") {
+        const value = z.object({ expectedRevision: z.number().int().nonnegative().safe(), settings: ServiceSettingsSchema }).strict().safeParse(await readJSON(request));
+        if (!value.success) throw new AppError("VALIDATION_ERROR", "Provide valid service preferences and their current revision.", 400);
+        return json(await new ServiceSettingsRepository(env, owner).save(value.data));
+      }
+      if (path === "/api/drive/approve" || path === "/api/reminders/approve") {
+        const value = DriveConsent.safeParse(await readJSON(request));
+        if (!value.success) throw new AppError("VALIDATION_ERROR", "Refresh the Apple connection before approving Drive.", 400);
+        const connection = new AppleConnectionService(env, owner);
+        return json(await (path === "/api/drive/approve" ? connection.approveDrive(value.data.expectedGeneration, value.data.restartApproval) : connection.approveReminders(value.data.expectedGeneration, value.data.restartApproval)));
+      }
+      const driveActions = { list: "list", lookup: "get", search: "search", read: "read", download: "download", upload: "upload", "prepare-upload": "prepareUpload", "create-folder": "createFolder", rename: "rename", move: "move", operation: "operation" } as const;
+      const driveAction = path.startsWith("/api/drive/") ? path.slice("/api/drive/".length) : "";
+      if (Object.hasOwn(driveActions, driveAction)) {
+        const method = driveActions[driveAction as keyof typeof driveActions];
+        let input;
+        try { input = await readJSON(request, method === "upload" ? INLINE_REQUEST_BYTES : 12_288); }
+        catch (error) {
+          if (method === "upload" && error instanceof AppError && error.code === "PROTOCOL_CHANGED") throw new AppError("VALIDATION_ERROR", INLINE_UPLOAD_GUIDANCE, 413);
+          throw error;
+        }
+        return json(await new DriveService(env, owner)[method](input));
+      }
       const jobRoute = /^\/api\/reminder-jobs(?:\/([a-f0-9-]{36})\/(append|preview|start|cancel|resume|continue))?$/i.exec(path);
       if (jobRoute || path === "/api/reminder-updates/prepare" || path === "/api/reminder-evidence/capture" || path === "/api/reminder-evidence/atomic-protection") {
         const bytes = await limitedBytes(new Response(request.body, { headers: request.headers }), 65_536);

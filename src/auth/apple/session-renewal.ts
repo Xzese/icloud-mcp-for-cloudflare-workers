@@ -2,6 +2,7 @@ import { z } from "zod";
 import { AppError } from "../../errors.ts";
 import type { AppleSession, AppleSessionRepository } from "../../persistence/apple-sessions.ts";
 import type { RuntimeEnv } from "../../platform/sites.ts";
+import { refreshedServices, sessionServices } from "./services.ts";
 import { freshPcsCheckpoint } from "./pcs.ts";
 import { requireCurrentLogin } from "./policy.ts";
 import { AppleAuthHTTP, AppleAuthenticationError, AppleRetryError, SETUP_ROOT } from "./http.ts";
@@ -94,8 +95,12 @@ export class AppleSessionRenewal {
         }
         const now = Date.now();
         requireCurrentLogin(saved.session.login, now);
+        const common = { dsid: connection.dsid, clientId: connection.clientId, clientBuildNumber: connection.clientBuildNumber, clientMasteringNumber: connection.clientMasteringNumber, cloudKitURL: connection.cloudKitURL };
+        const services = refreshedServices(saved.session, saved.state, connection, saved.action);
+        // Missing discovery must remove the old endpoint, never preserve a stale URL.
+        const refreshedConnection = { ...saved.session.connection, ...common, cloudKitURL: common.cloudKitURL };
         await this.repository.commitResume(fence, {
-          ...saved.session, auth: http.snapshot(), connection: { ...saved.session.connection, ...connection },
+          ...saved.session, auth: http.snapshot(), connection: refreshedConnection, services,
           renewal: { ...metadata, lastValidatedAt: now, lastRenewedAt: exchanged ? now : metadata.lastRenewedAt,
             failures: 0, nextRetryAt: null, requiredAction: null, lastErrorCode: null },
         }, saved.state, saved.action ?? undefined);
@@ -125,14 +130,25 @@ export class AppleSessionRenewal {
   }
 
   async requireDataApproval(expectedGeneration: number, budget: AppleRequestBudget) {
+    return this.requireServiceApproval(expectedGeneration, budget, "reminders");
+  }
+  // Mark loss locally; approval remains an explicit owner action and never runs
+  // as part of a read retry. The other service's state and errors are preserved.
+  async requireServiceApproval(expectedGeneration: number, budget: AppleRequestBudget, service: "reminders" | "drive") {
     const saved = await this.ensure(expectedGeneration, budget);
     const fence = await this.repository.claimRenewal(expectedGeneration, saved.fence.version);
+    const checkpoint = freshPcsCheckpoint();
+    const services = sessionServices(saved.session, saved.state, saved.action);
     try {
       await this.repository.commitResume(fence, {
-        ...saved.session, pcs: freshPcsCheckpoint(),
-        renewal: { ...(saved.session.renewal ?? renewalCheckpoint()), requiredAction: "approve-reminders", lastErrorCode: null },
-      }, "DEVICE_APPROVAL_PENDING", "approve-device-consent");
+        ...saved.session,
+        ...(service === "reminders" ? { pcs: checkpoint,
+          renewal: { ...(saved.session.renewal ?? renewalCheckpoint()), requiredAction: "approve-reminders" as const, lastErrorCode: null } } : {}),
+        services: { ...services, [service]: { ...services[service], state: "DEVICE_APPROVAL_PENDING", pcs: checkpoint,
+          action: "approve-device-consent", lastErrorCode: "DEVICE_APPROVAL_PENDING" } },
+      }, service === "reminders" ? "DEVICE_APPROVAL_PENDING" : saved.state,
+        service === "reminders" ? "approve-device-consent" : saved.action ?? undefined);
     } finally { await this.repository.releaseResume(fence); }
-    throw new AppError("DEVICE_APPROVAL_PENDING", "The Apple account connection is preserved. Approve Reminders web access on your device, then check approval.", 409);
+    throw new AppError("DEVICE_APPROVAL_PENDING", `The Apple account connection is preserved. Approve ${service} web access on your device, then check approval.`, 409);
   }
 }

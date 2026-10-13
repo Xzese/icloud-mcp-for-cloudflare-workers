@@ -1,6 +1,6 @@
 # Provenance and attribution
 
-Protocol implementations in `src/crypto/apple-kdf.ts`, `srp.ts`, `spake2.ts`, `src/transport/apple-push.ts`, `src/auth/apple/`, `src/transport/apple-websocket.ts`, `src/icloud/cloudkit.ts`, and `src/reminders/crdt.ts` are TypeScript translations or narrow reimplementations informed by the exact pyicloud revision in `sources.json`. Preserve its MIT notice, copyright PyiCloud Authors, together with the application reference's MIT notice, copyright Petr Chesnokov. The reference application is chesnokpeter/icloud-linux; no unrelated iCloud services were ported.
+Protocol implementations in `src/crypto/apple-kdf.ts`, `srp.ts`, `spake2.ts`, `src/transport/apple-push.ts`, `src/auth/apple/`, `src/transport/apple-websocket.ts`, `src/icloud/cloudkit.ts`, and `src/reminders/crdt.ts` are TypeScript translations or narrow reimplementations informed by the exact pyicloud revision in `sources.json`. Preserve its MIT notice, copyright PyiCloud Authors, together with the application reference's MIT notice, copyright Petr Chesnokov. The reference application is chesnokpeter/icloud-linux; the Drive client also uses its Drive protocol as a reference.
 
 SRP formulas and reference transcripts also use Python `srp==1.0.22`; its MIT notice is preserved. Cryptography and protobuf are build-time fixture dependencies only; their distribution notices are retained. No Python code or subprocess is part of the deployed runtime. The fixture generator executes selected pinned Python encoding functions only at build time with invented inputs.
 
@@ -11,3 +11,9 @@ The pinned protobuf schemas identify Apple main.js as their source. Their proven
 Fixture agreement is not independent proof of Apple protocol correctness. A cryptographic review and live hosted acceptance remain required. No source license notice grants authorization to access an Apple account or live data.
 
 To refresh the package inventory and notice asset after a locked install, run `node scripts/release/generate-notices.mjs` and rebuild. Review unknown package license declarations before approving a production release.
+
+The Drive metadata client and bounded transfer transport in `src/icloud/drive.ts` and
+`src/transport/drive-http.ts` also consult the pinned rclone Drive API implementation
+listed in `sources.json` (MIT, copyright Nick Craig-Wood). Its notice is preserved in
+`licenses/rclone-MIT.txt` and the shipped third-party notice asset. Synthetic Drive tests
+use invented account IDs, content, names and tokens, not Apple account transcripts.

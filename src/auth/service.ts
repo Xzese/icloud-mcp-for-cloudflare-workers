@@ -1,4 +1,8 @@
 import { z } from "zod";
+import { ServiceSettingsRepository } from "../persistence/service-settings.ts";
+import { requireServicePermission, type ServicePermission } from "../services/settings.ts";
+import { enabledToolNames } from "../services/tool-registry.ts";
+import { effectiveServiceStatus, requireDriveConnection, requireRemindersConnection, requireServiceReady, sessionServices, type AppleServices } from "./apple/services.ts";
 import { CreateListInput, RenameListInput, DeleteListInput, buildCreateList, buildRenameList, buildDeleteList, buildUpdateListAppearance, requireMutableList, type ListOperation, type ListWrite } from "../reminders/list-writes.ts";
 import { canonicalNativeJSONField, readListAppearance, UpdateListAppearanceRequest } from "../reminders/list-appearance.ts";
 import { AppError, WriteOutcomeUnknownError } from "../errors.ts";
@@ -9,7 +13,7 @@ import { AppleSessionRepository, mergeSavedLists, type AppleSession, type AllOpe
 import { CloudKitRateLimitedError, CloudKitRemindersClient, intrinsicParentIdentity, isKnownEmptyDeletionCollection, stableDeletionFields, normalizeList, normalizeReminder, referenceField, type CloudKitPage, type CloudKitRecord, type CloudKitLookupResult } from "../icloud/cloudkit.ts";
 import { CreateReminderInput, UpdateReminderInput, ReminderTargetInput, assertOwnedReminder, buildCreateReminder, buildReminderFieldUpdate, buildLifecycleReminder, matchesCreatedReminder, type CloudKitWriteRecord } from "../reminders/writes.ts";
 import { decodeDocument } from "../reminders/crdt.ts";
-import { AppleAuthHTTP } from "./apple/http.ts";
+import { AppleAuthHTTP, AppleRetryError } from "./apple/http.ts";
 import { advancePcs, freshPcsCheckpoint } from "./apple/pcs.ts";
 import { AppleSessionRenewal, appleRequestBudget, appleSuccess, renewalCheckpoint, type AppleRequestBudget } from "./apple/session-renewal.ts";
 import { appleDisabledMessage, appleGates, requireAppleEnabled } from "./gates.ts";
@@ -18,7 +22,6 @@ import { attachEarlyReminderWitness, loadSchedulingGraph, type SchedulingGraph }
 import { earlyReminderPayload } from "../reminders/early-reminder.ts";
 import { planReminderUpdate } from "../reminders/mutation-plan.ts";
 import { PrepareUpdateInput, PreparedUpdateInput, createPreparation, checkPreparation, preparationContext } from "../reminders/preparation.ts";
-import { JOB_TOOLS } from "../jobs/schemas.ts";
 import { EvidenceInput, AtomicProtectionInput, captureEvidenceGraph, sanitizeEvidence, verifyAtomicProtection } from "../reminders/evidence.ts";
 import { verifySchedulingWrite, type SchedulingWrite } from "../reminders/scheduling-plan.ts";
 import { CreateSubtaskInput, HAS_SUBTASKS_MESSAGE, SetReminderParentInput, buildCreateSubtask, buildSetReminderParent, inspectListChildren, requireNoChildren, subtaskParents } from "../reminders/subtasks.ts";
@@ -266,9 +269,13 @@ export class AppleConnectionService {
   async status() {
     const gates = appleGates(this.env);
     const session = await new AppleSessionRepository(this.env, this.owner).status();
-    const readsAvailable = gates.enabled && session.transportReady && !["apple-sign-in", "verify-device", "review-terms"].includes(session.requiredAction ?? "") && !(session.nextRetryAt && session.nextRetryAt > Date.now());
+    const preferences = await new ServiceSettingsRepository(this.env, this.owner).load();
+    const accountAvailable = gates.enabled && session.accountAuthenticated && !["apple-sign-in", "verify-device", "review-terms"].includes(session.requiredAction ?? "") && !(session.nextRetryAt && session.nextRetryAt > Date.now());
+    const serviceStatus = effectiveServiceStatus(session.services ? { services: session.services } as AppleSession : null,
+      session.accountAuthenticated ? session.state as "READY" | "DEVICE_APPROVAL_PENDING" : null, preferences.settings, accountAvailable, session.action);
+    const readsAvailable = serviceStatus.reminders.read;
     const connection = omitField(session, "liveReadValidated");
-    const writesAvailable = readsAvailable;
+    const writesAvailable = serviceStatus.reminders.write;
     const jobSchema = await this.env.DB?.withSession("first-primary").prepare("SELECT COUNT(*) AS count FROM sqlite_master WHERE type = 'table' AND name IN ('reminder_jobs','reminder_job_items','reminder_job_receipts','reminder_job_chunks','reminder_job_accounts')").first<{ count: number }>();
     const jobsAvailable = jobSchema?.count === 5;
     const actionMessage = session.requiredAction === "local-retention-expired" ? "The fixed local retention window expired. Sign in and verify your device again."
@@ -276,21 +283,71 @@ export class AppleConnectionService {
       : session.requiredAction === "review-terms" ? "Review Apple's updated terms in the official iCloud interface."
       : session.requiredAction === "retry" && session.nextRetryAt && session.nextRetryAt > Date.now() ? "Apple or the network is temporarily unavailable. The saved connection is preserved; wait until the retry time."
       : null;
-    return { ...connection, listDiscovery: { strategy: "direct", liveValidated: false, experimental: true }, gates,
-      connected: gates.enabled && session.transportReady, writeEnabled: writesAvailable, phase: writesAvailable ? "read-write" : "read-only",
+    return { ...connection, services: serviceStatus, serviceSettings: preferences, accountConnected: accountAvailable, listDiscovery: { strategy: "direct", liveValidated: false, experimental: true }, gates,
+      connected: accountAvailable, writeEnabled: writesAvailable, phase: writesAvailable ? "read-write" : "read-only",
       capabilities: { liveRead: readsAvailable, controlledRead: readsAvailable, listReminders: readsAvailable, allOpenReminders: readsAvailable, search: readsAvailable && session.state === "READY", create: writesAvailable, update: writesAvailable, complete: writesAvailable, reopen: writesAvailable, delete: writesAvailable,
-        prepareUpdate: readsAvailable, linkedScheduling: writesAvailable, reminderJobs: jobsAvailable, bulkCreate: writesAvailable && jobsAvailable, bulkDelete: writesAvailable && jobsAvailable,
+        prepareUpdate: readsAvailable, linkedScheduling: writesAvailable, reminderJobs: jobsAvailable && readsAvailable, bulkCreate: writesAvailable && jobsAvailable, bulkDelete: writesAvailable && jobsAvailable,
         autonomousJobs: false as const, jobExecutionMode: "request-driven" as const,
         subtasks: writesAvailable, urls: writesAvailable, tags: writesAvailable, moveCopy: writesAvailable, createList: writesAvailable, renameList: writesAvailable, deleteList: writesAvailable,
         listAppearanceRead: readsAvailable, listAppearanceUpdate: writesAvailable, shoppingCategoriesRead: readsAvailable, shoppingCategoriesUpdate: writesAvailable },
-      mcpTools: ["connection_status", "get_reminder_lists", "get_reminders", "search_reminders", "get_reminder", "get_reminder_organization", "set_reminder_url", "set_reminder_tags", "move_reminder", "copy_reminder", "get_all_open_reminders", "create_reminder", "create_subtask", "set_reminder_parent", "get_reminder_list", "get_reminder_list_appearance", "update_reminder_list_appearance", "get_shopping_categories", "set_reminder_category", "create_reminder_list", "rename_reminder_list", "delete_reminder_list", "update_reminder", "complete_reminder", "reopen_reminder", "delete_reminder", "prepare_reminder_update", ...JOB_TOOLS],
-      message: !gates.enabled ? appleDisabledMessage(gates) : actionMessage ?? (session.state === "READY"
-        ? "You can read, create, edit, complete, reopen and delete reminders. Use current IDs and version tags."
-        : session.state === "DEVICE_APPROVAL_PENDING"
-          ? session.action === "wait-for-reminders-keys" ? "Apple accepted device approval. Check again shortly while Apple makes the Reminders keys available." : "Approve Apple's web-access prompt on your device, then check approval again."
-          : "Connect your Apple account through the private Site's secure connection form.") };
+      mcpTools: enabledToolNames(preferences.settings),
+      message: !gates.enabled ? appleDisabledMessage(gates) : actionMessage ?? (!session.accountAuthenticated
+        ? "Connect your Apple account through the private Site's secure connection form."
+        : [preferences.settings.reminders.enabled ? `Reminders: ${serviceStatus.reminders.ready ? "approved" : "Apple approval or service discovery required"}.` : "Reminders is disabled.",
+          preferences.settings.drive.enabled ? `Drive: ${serviceStatus.drive.ready ? "approved" : "use Approve Drive to check Apple access"}.` : "Drive is disabled."].join(" ")) };
   }
   async disconnect() { return await new AppleSessionRepository(this.env, this.owner).disconnect(); }
+  private async requirePermission(permission: ServicePermission) {
+    const snapshot = await new ServiceSettingsRepository(this.env, this.owner).load();
+    requireServicePermission(snapshot.settings, permission);
+    return snapshot;
+  }
+  private async assertRemindersWrite(repository: AppleSessionRepository, fence: ResumeFence) {
+    await repository.assertWriteLease(fence);
+    await this.requirePermission("reminders.write");
+  }
+  // Local inspection never renews or requests PCS.
+  async loadDriveState(expectedGeneration?: number) {
+    const saved = await new AppleSessionRepository(this.env, this.owner).load();
+    if (expectedGeneration !== undefined && saved.fence.generation !== expectedGeneration) throw new AppError("CONFLICT", "The Apple connection changed.", 409);
+    return { ...saved, drive: sessionServices(saved.session, saved.state, saved.action).drive };
+  }
+  // Explicit owner action; enabled intent and status polling never call this.
+  async approveDrive(expectedGeneration: number, restartApproval = false) {
+    requireAppleEnabled(this.env);
+    const preferences = await new ServiceSettingsRepository(this.env, this.owner).load();
+    if (!preferences.settings.drive.enabled) throw new AppError("FORBIDDEN", "Enable Drive in Services before approving Apple access.", 403);
+    const repository = new AppleSessionRepository(this.env, this.owner);
+    const initial = await repository.load();
+    const saved = await new AppleSessionRenewal(this.env, repository).ensure(expectedGeneration, appleRequestBudget(), !initial.session.services?.drive.connection);
+    requireDriveConnection(saved.session);
+    const services = sessionServices(saved.session, saved.state, saved.action);
+    if (services.drive.state === "READY" && !restartApproval) return this.status();
+    if (services.drive.pcs && Date.now() < services.drive.pcs.nextAttemptAt) throw new AppError("RATE_LIMITED", "Wait until the displayed retry time before checking Drive approval.", 429, true);
+    if (services.drive.pcs && services.drive.pcs.expiresAt <= Date.now() && !restartApproval) throw new AppError("RESTART_REQUIRED", "The Drive approval attempt expired. Start a new explicit approval attempt.", 409);
+    const checkpoint = restartApproval || !services.drive.pcs ? freshPcsCheckpoint() : services.drive.pcs;
+    const fence = await repository.claimRenewal(expectedGeneration, saved.fence.version);
+    const http = AppleAuthHTTP.restore(saved.session.auth);
+    try {
+      const current = await new ServiceSettingsRepository(this.env, this.owner).load();
+      if (!current.settings.drive.enabled) throw new AppError("FORBIDDEN", "Drive was disabled before approval.", 403);
+      const result = await advancePcs(http, saved.session.connection.dsid, checkpoint, Date.now(), "drive", async () => {
+        if (!(await new ServiceSettingsRepository(this.env, this.owner).load()).settings.drive.enabled) throw new AppError("FORBIDDEN", "Drive was disabled before Apple approval.", 403);
+        await repository.assertAccountLease(fence);
+      });
+      await repository.commitResume(fence, appleSuccess({ ...saved.session, auth: http.snapshot(), services: {
+        ...services, drive: { connection: services.drive.connection, state: result.state, pcs: result.checkpoint,
+          ...(result.state === "DEVICE_APPROVAL_PENDING" ? { action: result.action } : {}) } } }), saved.state, saved.action ?? undefined);
+    } catch (error) {
+      const parsed = ["DEVICE_APPROVAL_PENDING", "AUTH_EXPIRED", "RATE_LIMITED", "UPSTREAM_UNAVAILABLE", "PROTOCOL_CHANGED", "FORBIDDEN"].includes(error instanceof AppError ? error.code : "");
+      if (parsed) await repository.commitResume(fence, { ...saved.session, auth: { ...saved.session.auth, cookies: http.snapshot().cookies },
+        services: { ...services, drive: { ...services.drive, state: "ERROR", action: undefined,
+          pcs: { ...checkpoint, nextAttemptAt: Math.max(checkpoint.nextAttemptAt, Date.now() + (error instanceof AppleRetryError ? error.retryAfterMs : 5000)) },
+          lastErrorCode: (error as AppError).code as AppleServices["drive"]["lastErrorCode"] } } }, saved.state, saved.action ?? undefined);
+      throw error;
+    } finally { await repository.releaseResume(fence); }
+    return this.status();
+  }
   private requireLocalEvidence() {
     if (this.env.LOCAL_REMINDER_EVIDENCE_ENABLED !== "synthetic-v1" || !["http://127.0.0.1:5173", "http://localhost:5173"].includes(this.env.APP_ORIGIN ?? "")) {
       throw new AppError("FORBIDDEN", "Protocol evidence capture requires the explicitly enabled loopback-only synthetic test runtime.", 403);
@@ -380,7 +437,7 @@ export class AppleConnectionService {
     if (!parsed.success) throw new AppError("VALIDATION_ERROR", "Confirm synthetic version-guard writes with exact case, list, target, dependency type and generation.", 400);
     const input = parsed.data;
     return this.operation(input.expectedGeneration, "mutation-preparation", async (http, saved, repository, fence, stage) => {
-      const client = new CloudKitRemindersClient(http.http, saved.session.connection);
+      const client = new CloudKitRemindersClient(http.http, requireRemindersConnection(saved.session));
       await this.authorizeLists(client, [input.listId]);
       const current = writeLookupRecord(await client.lookup([input.reminderId]), input.reminderId, false)!;
       const owner = client.remindersZoneOwner!;
@@ -392,7 +449,7 @@ export class AppleConnectionService {
         owner, input.listId, input.caseId, lookup);
       const result = await verifyAtomicProtection(graph, owner, input.dependencyType, client, async () => {
         stage.dispatch();
-        await repository.assertWriteLease(fence);
+        await this.assertRemindersWrite(repository, fence);
       });
       stage.confirm();
       await repository.commitResume(fence, appleSuccess({ ...omitField(saved.session, "allOpenScan"), connection: { ...saved.session.connection, remindersZoneOwner: owner }, auth: http.snapshot() }), "READY");
@@ -405,7 +462,7 @@ export class AppleConnectionService {
     if (!parsed.success) throw new AppError("VALIDATION_ERROR", "Provide this synthetic case UUID, exact list/reminder IDs and current generation.", 400);
     const input = parsed.data;
     return this.operation(input.expectedGeneration, "read-only", async (http, saved, repository, fence) => {
-      const client = new CloudKitRemindersClient(http.http, saved.session.connection);
+      const client = new CloudKitRemindersClient(http.http, requireRemindersConnection(saved.session));
       await this.authorizeLists(client, [input.listId]);
       const current = writeLookupRecord(await client.lookup([input.reminderId]), input.reminderId, false)!;
       const owner = client.remindersZoneOwner!;
@@ -423,7 +480,7 @@ export class AppleConnectionService {
     const parsed = ReminderTargetInput.omit({ recordChangeTag: true }).safeParse({ listId, reminderId });
     if (!parsed.success) throw new AppError("VALIDATION_ERROR", "Provide exact canonical list and reminder IDs.", 400);
     return this.operation(expectedGeneration, "read-only", async (http, saved, repository, fence) => {
-      const client = new CloudKitRemindersClient(http.http, saved.session.connection);
+      const client = new CloudKitRemindersClient(http.http, requireRemindersConnection(saved.session));
       if (client.remindersZoneOwner === undefined && !(await client.listZones()).available) throw new AppError("PROTOCOL_CHANGED", "Apple did not return an available private Reminders zone.");
       const found = await client.lookup([listId, reminderId]);
       const list = writeLookupRecord(found, listId, false)!;
@@ -445,7 +502,7 @@ export class AppleConnectionService {
     if (!parsed.success) throw new AppError("VALIDATION_ERROR", "Provide an exact update request with its current generation and supported policy.", 400);
     const input = parsed.data;
     return this.operation(input.expectedGeneration, "read-only", async (http, saved, repository, fence) => {
-      const client = new CloudKitRemindersClient(http.http, saved.session.connection);
+      const client = new CloudKitRemindersClient(http.http, requireRemindersConnection(saved.session));
       if (client.remindersZoneOwner === undefined && !(await client.listZones()).available) throw new AppError("PROTOCOL_CHANGED", "Apple did not return a private Reminders zone.");
       const found = await client.lookup([input.listId, input.reminderId]);
       const list = writeLookupRecord(found, input.listId, false)!;
@@ -469,7 +526,7 @@ export class AppleConnectionService {
     if (!ids.length || ids.length > 50) throw new AppError("UNSUPPORTED_FEATURE", "A job preview supports at most 50 distinct lists.");
     return this.operation(expectedGeneration, "read-only", async (http, saved, repository, fence) => {
       if (await accountScope(this.owner, saved.session.connection.dsid) !== account) throw new AppError("CONFLICT", "The job belongs to a different Apple account.", 409);
-      const client = new CloudKitRemindersClient(http.http, saved.session.connection);
+      const client = new CloudKitRemindersClient(http.http, requireRemindersConnection(saved.session));
       if (client.remindersZoneOwner === undefined && !(await client.listZones()).available) throw new AppError("PROTOCOL_CHANGED", "Apple did not return a private Reminders zone.");
       const found = await client.lookup(ids);
       for (const id of ids) {
@@ -482,7 +539,7 @@ export class AppleConnectionService {
   async observeJobCreate(expectedGeneration: number, account: string, input: z.infer<typeof CreateReminderInput>) {
     return this.operation(expectedGeneration, "read-only", async (http, saved, repository, fence) => {
       if (await accountScope(this.owner, saved.session.connection.dsid) !== account) throw new AppError("CONFLICT", "The job belongs to a different Apple account.", 409);
-      const client = new CloudKitRemindersClient(http.http, saved.session.connection);
+      const client = new CloudKitRemindersClient(http.http, requireRemindersConnection(saved.session));
       if (client.remindersZoneOwner === undefined && !(await client.listZones()).available) throw new AppError("PROTOCOL_CHANGED", "Apple did not return a private Reminders zone.");
       const id = `Reminder/${input.idempotencyKey.toUpperCase()}`, found = await client.lookup([input.listId, id]);
       const list = writeLookupRecord(found, input.listId, false)!;
@@ -496,7 +553,7 @@ export class AppleConnectionService {
   async observeJobDelete(expectedGeneration: number, account: string, input: z.infer<typeof ReminderTargetInput>) {
     return this.operation(expectedGeneration, "read-only", async (http, saved, repository, fence) => {
       if (await accountScope(this.owner, saved.session.connection.dsid) !== account) throw new AppError("CONFLICT", "The job belongs to a different Apple account.", 409);
-      const client = new CloudKitRemindersClient(http.http, saved.session.connection);
+      const client = new CloudKitRemindersClient(http.http, requireRemindersConnection(saved.session));
       if (client.remindersZoneOwner === undefined && !(await client.listZones()).available) throw new AppError("PROTOCOL_CHANGED", "Apple did not return a private Reminders zone.");
       const owner = client.remindersZoneOwner!, found = await client.lookup([input.listId, input.reminderId]);
       const list = writeLookupRecord(found, input.listId, false)!;
@@ -521,7 +578,7 @@ export class AppleConnectionService {
     if (!inputs.length || lists.length > 50) throw new AppError("UNSUPPORTED_FEATURE", "A job preview supports at most 50 distinct lists.");
     return this.operation(expectedGeneration, "read-only", async (http, saved, repository, fence) => {
       if (await accountScope(this.owner, saved.session.connection.dsid) !== account) throw new AppError("CONFLICT", "The job belongs to a different Apple account.", 409);
-      const client = new CloudKitRemindersClient(http.http, saved.session.connection);
+      const client = new CloudKitRemindersClient(http.http, requireRemindersConnection(saved.session));
       if (client.remindersZoneOwner === undefined && !(await client.listZones()).available) throw new AppError("PROTOCOL_CHANGED", "Apple did not return a private Reminders zone.");
       const owner = client.remindersZoneOwner!, foundLists = await client.lookup(lists);
       for (const id of lists) {
@@ -583,7 +640,7 @@ export class AppleConnectionService {
     try {
       return await this.operation(input.expectedGeneration, "mutation-preparation", async (http, saved, repository, fence, stage) => {
         if (hooks && await accountScope(this.owner, saved.session.connection.dsid) !== hooks.expectedAccount) throw new AppError("CONFLICT", "The job belongs to a different Apple account.", 409);
-        const client = new CloudKitRemindersClient(http.http, saved.session.connection);
+        const client = new CloudKitRemindersClient(http.http, requireRemindersConnection(saved.session));
         let connection = saved.session.connection;
         if (client.remindersZoneOwner === undefined) {
           const zone = await client.listZones();
@@ -641,10 +698,11 @@ export class AppleConnectionService {
                 ...(plan.terminal === undefined ? {} : { recurringDeletionTerminal: plan.terminal }) };
               saved.session.recurringIntents = await repository.checkpointRecurringIntent(fence, intent);
               records = await client.modifyRecurringDeletion(plan, async () => {
-                await repository.assertWriteLease(fence);
+                await this.assertRemindersWrite(repository, fence);
                 if (scope === "occurrence" && !plan.terminal && Number(plan.active.fields.DueDate.value) <= Date.now()) throw new AppError("UNSUPPORTED_FEATURE", "The next recurring deletion occurrence is now overdue.");
                 stage.dispatch(); intent = { ...intent!, phase: "dispatched" };
                 saved.session.recurringIntents = await repository.checkpointRecurringIntent(fence, intent);
+                await this.requirePermission("reminders.write");
               });
               applied = true;
             }
@@ -697,7 +755,7 @@ export class AppleConnectionService {
                 ...(plan.intrinsicParentGuards === undefined ? {} : { intrinsicParentGuards: plan.intrinsicParentGuards }) };
               saved.session.recurringIntents = await repository.checkpointRecurringIntent(fence, intent);
               records = await client.modifyRecurringCompletion(plan, async () => {
-                await repository.assertWriteLease(fence);
+                await this.assertRemindersWrite(repository, fence);
                 if (plan.mode === "advance" && Number(plan.active.fields.DueDate.value) <= Date.now()) throw new AppError("UNSUPPORTED_FEATURE", "The next recurring occurrence is now overdue; the retained request cannot skip it.");
                 // Budget and lease gates must precede the durable dispatch marker.
                 // Its own checkpoint CAS fences the current lease with >10s left;
@@ -705,6 +763,7 @@ export class AppleConnectionService {
                 stage.dispatch();
                 intent = { ...intent!, phase: "dispatched" };
                 saved.session.recurringIntents = await repository.checkpointRecurringIntent(fence, intent);
+                await this.requirePermission("reminders.write");
               });
               applied = true;
             }
@@ -728,7 +787,7 @@ export class AppleConnectionService {
             const pairs = await loadScheduledFamilyPairs(client, inspectedFamily, owner);
             const plan = planScheduledFamilyLifecycle(action, target, inspectedFamily, pairs, list, owner);
             const confirmations = await client.modifyScheduledFamilyLifecycle(plan, async () => {
-              await repository.assertWriteLease(fence); stage.dispatch();
+              await this.assertRemindersWrite(repository, fence); stage.dispatch();
             });
             applied = true; stage.confirm();
             const confirmed = confirmations.find(record => record.recordName === targetId)!;
@@ -744,10 +803,11 @@ export class AppleConnectionService {
         let affectedRecords: CloudKitRecord[] | undefined;
         let replayed = false;
         const dispatch = async () => {
-          stage.dispatch();
+          await this.assertRemindersWrite(repository, fence);
           if (hooks) await hooks.beforeDispatch(write);
-          await repository.assertWriteLease(fence);
           await hooks?.assertDispatch();
+          await this.requirePermission("reminders.write");
+          stage.dispatch();
         };
         if (input.action === "create") {
           const create = omitField(omitField(input, "action"), "expectedGeneration");
@@ -872,7 +932,7 @@ export class AppleConnectionService {
   async readOrganizationForMCP(expectedGeneration: number, listId: string, reminderId: string) {
     ReminderTargetInput.omit({ recordChangeTag: true }).parse({ listId, reminderId });
     return this.operation(expectedGeneration, "read-only", async (http, saved, repository, fence) => {
-      const client = new CloudKitRemindersClient(http.http, saved.session.connection);
+      const client = new CloudKitRemindersClient(http.http, requireRemindersConnection(saved.session));
       await this.authorizeLists(client, [listId]);
       const root = writeLookupRecord(await client.lookup([reminderId]), reminderId, false)!;
       const owner = client.remindersZoneOwner!;
@@ -890,7 +950,7 @@ export class AppleConnectionService {
     let applied = false;
     try {
       return await this.operation(input.expectedGeneration, "mutation-preparation", async (http, saved, repository, fence, stage) => {
-        const client = new CloudKitRemindersClient(http.http, saved.session.connection);
+        const client = new CloudKitRemindersClient(http.http, requireRemindersConnection(saved.session));
         if (client.remindersZoneOwner === undefined && !(await client.listZones()).available) throw new AppError("PROTOCOL_CHANGED", "No owned Reminders zone is available.");
         const owner = client.remindersZoneOwner!;
         const transfer = input.action === "move" || input.action === "copy";
@@ -919,7 +979,7 @@ export class AppleConnectionService {
           if (current.recordChangeTag !== input.recordChangeTag || normalized.listId !== input.listId) throw new AppError("CONFLICT", "The selected reminder changed before this request.", 409);
           const selected = input.action === "set_url" ? "url" : input.action === "set_tags" ? "tags" : undefined;
           const related = await organizationRecords(client, current, owner, selected);
-          const dispatch = async () => { stage.dispatch(); await repository.assertWriteLease(fence); };
+          const dispatch = async () => { await this.assertRemindersWrite(repository, fence); stage.dispatch(); };
           let confirmations: CloudKitRecord[];
           let write: CloudKitWriteRecord;
           if (input.action === "set_url" || input.action === "set_tags") {
@@ -979,7 +1039,7 @@ export class AppleConnectionService {
     let applied = false;
     try {
       return await this.operation(input.expectedGeneration, "mutation-preparation", async (http, saved, repository, fence, stage) => {
-        const client = new CloudKitRemindersClient(http.http, saved.session.connection);
+        const client = new CloudKitRemindersClient(http.http, requireRemindersConnection(saved.session));
         const authorizedLists = await this.authorizeLists(client, [input.listId], true);
         const current = writeLookupRecord(await client.lookup([targetId]), targetId, input.action === "create_subtask");
         const owner = client.remindersZoneOwner!;
@@ -996,7 +1056,7 @@ export class AppleConnectionService {
           } else {
             const parents = await subtaskParents(client, owner, input.listId, null, input.parentReminder, list);
             confirmed = await client.modifyReminderCreation(write, list, async () => {
-              stage.dispatch(); await repository.assertWriteLease(fence);
+              await this.assertRemindersWrite(repository, fence); stage.dispatch();
             }, parents);
             stage.confirm(); applied = true;
             if (!matchesCreatedReminder(omitField(create, "parentReminder"), confirmed, owner, create.parentReminder.reminderId)) throw new WriteOutcomeUnknownError(targetId, input.idempotencyKey);
@@ -1006,7 +1066,7 @@ export class AppleConnectionService {
           write = buildSetReminderParent(SetReminderParentInput.parse(omitField(omitField(input, "action"), "expectedGeneration")), current!, owner);
           const parents = await subtaskParents(client, owner, input.listId, current, input.parentReminder, list);
           confirmed = (await client.modifyRecords([{ operationType: "update", record: write }], async () => {
-            stage.dispatch(); await repository.assertWriteLease(fence);
+            await this.assertRemindersWrite(repository, fence); stage.dispatch();
           }, [...parents, list]))[0];
           stage.confirm(); applied = true;
           verifyWriteFields(write, confirmed, current!, owner, input.listId);
@@ -1025,7 +1085,7 @@ export class AppleConnectionService {
     const valid = RenameListInput.shape.listId.safeParse(listId);
     if (!valid.success) throw new AppError("VALIDATION_ERROR", "Supply an exact listId.", 400);
     return this.operation(expectedGeneration, "read-only", async (http, saved, repository, fence) => {
-      const client = new CloudKitRemindersClient(http.http, saved.session.connection);
+      const client = new CloudKitRemindersClient(http.http, requireRemindersConnection(saved.session));
       if (client.remindersZoneOwner === undefined && !(await client.listZones()).available)
         throw new AppError("PROTOCOL_CHANGED", "No owned Reminders zone is available.");
       const found = await client.lookup([listId]);
@@ -1048,7 +1108,7 @@ export class AppleConnectionService {
     const valid = RenameListInput.shape.listId.safeParse(listId);
     if (!valid.success) throw new AppError("VALIDATION_ERROR", "Supply an exact listId.", 400);
     return this.operation(expectedGeneration, "read-only", async (http, saved, repository, fence) => {
-      const client = new CloudKitRemindersClient(http.http, saved.session.connection);
+      const client = new CloudKitRemindersClient(http.http, requireRemindersConnection(saved.session));
       if (client.remindersZoneOwner === undefined && !(await client.listZones()).available)
         throw new AppError("PROTOCOL_CHANGED", "No owned Reminders zone is available.");
       const owner = client.remindersZoneOwner!;
@@ -1068,14 +1128,14 @@ export class AppleConnectionService {
     let applied = false;
     try {
       return await this.operation(input.expectedGeneration, "mutation-preparation", async (http, saved, repository, fence, stage) => {
-        const client = new CloudKitRemindersClient(http.http, saved.session.connection);
+        const client = new CloudKitRemindersClient(http.http, requireRemindersConnection(saved.session));
         if (client.remindersZoneOwner === undefined && !(await client.listZones()).available)
           throw new AppError("PROTOCOL_CHANGED", "No owned Reminders zone is available.");
         const owner = client.remindersZoneOwner!;
         const current = ownedListRecord(writeLookupRecord(await client.lookup([input.listId]), input.listId, false)!, owner);
         const write = buildUpdateListAppearance(omitField(input, "expectedGeneration"), current, owner);
         const confirmed = await client.modifyList("update", write, async () => {
-          stage.dispatch(); await repository.assertWriteLease(fence);
+          await this.assertRemindersWrite(repository, fence); stage.dispatch();
         });
         stage.confirm(); applied = true;
         const scoped = ownedListRecord(confirmed, owner);
@@ -1096,7 +1156,9 @@ export class AppleConnectionService {
     if (!parsed.success || parsed.data.expectedGeneration === undefined) throw new AppError("VALIDATION_ERROR", "Supply an exact Shopping list and session generation.", 400);
     const input = parsed.data, generation = input.expectedGeneration!, token = input.continuation ?? null;
     return this.operation(generation, "cursor-progress", async (http, saved, repository, fence) => {
+      const permissionRevision = (await this.requirePermission("reminders.read")).revision;
       const previous = token === null ? undefined : saved.session.categoryScan;
+      if (previous && (previous.permissionRevision ?? 0) !== permissionRevision) throw new AppError("CONFLICT", "Service permissions changed. Start a new category read.", 409);
       const accountHash = await accountScope(this.owner, saved.session.connection.dsid);
       if (token !== null && (!previous || previous.token !== token || previous.listId !== input.listId || previous.limit !== input.limit || previous.accountHash !== accountHash))
         throw new AppError("CONFLICT", "The category continuation was replaced, already used, or its scope changed.", 409);
@@ -1104,7 +1166,7 @@ export class AppleConnectionService {
         await repository.commitResume(fence, omitField(saved.session, "categoryScan"), "READY");
         throw new AppError("RESTART_REQUIRED", "The category scan expired or reached its pagination budget. Start a new read.", 409);
       }
-      const client = new CloudKitRemindersClient(http.http, saved.session.connection);
+      const client = new CloudKitRemindersClient(http.http, requireRemindersConnection(saved.session));
       if (client.remindersZoneOwner === undefined && !(await client.listZones()).available) throw new AppError("PROTOCOL_CHANGED", "No owned Reminders zone is available.");
       const owner = client.remindersZoneOwner!;
       const list = ownedListRecord(writeLookupRecord(await client.lookup([input.listId]), input.listId, false)!, owner);
@@ -1142,7 +1204,7 @@ export class AppleConnectionService {
           throw new AppError("PROTOCOL_CHANGED", "Apple repeated category pagination. Start a new read.");
         }
         continuation = crypto.randomUUID();
-        session = { ...session, categoryScan: { token: continuation, expiresAt: previous?.expiresAt ?? Math.min(Date.now() + 600000, saved.session.login.expiresAt),
+        session = { ...session, categoryScan: { permissionRevision, token: continuation, expiresAt: previous?.expiresAt ?? Math.min(Date.now() + 600000, saved.session.login.expiresAt),
           accountHash, listId: input.listId, limit: input.limit, cursor: page.continuation!, seen: [...previous?.seen ?? [], marker], pages: (previous?.pages ?? 0) + 1 } };
       }
       await repository.commitResume(fence, appleSuccess({ ...session, connection: { ...session.connection, remindersZoneOwner: owner }, auth: http.snapshot() }), "READY");
@@ -1163,7 +1225,7 @@ export class AppleConnectionService {
     let applied = false;
     try {
       return await this.operation(input.expectedGeneration, "mutation-preparation", async (http, saved, repository, fence, stage) => {
-        const client = new CloudKitRemindersClient(http.http, saved.session.connection);
+        const client = new CloudKitRemindersClient(http.http, requireRemindersConnection(saved.session));
         if (client.remindersZoneOwner === undefined && !(await client.listZones()).available) throw new AppError("PROTOCOL_CHANGED", "No owned Reminders zone is available.");
         const owner = client.remindersZoneOwner!;
         const list = ownedListRecord(writeLookupRecord(await client.lookup([input.listId]), input.listId, false)!, owner);
@@ -1181,7 +1243,7 @@ export class AppleConnectionService {
         const fields: ListWrite["fields"] = { ...plan.fields, MembershipsOfRemindersInSectionsAsData: { type: "ASSETID", value: uploaded.MembershipsOfRemindersInSectionsAsData },
           GroceryLocalCorrectionsAsData: { type: "ASSETID", value: uploaded.GroceryLocalCorrectionsAsData } };
         const result = await client.modifyShoppingCategory(plan.rootWrite, { recordName: list.recordName, recordType: "List", recordChangeTag: list.recordChangeTag, fields }, category,
-          async () => { stage.dispatch(); await repository.assertWriteLease(fence); });
+          async () => { await this.assertRemindersWrite(repository, fence); stage.dispatch(); });
         stage.confirm(); applied = true;
         const confirmedRoot = result.find(record => record.recordName === root.recordName)!, confirmedList = result.find(record => record.recordName === list.recordName)!;
         const categoryReceipt = result.find(record => record.recordName === category.recordName)!;
@@ -1228,7 +1290,7 @@ export class AppleConnectionService {
     let applied = false;
     try {
       return await this.operation(Number(input.expectedGeneration), "mutation-preparation", async (http, saved, repository, fence, stage) => {
-        const client = new CloudKitRemindersClient(http.http, saved.session.connection);
+        const client = new CloudKitRemindersClient(http.http, requireRemindersConnection(saved.session));
         if (client.remindersZoneOwner === undefined && !(await client.listZones()).available)
           throw new AppError("PROTOCOL_CHANGED", "No owned Reminders zone is available.");
         const owner = client.remindersZoneOwner!;
@@ -1247,7 +1309,7 @@ export class AppleConnectionService {
           } else {
             const write = buildCreateList(create);
             confirmed = await client.modifyList("create", write, async () => {
-              stage.dispatch(); await repository.assertWriteLease(fence);
+              await this.assertRemindersWrite(repository, fence); stage.dispatch();
             });
             stage.confirm(); applied = true;
           }
@@ -1279,7 +1341,7 @@ export class AppleConnectionService {
             requireEmptyListMetadata(latest);
           }
           confirmed = await client.modifyList("update", write, async () => {
-            stage.dispatch(); await repository.assertWriteLease(fence);
+            await this.assertRemindersWrite(repository, fence); stage.dispatch();
           });
           stage.confirm(); applied = true;
         }
@@ -1307,15 +1369,28 @@ export class AppleConnectionService {
 
   private async operation<T>(expectedGeneration: number, mode: OperationMode, run: (http: AppleAuthHTTP, saved: Awaited<ReturnType<AppleSessionRepository["load"]>>, repository: AppleSessionRepository, fence: ResumeFence, stage: OperationStage) => Promise<T>, budget = appleRequestBudget()) {
     requireAppleEnabled(this.env);
+    const permission = mode === "mutation-preparation" ? "reminders.write" : "reminders.read";
+    const preferences = mode === "pcs" ? null : await this.requirePermission(permission);
+    if (mode === "pcs" && !(await new ServiceSettingsRepository(this.env, this.owner).load()).settings.reminders.enabled) throw new AppError("FORBIDDEN", "Reminders is disabled in Services.", 403);
     const repository = new AppleSessionRepository(this.env, this.owner);
     const renewal = new AppleSessionRenewal(this.env, repository);
     for (let attempt = 0; attempt < 2; attempt++) {
       const saved = mode === "snapshot" ? await repository.load() : await renewal.ensure(expectedGeneration, budget);
       if (saved.fence.generation !== expectedGeneration) throw new AppError("CONFLICT", "The Apple connection changed before this operation.", 409);
       if (budget.deadline <= Date.now()) throw new AppError("UPSTREAM_UNAVAILABLE", "The Apple request deadline was reached.", 503, true);
-      if (mode === "pcs" && Date.now() < saved.session.pcs.nextAttemptAt) throw new AppError("RATE_LIMITED", "Wait until the displayed retry time before checking approval.", 429, true);
-      const fence = mode === "pcs" ? await repository.claimResume(expectedGeneration, saved.fence.version) : await repository.claimRead(expectedGeneration, saved.fence.version);
-      const http = AppleAuthHTTP.restore(saved.session.auth, fetch, AbortSignal.timeout(budget.deadline - Date.now()));
+      if (mode === "pcs" && sessionServices(saved.session, saved.state, saved.action).reminders.state === "DEVICE_APPROVAL_PENDING" && Date.now() < saved.session.pcs.nextAttemptAt) throw new AppError("RATE_LIMITED", "Wait until the displayed retry time before checking approval.", 429, true);
+      requireRemindersConnection(saved.session);
+      if (mode !== "pcs") requireServiceReady(saved.session, saved.state, "reminders", saved.action);
+      const fence = mode === "pcs" ? await repository.claimRenewal(expectedGeneration, saved.fence.version) : await repository.claimRead(expectedGeneration, saved.fence.version);
+      // Each upstream read is checked again, including multi-page preparation.
+      const send: typeof fetch = async (input, init) => {
+        if (mode !== "pcs") {
+          const current = await this.requirePermission(permission);
+          if (current.revision !== preferences!.revision) throw new AppError("CONFLICT", "Service permissions changed before dispatch. Start a new request.", 409);
+        }
+        return fetch(input, init);
+      };
+      const http = AppleAuthHTTP.restore(saved.session.auth, send, AbortSignal.timeout(budget.deadline - Date.now()));
       const stage: OperationStage = {
         phase: mode,
         dispatch() {
@@ -1325,7 +1400,13 @@ export class AppleConnectionService {
         confirm() { this.phase = "mutation-confirmation"; },
       };
       let recover = false;
-      try { return await run(http, saved, repository, fence, stage); }
+      try {
+        const result = await run(http, saved, repository, fence, stage);
+        if (mode !== "pcs" && (await this.requirePermission(permission)).revision !== preferences!.revision) {
+          throw new AppError("CONFLICT", "Service permissions changed before releasing the result. Start a new request.", 409);
+        }
+        return result;
+      }
       catch (error) {
         const dispatched = stage.phase === "mutation-dispatch" || stage.phase === "mutation-confirmation";
         if (error instanceof AppError && error.code === "AUTH_EXPIRED") await repository.invalidate(fence, "local-retention-expired");
@@ -1352,18 +1433,35 @@ export class AppleConnectionService {
     }
     throw new AppError("REAUTH_REQUIRED", "Apple rejected the operation after one recovery cycle. No automatic retry remains.", 409);
   }
+  async approveReminders(expectedGeneration: number, restartApproval = false) {
+    return this.resume(expectedGeneration, restartApproval);
+  }
   async resume(expectedGeneration: number, restartApproval = false) {
+    requireAppleEnabled(this.env);
+    if (!(await new ServiceSettingsRepository(this.env, this.owner).load()).settings.reminders.enabled) throw new AppError("FORBIDDEN", "Enable Reminders in Services before approving Apple access.", 403);
+    const repository = new AppleSessionRepository(this.env, this.owner);
+    const initial = await repository.load();
+    if (initial.fence.generation !== expectedGeneration) throw new AppError("CONFLICT", "The Apple connection changed.", 409);
+    if (sessionServices(initial.session, initial.state, initial.action).reminders.state === "READY") return this.status();
+    if (!initial.session.connection.cloudKitURL) await new AppleSessionRenewal(this.env, repository).ensure(expectedGeneration, appleRequestBudget(), true);
     await this.operation(expectedGeneration, "pcs", async (http, saved, repository, fence) => {
-      if (saved.session.pcs.expiresAt <= Date.now() && !restartApproval) throw new AppError("RESTART_REQUIRED", "This Reminders approval attempt expired. Use Check Apple approval to start a new bounded attempt; the Apple account connection is preserved.", 409);
-      const checkpoint = saved.session.pcs.expiresAt <= Date.now() ? freshPcsCheckpoint() : saved.session.pcs;
-      const result = await advancePcs(http, saved.session.connection.dsid, checkpoint);
+      const existing = sessionServices(saved.session, saved.state, saved.action).reminders;
+      const pending = existing.state === "DEVICE_APPROVAL_PENDING";
+      if (pending && saved.session.pcs.expiresAt <= Date.now() && !restartApproval) throw new AppError("RESTART_REQUIRED", "This Reminders approval attempt expired. Use Check Apple approval to start a new bounded attempt; the Apple account connection is preserved.", 409);
+      const checkpoint = !pending || restartApproval || saved.session.pcs.expiresAt <= Date.now() ? freshPcsCheckpoint() : saved.session.pcs;
+      const result = await advancePcs(http, saved.session.connection.dsid, checkpoint, Date.now(), "reminders", async () => {
+        if (!(await new ServiceSettingsRepository(this.env, this.owner).load()).settings.reminders.enabled) throw new AppError("FORBIDDEN", "Reminders was disabled before Apple approval.", 403);
+        await repository.assertAccountLease(fence);
+      });
       await repository.commitResume(fence, appleSuccess({ ...saved.session, auth: http.snapshot(), pcs: result.checkpoint,
+        services: { ...sessionServices(saved.session, saved.state, saved.action), reminders: { state: result.state, pcs: result.checkpoint,
+          ...(result.state === "DEVICE_APPROVAL_PENDING" ? { action: result.action } : {}) } },
         renewal: { ...(saved.session.renewal ?? renewalCheckpoint()), requiredAction: result.state === "READY" ? null : "approve-reminders", lastErrorCode: null } }), result.state, result.state === "DEVICE_APPROVAL_PENDING" ? result.action : undefined);
     });
     return this.status();
   }
   private async fetchDirectLists(http: AppleAuthHTTP, session: AppleSession) {
-    const client = new CloudKitRemindersClient(http.http, session.connection);
+    const client = new CloudKitRemindersClient(http.http, requireRemindersConnection(session));
     const found = await client.queryAllLists();
     if (!found.complete) throw new AppError("UNSUPPORTED_FEATURE", "Direct list discovery did not finish within its safe limits or returned record errors. The previous snapshot is preserved. Retry a refresh; if the error persists, direct discovery is not supported for this account or exceeds the current limits.", 409);
     const now = Date.now();
@@ -1407,8 +1505,10 @@ export class AppleConnectionService {
     return this.operation(expectedGeneration, "cursor-progress", async (http, saved, repository, fence) => {
       let session = saved.session;
       if (!continuation) session = appleSuccess((await this.fetchDirectLists(http, session)).session);
+      const permissionRevision = (await this.requirePermission("reminders.read")).revision;
       let scan: AllOpenScan;
       if (continuation) {
+        if ((session.allOpenScan?.permissionRevision ?? 0) !== permissionRevision) throw new AppError("CONFLICT", "Service permissions changed. Start a new all-open read.", 409);
         if (!session.allOpenScan || session.allOpenScan.token !== continuation) throw new AppError("CONFLICT", "The all-open continuation was replaced or already used. Restart the all-open read.", 409);
         if (session.allOpenScan.expiresAt <= Date.now()) {
           await repository.commitResume(fence, { ...session, allOpenScan: undefined }, "READY");
@@ -1417,7 +1517,7 @@ export class AppleConnectionService {
         scan = { ...session.allOpenScan, token: crypto.randomUUID() };
       } else {
         const lists = session.savedLists ?? [];
-        scan = { source: "direct-cloudkit-query", lists: lists.filter(list => !list.deleted && !list.isGroup), token: crypto.randomUUID(), expiresAt: Math.min(Date.now() + 600_000, session.login.expiresAt), listIds: lists.filter(list => !list.deleted && !list.isGroup).map(list => list.id), index: 0, cursor: null, seen: [], listPages: 0, totalPages: 0, caughtUpAt: session.directListSnapshot!.updatedAt };
+        scan = { permissionRevision, source: "direct-cloudkit-query", lists: lists.filter(list => !list.deleted && !list.isGroup), token: crypto.randomUUID(), expiresAt: Math.min(Date.now() + 600_000, session.login.expiresAt), listIds: lists.filter(list => !list.deleted && !list.isGroup).map(list => list.id), index: 0, cursor: null, seen: [], listPages: 0, totalPages: 0, caughtUpAt: session.directListSnapshot!.updatedAt };
       }
       // Rotation is fenced before the first query, making the supplied token
       // single-use even when another instance resumes concurrently.
@@ -1428,6 +1528,7 @@ export class AppleConnectionService {
   private async allOpenPage(expectedGeneration: number, token: string, remainingBytes: number, remainingRecords: number, budget: AppleRequestBudget) {
     return this.operation(expectedGeneration, "cursor-progress", async (http, saved, repository, fence) => {
       const session = saved.session; const scan = session.allOpenScan;
+      if (scan && (scan.permissionRevision ?? 0) !== (await this.requirePermission("reminders.read")).revision) throw new AppError("CONFLICT", "Service permissions changed. Start a new all-open read.", 409);
       if (!scan || scan.token !== token) throw new AppError("CONFLICT", "The all-open read changed. Restart with the latest continuation.", 409);
       if (scan.expiresAt <= Date.now()) {
         await repository.commitResume(fence, { ...session, allOpenScan: undefined }, "READY");
@@ -1441,7 +1542,7 @@ export class AppleConnectionService {
       let reason: string | null = null;
       let queried = false;
       {
-        const client = new CloudKitRemindersClient(http.http, session.connection);
+        const client = new CloudKitRemindersClient(http.http, requireRemindersConnection(session));
         const page = await client.queryRemindersPage({ listId, includeCompleted: false, limit: 200, continuation: scan.cursor });
         queried = true;
         records = page.records.flatMap(record => {
@@ -1518,6 +1619,7 @@ export class AppleConnectionService {
         throw error;
       }
     }
+    if ((await this.requirePermission("reminders.read")).revision !== (scan.permissionRevision ?? 0)) throw new AppError("CONFLICT", "Service permissions changed during the read. Start a new read.", 409);
     return { result: resultFor(), generation: expectedGeneration, liveReadValidated: false, writesEnabled: appleGates(this.env).enabled };
   }
   async searchRemindersForMCP(input: z.input<typeof SearchReminderInput>) {
@@ -1547,8 +1649,10 @@ export class AppleConnectionService {
     }
     return this.operation(expectedGeneration, "cursor-progress", async (http, saved, repository, fence) => {
       let session = saved.session;
+      const permissionRevision = (await this.requirePermission("reminders.read")).revision;
       let scan: SearchScan;
       if (token !== null) {
+        if ((session.searchScan?.permissionRevision ?? 0) !== permissionRevision) throw new AppError("CONFLICT", "Service permissions changed. Start a new search.", 409);
         const current = session.searchScan;
         if (!current || current.token !== token || current.filtersHash !== filterHash || current.inventoryHash !== await fingerprint(current.listIds) || current.accountHash !== await accountScope(this.owner, session.connection.dsid))
           throw new AppError("CONFLICT", "The search continuation changed during this request. Start a new search.", 409);
@@ -1560,7 +1664,7 @@ export class AppleConnectionService {
       } else {
         let listIds: string[];
         if (filters.listId !== undefined) {
-          const client = new CloudKitRemindersClient(http.http, session.connection);
+          const client = new CloudKitRemindersClient(http.http, requireRemindersConnection(session));
           await this.authorizeLists(client, [filters.listId]);
           session = { ...session, connection: { ...session.connection, remindersZoneOwner: client.remindersZoneOwner } };
           listIds = [filters.listId];
@@ -1569,7 +1673,7 @@ export class AppleConnectionService {
           listIds = (session.savedLists ?? []).filter(list => !list.deleted && !list.isGroup).map(list => list.id);
         }
         scan = {
-          token: crypto.randomUUID(), expiresAt: Math.min(Date.now() + 600_000, session.login.expiresAt),
+          permissionRevision, token: crypto.randomUUID(), expiresAt: Math.min(Date.now() + 600_000, session.login.expiresAt),
           accountHash: await accountScope(this.owner, session.connection.dsid), filtersHash: filterHash,
           inventoryHash: await fingerprint(listIds), listIds, index: 0, cursor: null, seen: [], listPages: 0, totalPages: 0,
         };
@@ -1584,7 +1688,7 @@ export class AppleConnectionService {
       let next = scan;
       if (scan.index < scan.listIds.length) {
         const listId = scan.listIds[scan.index];
-        const client = new CloudKitRemindersClient(http.http, session.connection);
+        const client = new CloudKitRemindersClient(http.http, requireRemindersConnection(session));
         let page: CloudKitPage;
         try {
           page = await client.queryRemindersPage({ listId, includeCompleted: filters.status !== "open", limit: request.limit, continuation: scan.cursor, projection: "search" });
@@ -1727,7 +1831,13 @@ export class AppleConnectionService {
   }
   private async controlledRead(input: z.infer<typeof ControlledRead>) {
     return this.operation(input.expectedGeneration, input.action === "saved-lists" ? "snapshot" : input.action === "reminders" && input.continuation ? "cursor-progress" : "read-only", async (http, saved, repository, fence) => {
-      const client = new CloudKitRemindersClient(http.http, saved.session.connection);
+      const client = new CloudKitRemindersClient(http.http, requireRemindersConnection(saved.session));
+      const permissionRevision = (await this.requirePermission("reminders.read")).revision;
+      if (input.action === "reminders" && input.continuation && !(saved.session.readContinuations ?? []).some(cursor =>
+        cursor.cursor === input.continuation && cursor.listId === input.listId && cursor.includeCompleted === input.includeCompleted &&
+        cursor.limit === input.limit && cursor.permissionRevision === permissionRevision && cursor.expiresAt > Date.now())) {
+        throw new AppError("CONFLICT", "The reminder continuation expired or its scope or service permissions changed. Start a new read.", 409);
+      }
       let result: unknown;
       let connection = saved.session.connection;
       let savedLists = saved.session.savedLists ?? [];
@@ -1781,7 +1891,15 @@ export class AppleConnectionService {
       }
       // Cookie changes and the response share a generation/version fence. A
       // concurrent disconnect prevents both the save and a successful response.
-      const session = { ...saved.session, connection, savedLists, auth: http.snapshot() };
+      const readContinuations = (saved.session.readContinuations ?? []).filter(cursor => cursor.expiresAt > Date.now() && cursor.permissionRevision === permissionRevision &&
+        !(input.action === "reminders" && cursor.listId === input.listId));
+      const retain = (page: Record<string, unknown>, listId: string, includeCompleted: boolean, limit: number) => {
+        if (typeof page.continuation === "string") readContinuations.push({ cursor: page.continuation, listId, includeCompleted, limit,
+          permissionRevision, expiresAt: Math.min(Date.now() + 600_000, saved.session.login.expiresAt) });
+      };
+      if (input.action === "reminders") retain(result as Record<string, unknown>, input.listId, input.includeCompleted, input.limit);
+      if (input.action === "reminders-batch") (result as { pages: Record<string, unknown>[] }).pages.forEach((page, index) => retain(page, input.listIds[index], input.includeCompleted, input.limit));
+      const session = { ...saved.session, connection, savedLists, auth: http.snapshot(), readContinuations: readContinuations.slice(-32) };
       await repository.commitResume(fence, input.action === "saved-lists" ? session : appleSuccess(session), "READY");
       result = { ...(result as Record<string, unknown>), requestTrace: client.readTrace };
       return { result, generation: fence.generation, liveReadValidated: false, writesEnabled: appleGates(this.env).enabled };

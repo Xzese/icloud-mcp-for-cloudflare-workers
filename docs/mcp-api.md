@@ -13,6 +13,8 @@ are connector choices, not claims about Apple's UI implementation. This is an un
 integration, and a supported recurrence edit does not imply support for completing every
 recurrence pattern.
 
+Drive tool contracts and file transfer endpoints are documented in [iCloud Drive and service permissions](icloud-drive.md). Disabled service groups are omitted from `tools/list`; server-side checks also enforce preferences for direct calls. `connection_status` includes `services`, `serviceSettings` and `accountConnected`, without contacting Apple.
+
 ## Contents
 
 - [Shared inputs, results and recovery](#shared-inputs-results-and-recovery)

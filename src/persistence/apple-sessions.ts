@@ -1,10 +1,10 @@
 import { z } from "zod";
 import { RecurrenceCalendarTimeZone } from "../reminders/recurrence-calendar.ts";
 import { AuthSnapshotSchema, type AuthSnapshot } from "../auth/apple/http.ts";
+import { AppleServicesSchema, PcsCheckpointSchema, requireRemindersConnection, sessionServices, type AppleServices, type CommonAppleConnection } from "../auth/apple/services.ts";
 import type { PcsCheckpoint } from "../auth/apple/pcs.ts";
 import { Envelopes, type Envelope, type EnvelopeContext } from "../crypto/envelopes.ts";
 import { AppError } from "../errors.ts";
-import type { CloudKitConnection } from "../icloud/cloudkit.ts";
 import type { RuntimeEnv } from "../platform/sites.ts";
 import { validatedAppleURL } from "../transport/apple-http.ts";
 import { LoginAssuranceSchema, RETENTION_POLICY, SESSION_RETENTION_MS, requireCurrentLogin, type LoginAssurance } from "../auth/apple/policy.ts";
@@ -31,15 +31,8 @@ const CloudKitConnectionSchema = z.object({
   clientId: z.string().min(1).max(100).regex(/^[A-Za-z0-9-]+$/),
   clientBuildNumber: z.string().min(1).max(100).regex(/^[A-Za-z0-9._-]+$/),
   clientMasteringNumber: z.string().min(1).max(100).regex(/^[A-Za-z0-9._-]+$/),
-  cloudKitURL,
+  cloudKitURL: cloudKitURL.optional(),
   remindersZoneOwner: z.string().min(1).max(256).refine(value => !/[\u0000-\u0020\u007f]/.test(value)).optional(),
-}).strict();
-const PcsCheckpointSchema = z.object({
-  consentRequested: z.boolean(),
-  pcsAttempts: z.number().int().min(0).max(10),
-  consentChecks: z.number().int().min(0).max(10),
-  expiresAt: z.number().int().positive().safe(),
-  nextAttemptAt: z.number().int().nonnegative().safe(),
 }).strict();
 export const SavedListSchema = z.object({
   id: z.string().min(6).max(512).regex(/^List\/[^/\u0000-\u0020\u007f]+$/),
@@ -59,6 +52,7 @@ export function mergeSavedLists(previous: SavedList[], records: { id: string; ti
   return [...merged.values()];
 }
 const AllOpenScanSchema = z.object({
+  permissionRevision: z.number().int().nonnegative().safe().optional(),
   token: z.string().uuid(),
   expiresAt: z.number().int().positive().safe(),
   listIds: z.array(SavedListSchema.shape.id).max(1000).refine(ids => new Set(ids).size === ids.length),
@@ -74,6 +68,7 @@ const AllOpenScanSchema = z.object({
   .refine(scan => scan.lists.length === scan.listIds.length && scan.lists.every((list, index) => list.id === scan.listIds[index] && !list.deleted && !list.isGroup), "The all-open list selection is inconsistent.");
 export type AllOpenScan = z.infer<typeof AllOpenScanSchema>;
 const SearchScanSchema = z.object({
+  permissionRevision: z.number().int().nonnegative().safe().optional(),
   token: z.string().uuid(),
   expiresAt: z.number().int().positive().safe(),
   accountHash: z.string().regex(/^[a-f0-9]{64}$/),
@@ -88,6 +83,7 @@ const SearchScanSchema = z.object({
 }).strict().refine(scan => scan.index <= scan.listIds.length, "The search scan list index is invalid.");
 export type SearchScan = z.infer<typeof SearchScanSchema>;
 const CategoryScanSchema = z.object({
+  permissionRevision: z.number().int().nonnegative().safe().optional(),
   token: z.string().uuid(), expiresAt: z.number().int().positive().safe(),
   accountHash: z.string().regex(/^[a-f0-9]{64}$/), listId: SavedListSchema.shape.id,
   limit: z.number().int().min(1).max(200), cursor: z.string().min(1).max(8192),
@@ -159,6 +155,8 @@ export type RecurringIntent = z.infer<typeof RecurringIntentSchema>;
 export const AppleSessionSchema = z.preprocess(discardRetiredCatalogueState, z.object({
   auth: AuthSnapshotSchema,
   connection: CloudKitConnectionSchema,
+  services: AppleServicesSchema.optional(),
+  readContinuations: z.array(z.object({ cursor: z.string().min(1).max(8192), listId: SavedListSchema.shape.id, includeCompleted: z.boolean(), limit: z.number().int().min(1).max(200), permissionRevision: z.number().int().nonnegative().safe(), expiresAt: z.number().int().positive().safe() }).strict()).max(32).optional(),
   pcs: PcsCheckpointSchema,
   login: LoginAssuranceSchema,
   renewal: RenewalCheckpointSchema.optional(),
@@ -171,10 +169,21 @@ export const AppleSessionSchema = z.preprocess(discardRetiredCatalogueState, z.o
   savedLists: SavedListsSchema.optional(),
   // Optional metadata preserves version-1 encrypted list snapshots.
   directListSnapshot: z.object({ updatedAt: z.number().int().nonnegative().safe() }).strict().optional(),
-}).strict());
+}).strict().superRefine((session, context) => {
+  if (session.auth.clientId !== session.connection.clientId || !session.services && !session.connection.cloudKitURL ||
+      session.services?.reminders.state !== undefined && session.services.reminders.state !== "UNAVAILABLE" && !session.connection.cloudKitURL) {
+    context.addIssue({ code: z.ZodIssueCode.custom, message: "The common account and Reminders discovery are inconsistent." });
+  }
+  const drive = session.services?.drive.connection;
+  if (drive && ["dsid", "clientId", "clientBuildNumber", "clientMasteringNumber"].some(key => drive[key as keyof typeof drive] !== session.connection[key as keyof typeof session.connection])) {
+    context.addIssue({ code: z.ZodIssueCode.custom, message: "Drive must belong to the same Apple account and client." });
+  }
+}));
 export type AppleSession = {
   auth: AuthSnapshot;
-  connection: CloudKitConnection;
+  connection: CommonAppleConnection;
+  services?: AppleServices;
+  readContinuations?: { cursor: string; listId: string; includeCompleted: boolean; limit: number; permissionRevision: number; expiresAt: number }[];
   pcs: PcsCheckpoint;
   login: LoginAssurance;
   renewal?: RenewalCheckpoint;
@@ -204,6 +213,8 @@ export interface AppleSessionStatus extends SessionFence {
   lastAppleSuccessAt: number | null;
   lastRenewedAt: number | null;
   nextRetryAt: number | null;
+  services: AppleServices | null;
+  accountAuthenticated: boolean;
   requiredAction: RenewalCheckpoint["requiredAction"] | "local-retention-expired" | "apple-sign-in";
 }
 
@@ -249,6 +260,7 @@ export class AppleSessionRepository {
   readonly db: D1DatabaseSession;
   readonly owner: string;
   readonly envelopes: Envelopes;
+  private readonly env: RuntimeEnv;
   private readonly migration: z.infer<typeof MigrationApprovalSchema> | null;
 
   constructor(env: RuntimeEnv, owner: string, envelopes = configuredEnvelopes(env)) {
@@ -256,6 +268,7 @@ export class AppleSessionRepository {
     if (typeof owner !== "string" || owner.length < 1 || owner.length > 256) throw new AppError("VALIDATION_ERROR", "An authenticated owner is required.", 400);
     this.db = env.DB.withSession("first-primary");
     this.owner = owner;
+    this.env = env;
     this.envelopes = envelopes;
     this.migration = null;
     if (env.APPLE_SESSION_RETENTION_MIGRATION_JSON) {
@@ -266,6 +279,15 @@ export class AppleSessionRepository {
       if (!approval.success || !env.REMINDERS_OWNER_ID || approval.data.owner !== env.REMINDERS_OWNER_ID) throw new AppError("CONFIGURATION_REQUIRED", "The retention migration approval must bind the configured owner, account and generation.", 503);
       this.migration = approval.data;
     }
+  }
+
+  private async clearPreviousDriveState(generation: number) {
+    // Existing deployments without Drive tables keep their current setup flow.
+    // Strictly older generations prevents deleting a concurrent new session.
+    if (this.env.REMINDERS_OWNER_ID !== this.owner) return;
+    const { DriveOperationRepository } = await import("./drive-operations.ts");
+    const repository = new DriveOperationRepository(this.env, this.owner);
+    if (await repository.available()) await repository.clearBeforeGeneration(generation);
   }
 
   private async ensureRow() {
@@ -283,7 +305,8 @@ export class AppleSessionRepository {
         // Use the restored row's metadata, rather than comparing it with an
         // earlier status SELECT while a concurrent operation advances the version.
         return { ...saved.fence, state: saved.state, action: saved.action,
-          nextAttemptAt: saved.session.pcs.nextAttemptAt, transportReady: saved.state === "READY",
+          nextAttemptAt: saved.session.pcs.nextAttemptAt, transportReady: sessionServices(saved.session, saved.state, saved.action).reminders.state === "READY",
+          services: sessionServices(saved.session, saved.state, saved.action), accountAuthenticated: true,
           liveReadValidated: false, expiresAt: saved.session.login.expiresAt,
           retentionDays: (saved.session.login.expiresAt - saved.session.login.verifiedAt) / 86_400_000,
           retentionSource: saved.session.login.version === 3 ? saved.session.login.retentionSource : "legacy-consent",
@@ -303,7 +326,7 @@ export class AppleSessionRepository {
       state: validState,
       action: null,
       nextAttemptAt: row?.next_attempt_at ?? 0,
-      transportReady: false,
+      transportReady: false, services: null, accountAuthenticated: false,
       liveReadValidated: false,
       expiresAt: null,
       retentionDays: null, retentionSource: null, lastValidatedAt: null, lastAppleSuccessAt: null,
@@ -324,6 +347,7 @@ export class AppleSessionRepository {
     const row = await this.db.prepare("UPDATE apple_session_state SET generation = generation + 1, version = version + 1, state = 'CONNECTING', action = NULL, next_attempt_at = 0, envelope = NULL, transaction_id = ?, transaction_expires_at = ?, resume_id = NULL, resume_expires_at = NULL, updated_at = ? WHERE owner_id = ? AND account_id = ? AND generation = ? AND version = ? RETURNING generation, version")
       .bind(transactionId, expiresAt, now, this.owner, ACCOUNT, expectedGeneration, version.version).first<FenceRow>();
     if (!row) throw new AppError("CONFLICT", "The Apple session changed. Refresh status and retry setup.", 409);
+    await this.clearPreviousDriveState(row.generation);
     return { generation: row.generation, version: row.version, transactionId, expiresAt };
   }
 
@@ -363,7 +387,11 @@ export class AppleSessionRepository {
     return result !== null;
   }
 
-  private invalidateSnapshot(fence: SessionFence) { return this.invalidate(fence); }
+  private async invalidateSnapshot(fence: SessionFence, cause: "missing-envelope" | "envelope-verification" | "session-schema" | "row-state") {
+    const invalidated = await this.invalidate(fence);
+    if (invalidated) console.warn({ event: "apple-session-invalidated", cause, generation: fence.generation });
+    return invalidated;
+  }
 
   async load() { return this.loadSnapshot(); }
 
@@ -403,7 +431,7 @@ export class AppleSessionRepository {
     const fence = { generation: row.generation, version: row.version };
     if (row.transaction_id !== null) throw new AppError("CONFLICT", "An Apple setup operation is active. The saved session was not changed.", 409, true);
     if (!row.envelope) {
-      await this.invalidateSnapshot(fence);
+      await this.invalidateSnapshot(fence, "missing-envelope");
       throw invalidSession();
     }
     let decoded: unknown;
@@ -414,13 +442,13 @@ export class AppleSessionRepository {
       decoded = await this.envelopes.decrypt<unknown>(envelope, context);
     } catch (error) {
       if (error instanceof AppError && error.code === "CONFIGURATION_REQUIRED") throw error;
-      await this.invalidateSnapshot(fence);
+      await this.invalidateSnapshot(fence, "envelope-verification");
       throw invalidSession();
     }
     const parsed = AppleSessionSchema.safeParse(decoded);
     const actionValid = row.state === "READY" ? row.action === null : !!row.action && APPROVAL_ACTIONS.includes(row.action as ApprovalAction);
     if (!parsed.success || !actionValid || row.next_attempt_at !== parsed.data?.pcs.nextAttemptAt) {
-      await this.invalidateSnapshot(fence);
+      await this.invalidateSnapshot(fence, !parsed.success ? "session-schema" : "row-state");
       throw invalidSession();
     }
     if (await this.migrateRetention(row, parsed.data)) {
@@ -495,6 +523,15 @@ export class AppleSessionRepository {
     const row = await this.db.prepare("SELECT 1 AS active FROM apple_session_state WHERE owner_id = ? AND account_id = ? AND generation = ? AND version = ? AND state = 'READY' AND transaction_id IS NULL AND resume_id = ? AND resume_expires_at > ?")
       .bind(this.owner, ACCOUNT, fence.generation, fence.version, fence.resumeId, now + 10_000).first<{ active: number }>();
     if (!row) throw new AppError("CONFLICT", "The Apple session changed or the preparation budget expired. Refresh before retrying; no write was sent.", 409, true);
+  }
+
+  // Drive and future services share the account fence without depending on
+  // Reminders consent. Service readiness and permission remain caller guards.
+  async assertAccountLease(fence: ResumeFence) {
+    const now = Date.now();
+    const row = await this.db.prepare("SELECT 1 AS active FROM apple_session_state WHERE owner_id = ? AND account_id = ? AND generation = ? AND version = ? AND state IN ('READY', 'DEVICE_APPROVAL_PENDING') AND transaction_id IS NULL AND resume_id = ? AND resume_expires_at > ?")
+      .bind(this.owner, ACCOUNT, fence.generation, fence.version, fence.resumeId, now + 10_000).first<{ active: number }>();
+    if (!row) throw new AppError("CONFLICT", "The Apple account changed or the preparation budget expired. No operation may be dispatched.", 409, true);
   }
 
   async claimRenewal(expectedGeneration: number, expectedVersion: number) {
@@ -582,8 +619,13 @@ export class AppleSessionRepository {
       const now = Date.now();
       const updated = await this.db.prepare("UPDATE apple_session_state SET generation = generation + 1, version = version + 1, state = 'DISCONNECTED', action = NULL, next_attempt_at = 0, envelope = NULL, transaction_id = NULL, transaction_expires_at = NULL, resume_id = NULL, resume_expires_at = NULL, updated_at = ? WHERE owner_id = ? AND account_id = ? AND generation = ? AND version = ? RETURNING generation")
         .bind(now, this.owner, ACCOUNT, current.generation, current.version).first<{ generation: number }>();
-      if (updated) return { generation: updated.generation, state: "DISCONNECTED" as const };
+      if (updated) {
+        await this.clearPreviousDriveState(updated.generation);
+        return { generation: updated.generation, state: "DISCONNECTED" as const };
+      }
     }
     throw new AppError("CONFLICT", "The Apple session changed repeatedly while disconnecting. Retry disconnect.", 409, true);
   }
 }
+
+export { requireRemindersConnection };
