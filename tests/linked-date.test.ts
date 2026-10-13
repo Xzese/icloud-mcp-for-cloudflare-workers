@@ -14,7 +14,8 @@ import { dateComponents, decodeDateComponents, dueDateNonce } from "../src/remin
 
 import { RecurrenceChanges, readRecurrence } from "../src/reminders/recurrence.ts";
 import { verifySchedulingWrite } from "../src/reminders/scheduling-plan.ts";
-import { nextRecurringDue, planRecurringCompletion, recurringIdentities } from "../src/reminders/recurring-lifecycle.ts";
+import { nextRecurringDue, planRecurringCompletion, recurringIdentities, verifyRecurringExpected } from "../src/reminders/recurring-lifecycle.ts";
+import { RecurringIntentSchema } from "../src/persistence/apple-sessions.ts";
 import { planRecurringDeletion } from "../src/reminders/recurring-deletion.ts";
 import { planDateAlarmLifecycle } from "../src/reminders/date-alarm-lifecycle.ts";
 import { RecurrenceCalendarTimeZone, recurrenceEndCalendarLabel } from "../src/reminders/recurrence-calendar.ts";
@@ -857,6 +858,12 @@ test("recurring completion preserves encoded history, advances calendar dates an
   assert.equal(nextRecurringDue("2027-01-31T00:00:00Z", null, true, "last-day-monthly"), "2027-02-28T00:00:00.000Z");
   assert.equal(nextRecurringDue("2027-02-28T00:00:00Z", null, true, "last-day-monthly"), "2027-03-31T00:00:00.000Z");
   assert.equal(nextRecurringDue("2026-10-20T00:00:00Z", null, true, "daily"), "2026-10-21T00:00:00.000Z");
+  for (const [before, after, hours] of [["2027-03-27T09:00:00Z", "2027-03-28T08:00:00.000Z", 23], ["2027-10-30T08:00:00Z", "2027-10-31T09:00:00.000Z", 25]] as const) {
+    assert.equal(nextRecurringDue(before, "Europe/London", false, "daily"), after);
+    assert.equal((Date.parse(after) - Date.parse(before)) / 3_600_000, hours);
+  }
+  for (const due of ["2027-03-27T01:30:00Z", "2027-10-30T00:30:00Z"])
+    assert.throws(() => nextRecurringDue(due, "Europe/London", false, "daily"), hasCode("UNSUPPORTED_FEATURE"));
   const values = records(), root = values[0];
   root.fields.TitleDocument = { ...(root.fields.TitleDocument as object), type: "ENCRYPTED_BYTES" };
   const list: CloudKitRecord = { recordName: listId, recordType: "List", recordChangeTag: "list-before", zoneID, raw: {}, fields: {
@@ -903,6 +910,123 @@ test("recurring completion preserves encoded history, advances calendar dates an
   await assert.rejects(client(undefined, true).modifyRecurringCompletion(plan, async () => {}), hasCode("WRITE_OUTCOME_UNKNOWN"));
   for (const type of ["Alarm", "AlarmTrigger"] as const) await assert.rejects(client(undefined, false, type).modifyRecurringCompletion(plan, async () => {}), hasCode("WRITE_OUTCOME_UNKNOWN"));
   assert.equal(dispatches, 7);
+  const dailyRecords = (due: string) => {
+    const source = records(); source[0].fields.DueDate = { type: "TIMESTAMP", value: Date.parse(due) };
+    source[0].fields.Flagged = { type: "INT64", value: 1 }; source[0].fields.Priority = { type: "INT64", value: 5 };
+    source[0].fields.TitleDocument = { ...(source[0].fields.TitleDocument as object), type: "ENCRYPTED_BYTES", nativeDocumentMetadata: "preserve" };
+    source[0].fields.UrgentPresentationAlarmsAsData = { type: "ASSETID", nativeWrapperMetadata: "preserve", value: {
+      downloadURL: "https://synthetic.invalid/first", wrappingKey: "synthetic-wrapping", referenceSignature: "synthetic-reference", fileChecksum: "synthetic-content", size: 64,
+    } };
+    source[0].fields.UrgentPresentationAlarmsChecksum = { type: "STRING", value: "synthetic-policy-checksum", nativeChecksumMetadata: "preserve" };
+    source[2].fields.DateComponentsData = { type: "BYTES", value: b64(utf8(JSON.stringify(dateComponents(due, "Europe/London", true)))) };
+    source[3].fields.Frequency = { type: "INT64", value: 0 };
+    return source;
+  };
+  const timedDaily = dailyRecords("2027-03-27T09:00:00Z"), timedDailyBefore = structuredClone(timedDaily), dailyTime = Date.parse("2027-03-27T12:00:00Z");
+  const timedDailyGraph = await loadSchedulingGraph(timedDaily[0], owner, lookup(timedDaily));
+  const dailyPlan = await planRecurringCompletion(timedDailyGraph, list, owner, ids, dailyTime);
+  assert.equal(dailyPlan.active.recordName, timedDaily[0].recordName); assert.equal(dailyPlan.mode, "advance");
+  assert.equal(dailyPlan.active.fields.DueDate.value, Date.parse("2027-03-28T08:00:00Z"));
+  assert.deepEqual(Object.keys(dailyPlan.active.fields).sort(), ["AlarmIDs", "Completed", "CompletionDate", "DueDate", "LastModifiedDate", "ResolutionTokenMap"]);
+  for (const key of ["DueDate", "CreationDate", "Flagged", "Priority", "TimeZone"])
+    assert.deepEqual(dailyPlan.history!.fields[key], timedDaily[0].fields[key]);
+  assert.equal(dailyPlan.history!.fields.TitleDocument.value, (timedDaily[0].fields.TitleDocument as { value: string }).value);
+  assert.equal(dailyPlan.history!.fields.TitleDocument.type, "STRING"); assert.deepEqual(dailyPlan.history!.fields.RecurrenceRuleIDs.value, []);
+  assert.deepEqual(dailyPlan.retired.slice().sort(), [alarmId, triggerId].sort()); assert.equal(dailyPlan.operations.length, 9);
+  assert.deepEqual(dailyPlan.guards, [timedDaily[3]]); assert.equal(dailyPlan.guards[0].recordChangeTag, "rule-before");
+  assert.deepEqual(JSON.parse(String(dailyPlan.membership!.fields.ReminderIDs.value)), ["KEEP", ids.history, timedDaily[0].recordName.slice(9), "OTHER"]);
+  const pairs = dailyPlan.operations.filter(operation => operation.operationType === "create" && operation.record.recordType === "AlarmTrigger");
+  assert.deepEqual(pairs.map(operation => decodeDateComponents(operation.record.fields.DateComponentsData.value)),
+    [dateComponents("2027-03-28T08:00:00Z", "Europe/London", true), dateComponents("2027-03-27T09:00:00Z", "Europe/London", true)]);
+  const presentationEntry = dailyPlan.expected.find(entry => entry.id === timedDaily[0].recordName)!;
+  assert.match(presentationEntry.presentationHash!, /^[a-f0-9]{64}$/);
+  assert.equal(dailyPlan.expected.filter(entry => entry.presentationHash !== undefined).length, 1);
+  assert.ok(plan.expected.every(entry => entry.presentationHash === undefined), "Legacy weekly intent projections are unchanged.");
+  const intent = { requestFingerprint: await fingerprint({ synthetic: "daily-completion" }), sourceFingerprint: dailyPlan.sourceFingerprint,
+    timestamp: dailyTime, phase: "dispatched", ids, expected: dailyPlan.expected, retired: dailyPlan.retired };
+  assert.ok(RecurringIntentSchema.safeParse(intent).success);
+  const legacyExpected = intent.expected.map(({ id, type, hash }) => ({ id, type, hash }));
+  assert.ok(RecurringIntentSchema.safeParse({ ...intent, expected: legacyExpected }).success);
+  assert.equal(RecurringIntentSchema.safeParse({ ...intent, expected: intent.expected.map(entry => ({ ...entry, presentationHash: "invalid" })) }).success, false);
+  let dailyDispatches = 0;
+  const dailyReceipt = (variant?: string): CloudKitRecord[] => [...dailyPlan.operations.filter(operation => operation.operationType !== "delete").map(operation => {
+    const before = [...timedDaily, list].find(record => record.recordName === operation.record.recordName);
+    const record: CloudKitRecord = { ...operation.record, recordChangeTag: "daily-confirmed", zoneID, raw: { ...before?.raw, ...(operation.record.parent ? { parent: operation.record.parent } : {}) },
+      fields: structuredClone({ ...before?.fields, ...operation.record.fields }) };
+    if (record.recordName === dailyPlan.active.recordName) {
+      const asset = record.fields.UrgentPresentationAlarmsAsData as { value: Record<string, unknown>; nativeWrapperMetadata?: string };
+      asset.value.downloadURL = "https://synthetic.invalid/refreshed";
+      if (variant === "crypto") asset.value.wrappingKey = "changed";
+      if (variant === "reference") asset.value.referenceSignature = "changed";
+      if (variant === "content") asset.value.fileChecksum = "changed";
+      if (variant === "size") asset.value.size = 65;
+      if (variant === "wrapper") asset.nativeWrapperMetadata = "changed";
+      if (variant === "checksum") record.fields.UrgentPresentationAlarmsChecksum = { type: "STRING", value: "changed" };
+      if (variant === "checksum-wrapper") record.fields.UrgentPresentationAlarmsChecksum = { ...(record.fields.UrgentPresentationAlarmsChecksum as object), nativeChecksumMetadata: "changed" };
+      if (variant === "omission") delete record.fields.UrgentPresentationAlarmsAsData;
+      if (variant === "checksum-omission") delete record.fields.UrgentPresentationAlarmsChecksum;
+    }
+    if (record.recordName === dailyPlan.history!.recordName) record.fields.TitleDocument = { ...(record.fields.TitleDocument as object), type: "ENCRYPTED_BYTES", serverMetadata: "normalized-copy" };
+    return record;
+  }), { ...timedDaily[3], recordChangeTag: "rule-confirmed" }];
+  const dailyClient = (variant?: string) => new CloudKitRemindersClient(new AppleHTTP(new CookieJar(), async (_, init) => {
+    dailyDispatches++; const payload = JSON.parse(String(init?.body)); assert.equal(payload.atomic, true); assert.equal(payload.operations.length, 10);
+    if ([alarmId, ruleId, listId].includes(variant ?? "")) return Response.json({ records: payload.operations.map((operation: { record: CloudKitRecord }) => ({ recordName: operation.record.recordName,
+      serverErrorCode: operation.record.recordName === variant ? "CONFLICT" : "ATOMIC_ERROR" })) });
+    return Response.json({ records: [...dailyReceipt(variant).map(record => ({ ...record, parent: record.raw.parent })), ...dailyPlan.retired.map(recordName => ({ recordName, deleted: true }))].reverse() });
+  }), { dsid: "123", clientId: "synthetic", clientBuildNumber: "synthetic", clientMasteringNumber: "synthetic", cloudKitURL: "https://p01-ckdatabasews.icloud.com/database/1/com.apple.reminders/production/private", remindersZoneOwner: owner });
+  await dailyClient().modifyRecurringCompletion(dailyPlan, async () => {});
+  for (const stale of [alarmId, ruleId, listId]) await assert.rejects(dailyClient(stale).modifyRecurringCompletion(dailyPlan, async () => {}), hasCode("CONFLICT"));
+  await assert.rejects(dailyClient("crypto").modifyRecurringCompletion(dailyPlan, async () => {}), hasCode("WRITE_OUTCOME_UNKNOWN"));
+  const confirmedDaily = dailyReceipt(), recoveryReads = await lookup(confirmedDaily)(dailyPlan.expected.map(entry => entry.id));
+  // The original dispatched intent is checked using only current records; no
+  // regenerated IDs, guessed presentation policy or repeat writes are needed.
+  await verifyRecurringExpected(RecurringIntentSchema.parse(intent).expected, recoveryReads.records, owner);
+  await assert.rejects(verifyRecurringExpected(intent.expected, [...timedDaily, list], owner), hasCode("WRITE_OUTCOME_UNKNOWN"));
+  await assert.rejects(verifyRecurringExpected(intent.expected, confirmedDaily.filter(record => record.recordName !== ruleId), owner), hasCode("WRITE_OUTCOME_UNKNOWN"));
+  for (const drift of ["crypto", "reference", "content", "size", "wrapper", "checksum", "checksum-wrapper", "omission", "checksum-omission"])
+    await assert.rejects(verifyRecurringExpected(intent.expected, dailyReceipt(drift), owner), hasCode("WRITE_OUTCOME_UNKNOWN"));
+  await verifyRecurringExpected(legacyExpected, dailyReceipt("crypto"), owner);
+  assert.equal(dailyDispatches, 5, "Recovery verification never dispatches another write.");
+  const regenerated = structuredClone(timedDaily); (regenerated[0].fields.UrgentPresentationAlarmsAsData as { value: Record<string, unknown> }).value.downloadURL = "https://synthetic.invalid/new-read";
+  const regeneratedPlan = await planRecurringCompletion(await loadSchedulingGraph(regenerated[0], owner, lookup(regenerated)), list, owner, ids, dailyTime);
+  assert.equal(regeneratedPlan.sourceFingerprint, dailyPlan.sourceFingerprint); assert.deepEqual(regeneratedPlan.expected, dailyPlan.expected);
+  const historyRoot = confirmedDaily.find(record => record.recordName === dailyPlan.history!.recordName)!;
+  const historyGraph = await loadSchedulingGraph(historyRoot, owner, lookup(confirmedDaily)); assert.equal(historyGraph.records.length, 3);
+  const ordinaryReopen = planDateAlarmLifecycle("reopen", { listId, reminderId: historyRoot.recordName, recordChangeTag: historyRoot.recordChangeTag! }, historyGraph,
+    confirmedDaily.find(record => record.recordName === listId)!, owner, dailyTime + 1000);
+  assert.equal(ordinaryReopen.write.fields.Completed.value, 0);
+  assert.deepEqual(timedDaily, timedDailyBefore, "Planning and recovery preserve the original read-only graph.");
+  const fallDaily = dailyRecords("2027-10-30T08:00:00Z");
+  assert.equal((await planRecurringCompletion(await loadSchedulingGraph(fallDaily[0], owner, lookup(fallDaily)), list, owner, ids, Date.parse("2027-10-30T12:00:00Z"))).active.fields.DueDate.value, Date.parse("2027-10-31T09:00:00Z"));
+  const absentPresentation = structuredClone(timedDaily); delete absentPresentation[0].fields.UrgentPresentationAlarmsAsData; delete absentPresentation[0].fields.UrgentPresentationAlarmsChecksum;
+  const absentPlan = await planRecurringCompletion(await loadSchedulingGraph(absentPresentation[0], owner, lookup(absentPresentation)), list, owner, ids, dailyTime);
+  const absentReceipt = dailyReceipt(); const absentRoot = absentReceipt.find(record => record.recordName === absentPlan.active.recordName)!;
+  delete absentRoot.fields.UrgentPresentationAlarmsAsData; delete absentRoot.fields.UrgentPresentationAlarmsChecksum;
+  await verifyRecurringExpected(absentPlan.expected, absentReceipt, owner);
+  absentRoot.fields.UrgentPresentationAlarmsChecksum = { type: "STRING", value: "replacement" };
+  await assert.rejects(verifyRecurringExpected(absentPlan.expected, absentReceipt, owner), hasCode("WRITE_OUTCOME_UNKNOWN"));
+  for (const variant of ["no-alarm", "no-zone", "offset-zone", "all-day", "ended", "interval", "tags", "family", "early", "location", "gap", "fold", "nonce"]) {
+    const bad = dailyRecords(variant === "gap" ? "2027-03-27T01:30:00Z" : variant === "fold" ? "2027-10-30T00:30:00Z" : "2027-03-27T09:00:00Z");
+    if (variant === "no-alarm") { bad[0].fields.AlarmIDs = { type: "UNKNOWN_LIST", value: [] }; bad.splice(1, 2); }
+    if (variant === "no-zone") delete bad[0].fields.TimeZone;
+    if (variant === "offset-zone") bad[0].fields.TimeZone = { type: "STRING", value: "+01:00" };
+    if (variant === "all-day") bad[0].fields.AllDay = { type: "INT64", value: 1 };
+    if (variant === "ended") bad[3].fields.EndDate = { type: "TIMESTAMP", value: Date.parse("2027-03-28T00:00:00Z") };
+    if (variant === "interval") bad[3].fields.Interval = { type: "INT64", value: 2 };
+    if (variant === "tags") bad[0].fields.HashtagIDs = { type: "STRING_LIST", value: ["synthetic-tag"] };
+    if (variant === "family") bad[0].fields.ChildReminderIDs = { type: "STRING_LIST", value: ["synthetic-child"] };
+    if (variant === "early") bad[0].fields.DueDateDeltaAlertsData = { type: "BYTES", value: b64(utf8("[]")) };
+    if (variant === "location") bad[2].fields.Type = { type: "STRING", value: "Location" };
+    if (variant === "nonce") bad[1].fields.DueDateResolutionTokenAsNonce = { type: "DOUBLE", value: 0 };
+    const badGraph = await loadSchedulingGraph(bad[0], owner, lookup(bad));
+    await assert.rejects(planRecurringCompletion(badGraph, list, owner, ids, variant === "fold" ? Date.parse("2027-10-30T12:00:00Z") : dailyTime),
+      hasCode(variant === "nonce" ? "CONFLICT" : "UNSUPPORTED_FEATURE"));
+  }
+  await assert.rejects(planRecurringCompletion(timedDailyGraph, list, owner, ids, dailyTime, "complete", "Europe/London"), hasCode("UNSUPPORTED_FEATURE"));
+  const completedDaily = structuredClone(timedDaily); completedDaily[0].fields.Completed = { type: "INT64", value: 1 }; completedDaily[0].fields.CompletionDate = { type: "TIMESTAMP", value: dailyTime };
+  await assert.rejects(planRecurringCompletion(await loadSchedulingGraph(completedDaily[0], owner, lookup(completedDaily)), list, owner, undefined, dailyTime, "reopen"), hasCode("UNSUPPORTED_FEATURE"));
+  for (const scope of ["occurrence", "all_future"] as const) await assert.rejects(planRecurringDeletion(timedDailyGraph, list, owner, scope, undefined, dailyTime), hasCode("UNSUPPORTED_FEATURE"));
   const endedWeekly = records(), weeklyDue = "2026-10-19T08:00:00Z", weeklyEnd = "2026-10-26T09:00:00Z";
   endedWeekly[0].fields.DueDate = { type: "TIMESTAMP", value: Date.parse(weeklyDue) };
   endedWeekly[2].fields.DateComponentsData = { type: "BYTES", value: b64(utf8(JSON.stringify(dateComponents(weeklyDue, "Europe/London")))) };

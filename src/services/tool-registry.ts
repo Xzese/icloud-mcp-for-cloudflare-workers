@@ -3,11 +3,13 @@ import { isServicePermissionEnabled, type ServicePermission, type ServiceSetting
 // Shared by discovery, status and dispatch. Unknown names never inherit access.
 export const TOOL_PERMISSIONS: Readonly<Record<string, ServicePermission>> = Object.freeze({
   ...Object.fromEntries([
+    "get_reminder_view", "export_reminders", "get_reminder_filters", "run_reminder_filter", "inspect_reminder", "get_reminder_list_sections",
     "get_reminder_lists", "get_reminders", "search_reminders", "get_reminder", "get_reminder_organization",
     "get_all_open_reminders", "get_reminder_list", "get_reminder_list_appearance", "get_shopping_categories",
     "prepare_reminder_update", "get_reminder_job", "preview_reminder_job",
   ].map(name => [name, "reminders.read" as const])),
   ...Object.fromEntries([
+    "save_reminder_filter", "delete_reminder_filter", "create_reminder_workflow", "duplicate_reminder_list",
     "set_reminder_url", "set_reminder_tags", "move_reminder", "copy_reminder", "create_reminder", "create_subtask",
     "set_reminder_parent", "update_reminder_list_appearance", "set_reminder_category", "create_reminder_list",
     "rename_reminder_list", "delete_reminder_list", "update_reminder", "complete_reminder", "reopen_reminder", "delete_reminder",

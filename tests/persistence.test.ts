@@ -869,7 +869,7 @@ test("session restoration follows bounded same-generation progress without adopt
   } finally { db.afterStatement = null; db.sqlite.close(); }
 });
 
-test("tampered ciphertext fails closed and an invalid decrypted snapshot is invalidated", async () => {
+test("tampered ciphertext fails closed while unsupported authenticated snapshots remain retained and unusable", async () => {
   const db = new SQLiteD1(); const envelopes = key(); const repository = appleRepo(db, owner, envelopes);
   const setup = await repository.begin(0);
   await repository.commit(setup, appleSession(), "READY");
@@ -889,10 +889,12 @@ test("tampered ciphertext fails closed and an invalid decrypted snapshot is inva
   const invalidContext = { ...context, generation: second.generation };
   const invalidSnapshot = await envelopes.encrypt({ ...appleSession(), unexpectedProof: "must-not-persist" }, invalidContext);
   db.sqlite.prepare("UPDATE apple_session_state SET envelope = ? WHERE owner_id = ?").run(JSON.stringify(invalidSnapshot), owner);
-  await assert.rejects(repository.load());
-  assert.equal((await repository.status()).state, "DISCONNECTED");
-  const invalidated = db.sqlite.prepare("SELECT envelope FROM apple_session_state WHERE owner_id = ?").get(owner) as { envelope: string | null };
-  assert.equal(invalidated.envelope, null);
+  await assert.rejects(repository.load(), (error: unknown) => error instanceof AppError && error.code === "PROTOCOL_CHANGED");
+  await assert.rejects(repository.status(), (error: unknown) => error instanceof AppError && error.code === "PROTOCOL_CHANGED");
+  const retained = db.sqlite.prepare("SELECT generation, state, envelope FROM apple_session_state WHERE owner_id = ?").get(owner) as { generation: number; state: string; envelope: string | null };
+  assert.equal(retained.envelope, JSON.stringify(invalidSnapshot));
+  assert.equal(retained.generation, second.generation);
+  assert.equal(retained.state, "READY");
 });
 
 
@@ -1602,6 +1604,32 @@ test("Shopping category read and move bind cursor scope and confirm native asset
     await assert.rejects(service().readShoppingCategoriesForMCP({ expectedGeneration: setup.generation, listId: unrelatedListId, continuation: cursor }), hasCode("CONFLICT"));
     await assert.rejects(new AppleConnectionService(env, "synthetic-other-owner").readShoppingCategoriesForMCP({ expectedGeneration: setup.generation, listId, continuation: cursor }), AppError);
     assert.equal(requests.length, requestsBeforeScopeChecks, "Wrong List and owner-scoped cursor use fail before Apple is contacted.");
+
+    const beforeInspection = requests.length;
+    const inspect = () => service().inspectReminder({ expectedGeneration: setup.generation, listId, reminderId });
+    const inspected = await inspect();
+    assert.deepEqual(inspected.category, { status: "known", assignment: {
+      categoryId: previousCategoryId, name: "Pantry", canonicalName: "pantry", recordChangeTag: previousCategory.recordChangeTag,
+    }, reason: null });
+    const inspectionRequests = requests.slice(beforeInspection);
+    assert.equal(inspectionRequests.filter(request => request.path.endsWith("/changes/zone")).length, 0, "Selected category inspection does not scan the category catalogue.");
+    assert.equal(inspectionRequests.filter(request => request.path.endsWith("/records/lookup"))
+      .flatMap(request => request.body!.records).filter((record: { recordName: string }) => record.recordName.startsWith("ListSection/")).length, 1);
+    assert.ok(!JSON.stringify(inspected).includes(membershipAssetURL) && !JSON.stringify(inspected).includes("synthetic-memberships-v1-key"));
+    assert.equal(modifyCount, 0); assert.equal(uploadedBytes.size, 0, "Inspection cannot stage assets or mutate Apple.");
+    const originalMembershipAsset = currentList.fields.MembershipsOfRemindersInSectionsAsData;
+    const originalMembershipChecksum = currentList.fields.MembershipsOfRemindersInSectionsChecksum;
+    const unassigned = { ...memberships, memberships: memberships.memberships.filter(member => member.memberID !== reminderUUID) };
+    assetContents.set(membershipAssetURL, encodeSectionMemberships(unassigned));
+    currentList.fields.MembershipsOfRemindersInSectionsAsData = assetReference("synthetic-unassigned", assetContents.get(membershipAssetURL)!, membershipAssetURL);
+    currentList.fields.MembershipsOfRemindersInSectionsChecksum = { type: "STRING", value: await membershipsChecksum(unassigned), isEncrypted: true };
+    assert.deepEqual((await inspect()).category, { status: "known", assignment: null, reason: null });
+    currentList.fields.MembershipsOfRemindersInSectionsChecksum = originalMembershipChecksum;
+    const uncertainCategory = (await inspect()).category;
+    assert.equal(uncertainCategory.status, "unknown"); assert.equal(uncertainCategory.assignment, null);
+    assert.ok(uncertainCategory.reason);
+    currentList.fields.MembershipsOfRemindersInSectionsAsData = originalMembershipAsset;
+    assetContents.set(membershipAssetURL, membershipBytes);
 
     const beforeSession = await repository.load();
     const mutation = await service().setShoppingCategory({

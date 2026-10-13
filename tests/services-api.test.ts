@@ -4,6 +4,11 @@ import { applicationRoute } from "../src/api/router.ts";
 import { JobSQLiteD1 } from "./helpers/sqlite-d1.ts";
 import { b64 } from "../src/crypto/bytes.ts";
 import { DEFAULT_SERVICE_SETTINGS } from "../src/services/settings.ts";
+import { AppError } from "../src/errors.ts";
+import { AppleConnectionService } from "../src/auth/service.ts";
+import { ConnectorFilterRepository } from "../src/persistence/connector-filters.ts";
+import { CreateWorkflowService, createWorkflowAppleFacade } from "../src/reminders/create-workflow.ts";
+import { listDuplicationAppleFacade } from "../src/reminders/list-duplication-apple.ts";
 
 test("owner dashboard settings change MCP discovery and direct permission enforcement without Apple calls", async () => {
   const db = new JobSQLiteD1();
@@ -28,6 +33,14 @@ test("owner dashboard settings change MCP discovery and direct permission enforc
     const list = async () => (await request("/mcp", { jsonrpc: "2.0", id: 1, method: "tools/list", params: {} })).data.result.tools.map((tool: { name: string }) => tool.name) as string[];
     assert.ok((await list()).includes("get_reminders"));
     assert.ok(!(await list()).includes("list_icloud_drive_items"));
+    const newReadTools = ["get_reminder_view", "export_reminders", "get_reminder_filters", "run_reminder_filter", "inspect_reminder", "get_reminder_list_sections"];
+    const newWriteTools = ["save_reminder_filter", "delete_reminder_filter", "create_reminder_workflow", "duplicate_reminder_list"];
+    const initialTools = await list();
+    assert.ok([...newReadTools, ...newWriteTools].every(name => initialTools.includes(name)));
+    const apple = new AppleConnectionService(env, "test-owner"), filters = new ConnectorFilterRepository(env, "test-owner");
+    const filterId = crypto.randomUUID();
+    const filter = { filterId, name: "Synthetic view", definition: { view: "all" as const, timeZone: "UTC", sortBy: "title" as const, filters: { status: "open" as const } } };
+    await filters.save(filter);
     const settings = { reminders: { enabled: false, read: false, write: false }, drive: { enabled: true, browse: true, contents: false, upload: true, organize: false } };
     assert.equal((await request("/api/settings", { expectedRevision: 0, settings })).status, 200);
     assert.equal((await request("/api/settings", { expectedRevision: 0, settings })).status, 409);
@@ -36,6 +49,26 @@ test("owner dashboard settings change MCP discovery and direct permission enforc
     assert.ok(tools.includes("upload_icloud_drive_file"));
     assert.ok(!tools.includes("get_reminders"));
     assert.ok(!tools.includes("read_icloud_drive_file"));
+    assert.ok([...newReadTools, ...newWriteTools].every(name => !tools.includes(name)));
+    for (const name of [...newReadTools, ...newWriteTools]) {
+      const result = await request("/mcp", { jsonrpc: "2.0", id: 4, method: "tools/call", params: { name, arguments: {} } });
+      assert.ok(result.data.error || result.data.result?.isError, name);
+    }
+    const forbidden = (error: unknown) => error instanceof AppError && error.code === "FORBIDDEN";
+    const listId = `List/${crypto.randomUUID().toUpperCase()}`, reminderId = `Reminder/${crypto.randomUUID().toUpperCase()}`;
+    const collection = { ...filter.definition, referenceInstant: "2026-10-13T12:00:00Z" };
+    await assert.rejects(apple.collectRemindersForMCP(collection, 0), forbidden);
+    await assert.rejects(apple.readReminderListSectionsForMCP({ expectedGeneration: 0, listId }), forbidden);
+    await assert.rejects(apple.readDuplicationList(0, listId), forbidden);
+    await assert.rejects(filters.list(), forbidden);
+    await assert.rejects(filters.get(filterId), forbidden);
+    await assert.rejects(filters.save(filter), forbidden);
+    await assert.rejects(filters.delete({ filterId, expectedRevision: 1 }), forbidden);
+    const facade = createWorkflowAppleFacade(env, "test-owner", apple);
+    await assert.rejects(facade.binding(), forbidden);
+    await assert.rejects(new CreateWorkflowService(env, "test-owner", facade).run({}), forbidden);
+    await assert.rejects(listDuplicationAppleFacade(env, "test-owner", apple), forbidden);
+    assert.equal((await request("/api/reminders/inspect", { expectedGeneration: 0, listId, reminderId })).data.error.code, "FORBIDDEN");
     assert.equal((await request("/mcp", { jsonrpc: "2.0", id: 9, method: "tools/list", params: { padding: "x".repeat(70_000) } })).status, 413);
     const disabled = await request("/mcp", { jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "get_reminders", arguments: {} } });
     assert.ok(disabled.data.error || disabled.data.result?.isError);
@@ -43,6 +76,17 @@ test("owner dashboard settings change MCP discovery and direct permission enforc
     const status = await request("/mcp", { jsonrpc: "2.0", id: 3, method: "tools/call", params: { name: "connection_status", arguments: {} } });
     assert.equal(status.data.result?.isError, undefined, JSON.stringify(status.data));
     assert.equal(status.data.result.structuredContent.services.drive.ready, false);
+    assert.equal(status.data.result.structuredContent.capabilities.standardSectionsRead, false);
+    assert.ok([...newReadTools, ...newWriteTools].every(name => !status.data.result.structuredContent.mcpTools.includes(name)));
+    const readOnlySettings = { ...settings, reminders: { enabled: true, read: true, write: false } };
+    assert.equal((await request("/api/settings", { expectedRevision: 1, settings: readOnlySettings })).status, 200);
+    const readOnlyTools = await list();
+    assert.ok(newReadTools.every(name => readOnlyTools.includes(name)));
+    assert.ok(newWriteTools.every(name => !readOnlyTools.includes(name)));
+    assert.equal((await filters.get(filterId)).name, filter.name);
+    await assert.rejects(filters.save(filter), forbidden);
+    await assert.rejects(filters.delete({ filterId, expectedRevision: 1 }), forbidden);
+    assert.equal(db.sqlite.prepare("SELECT COUNT(*) AS count FROM apple_session_state").get()?.count, 0);
     assert.equal(sends, 0);
   } finally { globalThis.fetch = originalFetch; db.sqlite.close(); }
 });

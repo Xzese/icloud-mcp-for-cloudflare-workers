@@ -138,6 +138,27 @@ back into the result. Soft-deleted and missing are different states. This exact 
 fresh tags and resolves uncertain outcomes even when the item has disappeared from the
 ordinary app list. The requested list must still be available and authorized.
 
+### `inspect_reminder`
+
+**Input:** exact `listId`, `reminderId`, optional MCP `expectedGeneration` and
+`recurrenceCalendarTimeZone`. **Result:** current normalized `record`, readable `schedule`,
+`organization`, `category`, `subtasks`, and `actions` for complete/reopen/delete/move/copy/update.
+
+This is a bounded, read-only inspection of a nondeleted reminder. Schedule and organization
+sections distinguish `known` from `unknown`; null or empty values in an unknown section do
+not establish absence. Shopping membership resolves only the selected category, without
+enumerating the entire category catalogue. Subtask details identify the selected reminder's
+children and its one-level family. Raw Apple records, signed asset links and private early-alert
+metadata are excluded. Use `get_reminder` for soft-deleted or missing-item reconciliation.
+
+Each action reports `supported`, `unsupported` or `requires_input`, with a reason, affected
+existing reminder IDs and missing inputs. Lifecycle checks reuse native planners; recurring
+completion can also create a fresh history identity at execution. Moves/copies still need a
+destination and exact List versions. Updates direct callers to `prepare_reminder_update` with
+the proposed changes. An ended all-day recurrence can require an explicit calendar zone;
+recurring deletion requires an explicit deletion scope. Inspection creates no mutation intent
+or write authorization and reserves no versions. Actual mutations repeat their checks.
+
 ### `search_reminders`
 
 **Input:** optional `listId`, `text`, `status` (`open` by default, `completed` or `all`),
@@ -229,6 +250,32 @@ The values come from native captures, with app round trips verifying appearance.
 clearing colour/badge, standard symbol badges, pinning, groups and sections have no write
 contract here. After uncertainty, read appearance rather than retrying the original write.
 See [appearance evidence](native-reminders-parity.md#native-list-appearance-acceptance).
+
+## Standard-list sections
+
+### `get_reminder_list_sections`
+
+**Input:** exact `listId`, optional `expectedGeneration`, `limit` (1–200, default 200)
+and returned UUID `continuation`. **Result:** section IDs/names/version tags, memberships,
+`orderedSectionIds`, `orderingStatus`, current `listRecordChangeTag`, and pagination state.
+Only owned private Standard lists are supported; Shopping lists use `get_shopping_categories`.
+Shared lists, groups and Smart Lists are refused.
+
+Reads use the type-filtered `ListSection` metadata change feed, current exact lookups and
+the selected List's checksum-verified membership and ordering assets. Empty materialised
+sections can be found even without memberships. Each call reads one feed page; an empty
+page can still return a continuation. Merge sections by `sectionId`. `complete` becomes
+true only at the end of the metadata feed. It does not imply a cached snapshot.
+
+Keep list, generation and page limit fixed, use each new single-use continuation within
+ten minutes, and restart after expiry, repeated native pagination or a List-version change.
+Each page rechecks the List version before returning. At most 200 sections/memberships are
+supported. `orderingStatus: "explicit"` reports the persisted ordering asset;
+`"not_materialized"` returns an empty `orderedSectionIds` without guessing native default
+order. No raw records, asset URLs or reminder bodies are persisted or returned.
+
+This read tool provides no section creation, rename, deletion, move or reorder operation.
+See [native read evidence](native-reminders-parity.md#standard-section-read-evidence).
 
 ## Shopping categories
 
@@ -537,6 +584,10 @@ ordinary lifecycle recipe.
 - **Timed weekly:** childless interval-one root in its stored IANA zone, zero or one supported
   absolute-date pair. A supported end must be on an exact weekly occurrence and local clock.
   Earlier occurrences advance with history; the final completes/reopens in place.
+- **Timed daily completion:** non-ended childless interval-one root in its stored IANA
+  zone with exactly one absolute-date pair. Advancement preserves the local clock across
+  daylight-saving changes; missing or repeated next local times are refused. Active-series
+  reopening, ended completion and timed daily deletion require separate evidence.
 - **All-day daily:** childless interval-one root at midnight UTC, without stored zone/alarms.
   Inclusive end interpretation without
   `recurrenceCalendarTimeZone` requires a midnight-UTC end. With an explicit valid IANA zone,
@@ -547,7 +598,8 @@ ordinary lifecycle recipe.
   `[28,29,30,31]` and set position `[-1]`, advancing actual month ends and creating history.
   This is distinct from an arbitrary monthly recurrence or a guessed hidden anchor.
 
-For weekly advancement with an absolute-date alarm, Apple creates separate fresh Alarm/
+For supported weekly or timed daily advancement with an absolute-date alarm, Apple creates
+separate fresh Alarm/
 AlarmTrigger pairs for next active and completed history and retires the exact old pair.
 History retains its own old-date pair; reopening it retains that pair. The connector follows
 that graph transition, not a shared alarm redirected to the next date. Final supported
@@ -593,7 +645,7 @@ Queue consumer or cron runner; `executionMode` is always `request-driven`. Only 
 
 ### `create_reminder_job`
 
-**Input:** `kind` (`bulk_create` or `bulk_delete`), UUID `idempotencyKey`, required
+**Input:** `kind` (`bulk_create`, `bulk_delete`, `bulk_update` or `bulk_complete`), UUID `idempotencyKey`, required
 `expectedGeneration`. **Result:** empty encrypted draft, `jobId`, revision and expiry.
 
 It saves no Apple mutation. The normalized UUID is the recovery/job ID, so a lost response
@@ -603,13 +655,15 @@ expires within 24 hours or the original fixed session deadline, whichever is ear
 ### `append_reminder_job_items`
 
 **Input:** `jobId`, UUID `chunkKey`, current `expectedRevision`, ordered `items`; each item
-has `kind`, unique `clientItemKey` and strict creation or exact-delete `input`.
+has `kind`, unique `clientItemKey` and strict operation `input`.
 **Result:** updated draft/revision and counts.
 
 Append 1–50 items per request within 64 KiB; the job supports up to 1,000 items/2 MiB input.
 Stable chunk keys prevent duplicate ingestion; changed reuse or concurrent revisions conflict.
-Create items retain their own UUIDs, so equal titles do not collapse. Delete items retain
-their exact versions; no dynamic search selection or automatic tag refresh is allowed.
+Create items retain their own UUIDs, so equal titles do not collapse. Other items retain
+their exact list/reminder/version. Updates also include nonempty `changes` limited to title,
+notes, priority, flagged, dueDate, timeZone and allDay; omitted fields remain untouched.
+No dynamic search selection or automatic tag refresh is allowed.
 This stages authorized inputs without changing Apple.
 
 ### `preview_reminder_job`
@@ -617,8 +671,11 @@ This stages authorized inputs without changing Apple.
 **Input:** `jobId`, current `expectedRevision`. **Result:** sealed immutable manifest,
 counts, first-page summaries/results and ten-minute preview token.
 
-It validates the entire manifest and read-only preflights delete targets. Missing, stale,
-duplicate, recurring, alarmed, nested and parent deletes fail explicitly and never dispatch.
+It validates the entire manifest and read-only preflights delete, update and completion
+targets. Missing, stale, duplicate, recurring, alarmed, nested and parent targets fail
+explicitly and never dispatch. Updates/completion additionally exclude early alerts and
+start dates; date transitions that change linked scheduling fields, including all-day
+conversions, must be reviewed individually.
 Review additional pages through `get_reminder_job` before authorization. Sealing and token
 binding prevent the accepted work changing between review and start; a token is not user
 authorization and preview performs no Apple write.
@@ -633,6 +690,10 @@ work **without executing an Apple mutation in this request**. Call `continue_rem
 for progress, respecting `nextRetryAt` and reviewing unknown or paused states. Each delete repeats single-item checks and never
 cascades a newly discovered family; a post-commit native child is reported as `SUBTASKS_REMAIN`
 or an incomplete-check warning. Execution order does not promise native display order.
+Updates and completion also repeat exact-version and childless-root checks, with a List
+version guard. Completion cannot silently expand to a family operation. A lost response
+remains unknown; recovery compares the persisted planned fields, including implicit date
+changes, without resubmitting the mutation.
 
 ### `get_reminder_job`
 
@@ -716,6 +777,7 @@ MCP requires the authenticated owner and rejects a supplied foreign `Origin`.
 | `POST /api/apple/read` | Required `expectedGeneration` and strict controlled-read `action`; diagnostic dashboard reads described below. It is not the MCP normalized-output contract. |
 | `POST /api/mutations` | Required `expectedGeneration` plus strict `action` and matching single-reminder tool arguments. Returns the same mutation service result. No raw-record/force-write interface. |
 | `POST /api/reminder-updates/prepare` | Same input/result as `prepare_reminder_update`; required generation and exact graph/request binding. |
+| `POST /api/reminders/inspect` | Same input/result as `inspect_reminder`, with required `expectedGeneration`; no Apple writes. |
 | `POST /api/reminder-jobs` | Same as `create_reminder_job`. |
 | `POST /api/reminder-jobs/:jobId/append`, `/preview`, `/start`, `/cancel`, `/resume`, `/continue` | Same as corresponding job tool; omit `jobId` from JSON because it is in the route. |
 | `GET /api/reminder-jobs/:jobId?offset=0&limit=50` | Same paged read as `get_reminder_job`; only `offset`/`limit` query parameters are accepted. |
@@ -754,3 +816,35 @@ claiming new parity; document connector-specific safeguards separately. Authorit
 implementation entry points are [MCP registration](../src/mcp/handler.ts),
 [public output schemas](../src/mcp/schemas.ts), [HTTP routing](../src/api/router.ts),
 [connection/mutation service](../src/auth/service.ts) and [job schemas](../src/jobs/schemas.ts).
+
+## Connector collections, export and saved filters
+
+`get_reminder_view` and `export_reminders` scan complete live search results before sorting or
+exporting. Supply `timeZone`, `referenceInstant`, optional `view`, `upcomingDays`, `sortBy`,
+`filters` and `expectedGeneration`. Export adds `format: "json" | "csv"`. Public bounds are
+25 pages, 1,000 scanned records, 512 KiB and 30 seconds; exceeding a bound returns an error
+without partial records. These tools do not mutate Apple.
+
+`save_reminder_filter`, `get_reminder_filters`, `run_reminder_filter` and
+`delete_reminder_filter` manage independent encrypted owner-scoped connector definitions.
+Migration 0003 is required; updates/deletion use exact filter revisions. A run needs a new
+explicit reference instant. See [examples and semantics](connector-collections.md).
+
+## Durable connector creation and list duplication
+
+`create_reminder_workflow` accepts a stable `workflowId`, `create` fields, optional one-feature
+`schedule`, `url`, `tags` and optional `expectedGeneration`. It invokes the existing create,
+prepared-update and organization contracts in order. It returns per-stage confirmed, pending,
+blocked or uncertain progress. Repeating a persisted started/uncertain stage performs only
+read-only reconciliation. Migration 0004 is required. See [workflow contracts](create-workflows.md).
+
+`duplicate_reminder_list` accepts a stable `duplicationId`, exact `sourceListId`,
+`sourceListRecordChangeTag`, destination `name` and optional `expectedGeneration`. It performs
+complete bounded preflight of at most 20 eligible open undated childless roots, then creates
+and populates a new Standard list through existing native copy operations. Native groups,
+sections/order/appearance, completed history and schedules are excluded. Migration 0005 is
+required. Read-only uncertainty and exact-version rules are in [the duplication contract](list-duplication.md).
+
+Confirmed move/copy responses may include `listVersions` with both exact List tags from that
+atomic operation. Read-only copy reconciliation omits them. An observed later List version is
+not a receipt from the original write.

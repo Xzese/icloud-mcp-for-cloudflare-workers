@@ -54,14 +54,18 @@ acknowledgement returns uncertainty; the original stale arguments cannot dispatc
 Read the exact reminder and related records before considering a different action.
 
 Recurring completion has separate root-only recipes: interval-one timed weekly recurrence
-in an IANA zone, with zero or one absolute date alarm; all-day daily recurrence without a
+in an IANA zone, with zero or one absolute date alarm; non-ended timed daily recurrence in
+a stored IANA zone with exactly one absolute-date pair; all-day daily recurrence without a
 stored time zone; and the observed all-day last-day monthly rule. Calendar advancement
 preserves local time across clock changes. The active ID remains open at the next due date;
 `completedOccurrence` returns a fresh completed reminder at the previous date, without a
 recurrence link. History retains the original creation date and encoded title/notes documents.
 The List membership inserts history immediately before the active record. Alarmed weekly
-completion retires only the old exact Alarm/AlarmTrigger and creates separate pairs for the
-next active occurrence and the completed history, in the same atomic group.
+and supported timed daily completion retires only the old exact Alarm/AlarmTrigger and creates separate pairs for the
+next active occurrence and the completed history, in the same atomic group. Timed daily
+completion refuses a missing or repeated next local time. Its retained intent also guards
+the active root’s opaque urgency presentation fields; unexpected changes remain uncertain
+and cannot cause redispatch. It does not modify notification or device permissions.
 
 The encrypted session retains a bounded occurrence intent before dispatch: original request
 fingerprint, selected IDs/time, source/expected hashes and dispatch phase, without reminder
@@ -372,6 +376,10 @@ The eight `*_reminder_job*` lifecycle tools stage, preview, start, read, cancel,
 continue encrypted durable manifests. Simple bulk creation is a normal ready-account capability
 once the job schema is installed, without a rollout flag;
 simple bulk deletion is permanent with a read-only preview preflight and per-item single-delete checks.
+Migration `0004_bulk_change_jobs.sql` adds bulk updates and completion for exact-version
+ordinary childless roots without linked schedules. Updates support text, priority, flag and
+simple date changes; conversions that change linked scheduling fields require an individual
+prepared update. Preview and dispatch use the same planner and recheck family eligibility.
 Both deployment targets honestly advertise request-driven execution, not background progress.
 Recovered dispatch intent is never automatically replayed; desired state observed without a
 receipt stays unknown. See [job contracts, limits and migration](reminder-jobs.md).

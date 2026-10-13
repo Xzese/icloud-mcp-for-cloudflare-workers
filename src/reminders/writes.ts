@@ -5,6 +5,7 @@ import { RecurrenceChanges } from "./recurrence.ts";
 import { LocationAlarmChange } from "./location-alarm.ts";
 import { EarlyReminder } from "./early-reminder.ts";
 import { encodeDocument } from "./crdt.ts";
+import { ListId } from "./identifiers.ts";
 
 // Write fields and resolution-token shapes follow pyicloud's MIT-licensed Reminders _writes.py and _protocol.py pinned references.
 const UNSAFE_TEXT_CONTROLS = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]/;
@@ -59,7 +60,7 @@ function validTimeZone(value: string): boolean {
   }
 }
 
-const listId = z.string().min(6).max(255).regex(/^List\/[\x21-\x2e\x30-\x7e]+$/, "Expected a canonical List/<ASCII suffix> ID.").describe("Exact list ID from get_reminder_lists; do not use a list title or invent an ID.");
+const listId = ListId.describe("Exact list ID from get_reminder_lists; do not use a list title or invent an ID.");
 const reminderId = z.string().min(10).max(255).regex(/^Reminder\/[\x21-\x2e\x30-\x7e]+$/, "Expected a canonical Reminder/<ASCII suffix> ID.").describe("Exact reminder ID from a previous read or mutation result, in the selected list.");
 const idempotencyKey = z.string().uuid().describe("Generate one UUID for each distinct new reminder. Retain this key and identical creation inputs to reconcile an uncertain creation; never generate a replacement key for that attempt.");
 const title = z.string().min(1).max(2048).refine(value => value.trim().length > 0 && safeText(value), "Title must be nonblank text without unsafe controls or unpaired surrogates.").describe("Nonblank plain-text title, up to 2,048 UTF-16 code units. Editing it replaces that field's formatting.");

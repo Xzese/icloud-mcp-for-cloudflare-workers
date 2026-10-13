@@ -9,6 +9,7 @@ import type { RuntimeEnv } from "../platform/sites.ts";
 import { validatedAppleURL } from "../transport/apple-http.ts";
 import { LoginAssuranceSchema, RETENTION_POLICY, SESSION_RETENTION_MS, requireCurrentLogin, type LoginAssurance } from "../auth/apple/policy.ts";
 import { RenewalCheckpointSchema, type RenewalCheckpoint } from "../auth/apple/session-renewal.ts";
+import { SectionScanSchema, type SectionScan } from "../reminders/sections.ts";
 
 const ACCOUNT = "apple-reminders";
 const RECORD = "apple-session";
@@ -111,7 +112,7 @@ export const RecurringIntentSchema = z.object({
   ids: z.object({ history: z.string().uuid().optional(), activeAlarm: z.string().uuid().optional(), activeTrigger: z.string().uuid().optional(),
     historyAlarm: z.string().uuid().optional(), historyTrigger: z.string().uuid().optional(), replicas: z.array(z.string().uuid()).length(24) }).strict(),
   expected: z.array(z.object({ id: z.string().max(255), type: z.enum(["Reminder", "List", "RecurrenceRule", "Alarm", "AlarmTrigger"]),
-    hash: z.string().regex(/^[a-f0-9]{64}$/) }).strict()).min(3).max(8),
+    hash: z.string().regex(/^[a-f0-9]{64}$/), presentationHash: z.string().regex(/^[a-f0-9]{64}$/).optional() }).strict()).min(3).max(8),
   retired: z.array(z.string().max(255)).max(2),
   mode: z.enum(["final", "reopen"]).optional(),
   recurrenceCalendarTimeZone: RecurrenceCalendarTimeZone.optional(),
@@ -163,6 +164,7 @@ export const AppleSessionSchema = z.preprocess(discardRetiredCatalogueState, z.o
   allOpenScan: AllOpenScanSchema.optional(),
   searchScan: SearchScanSchema.optional(),
   categoryScan: CategoryScanSchema.optional(),
+  sectionScan: SectionScanSchema.optional(),
   recurringIntents: z.array(RecurringIntentSchema).max(256).refine(items => new Set(items.map(item => item.requestFingerprint)).size === items.length).optional(),
   copyIntents: z.array(z.object({ id: z.string().uuid(), requestFingerprint: z.string().regex(/^[a-f0-9]{64}$/),
     contentFingerprint: z.string().regex(/^[a-f0-9]{64}$/) }).strict()).max(128).optional(),
@@ -190,6 +192,7 @@ export type AppleSession = {
   allOpenScan?: AllOpenScan;
   searchScan?: SearchScan;
   categoryScan?: CategoryScan;
+  sectionScan?: SectionScan;
   recurringIntents?: RecurringIntent[];
   copyIntents?: { id: string; requestFingerprint: string; contentFingerprint: string }[];
   savedLists?: SavedList[];
@@ -446,9 +449,18 @@ export class AppleSessionRepository {
       throw invalidSession();
     }
     const parsed = AppleSessionSchema.safeParse(decoded);
+    // An authenticated envelope may have been written by a newer checkout.
+    // Refuse unsupported data without destroying the retained credentials.
+    if (!parsed.success) {
+      const login = LoginAssuranceSchema.safeParse(decoded && typeof decoded === "object" && "login" in decoded ? decoded.login : undefined);
+      if (!login.success) { await this.invalidateSnapshot(fence, "session-schema"); throw invalidSession(); }
+      try { requireCurrentLogin(login.data); }
+      catch (error) { await this.invalidate(fence, "local-retention-expired"); throw error; }
+      throw new AppError("PROTOCOL_CHANGED", "This checkout cannot read the saved Apple session format. Use a compatible version; the retained session was not changed.", 503);
+    }
     const actionValid = row.state === "READY" ? row.action === null : !!row.action && APPROVAL_ACTIONS.includes(row.action as ApprovalAction);
-    if (!parsed.success || !actionValid || row.next_attempt_at !== parsed.data?.pcs.nextAttemptAt) {
-      await this.invalidateSnapshot(fence, !parsed.success ? "session-schema" : "row-state");
+    if (!actionValid || row.next_attempt_at !== parsed.data.pcs.nextAttemptAt) {
+      await this.invalidateSnapshot(fence, "row-state");
       throw invalidSession();
     }
     if (await this.migrateRetention(row, parsed.data)) {
@@ -523,6 +535,25 @@ export class AppleSessionRepository {
     const row = await this.db.prepare("SELECT 1 AS active FROM apple_session_state WHERE owner_id = ? AND account_id = ? AND generation = ? AND version = ? AND state = 'READY' AND transaction_id IS NULL AND resume_id = ? AND resume_expires_at > ?")
       .bind(this.owner, ACCOUNT, fence.generation, fence.version, fence.resumeId, now + 10_000).first<{ active: number }>();
     if (!row) throw new AppError("CONFLICT", "The Apple session changed or the preparation budget expired. Refresh before retrying; no write was sent.", 409, true);
+  }
+
+  /** Last transport gate: session and settings are read from one database snapshot. */
+  async assertRemindersTransport(fence: ResumeFence, settings: { revision: number; available: boolean }, mutation: boolean) {
+    const values: (string | number)[] = [this.owner, ACCOUNT, fence.generation, fence.version, fence.resumeId, Date.now() + (mutation ? 10_000 : 0)];
+    // Do not reference a missing table: SQLite resolves names even in an unused
+    // CASE branch. Installing settings during a legacy request must fence it out.
+    const settingsPredicate = settings.available
+      ? "((? = 0 AND NOT EXISTS (SELECT 1 FROM owner_service_settings WHERE owner_id = ?)) OR EXISTS (SELECT 1 FROM owner_service_settings WHERE owner_id = ? AND revision = ?))"
+      : "NOT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'owner_service_settings')";
+    if (settings.available) values.push(settings.revision, this.owner, this.owner, settings.revision);
+    const row = await this.db.prepare(`SELECT
+      EXISTS (SELECT 1 FROM apple_session_state WHERE owner_id = ? AND account_id = ? AND generation = ? AND version = ?
+        AND state = 'READY' AND transaction_id IS NULL AND resume_id = ? AND resume_expires_at > ?) AS lease_active,
+      ${settingsPredicate} AS settings_current`)
+      .bind(...values).first<{ lease_active: number; settings_current: number }>();
+    if (!row?.lease_active || !row.settings_current) {
+      throw new AppError("CONFLICT", "The Apple lease or service permissions changed before transport dispatch. No request was sent; retained intents must be reconciled before retrying.", 409);
+    }
   }
 
   // Drive and future services share the account fence without depending on

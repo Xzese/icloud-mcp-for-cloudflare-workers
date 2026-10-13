@@ -3,13 +3,13 @@ import { AppError } from "../errors.ts";
 import { createResolutionTokenMap, updateResolutionTokenMap } from "./writes.ts";
 import { normalizeList, type CloudKitRecord } from "../icloud/cloudkit.ts";
 import { UpdateListAppearanceInput, colorValueForPreset, nativeEmojiField } from "./list-appearance.ts";
+import { ListId } from "./identifiers.ts";
 
 const safeName = z.string().min(1).max(256).refine(value =>
   value.trim().length > 0 && !/[\u0000-\u001f\u007f-\u009f]/.test(value) &&
   !/[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/u.test(value),
   "List names must contain visible text and no invalid control characters.");
-const listId = z.string().min(6).max(255).regex(/^List\/[\x21-\x2e\x30-\x7e]+$/)
-  .describe("Exact list ID returned by a Reminders list read; do not use a title or invent an ID.");
+const listId = ListId;
 const version = z.string().min(1).max(512).refine(value => !/[\u0000-\u001f\u007f]/.test(value))
   .describe("Current Apple version tag returned by the list read. A stale tag returns CONFLICT; refresh before making a new write.");
 const name = safeName.describe("Visible, nonblank list name, up to 256 characters.");

@@ -17,12 +17,13 @@ excluded from public source. Framework-generated Wrangler JSON stays inside `dis
 
 D1 holds encrypted Apple-session envelopes in `apple_session_state`. Envelope associated data
 binds owner/account/generation/schema. Versioned leases fence concurrent setup, consent, reads, writes
-and disconnect. `schema.sql` defines the session and additive job tables for a new deployment. Local setup
+and disconnect. `schema.sql` defines the session, job, saved-filter and workflow tables for a new deployment. Local setup
 and tests execute it directly using native D1. Standalone operators initialize D1 with Wrangler's
-`d1 execute --file schema.sql`. The Sites build copies it into the platform's SQL initialization
-layout at `dist/.openai/drizzle/0000_schema.sql`; this is a generated build artifact, not a separate
-schema source or a dependency on Drizzle. Setup uses `CREATE TABLE IF NOT EXISTS` to preserve
-existing data when repeated. Schema changes to an existing database need a separate upgrade plan.
+`d1 execute --file schema.sql`. The Sites build copies the immutable `migrations/0000`–`0007` history into
+`dist/.openai/drizzle/`; pending migrations upgrade existing databases while preserving jobs
+and encrypted sessions. Artifact verification compares fresh `schema.sql` and migrated schemas.
+No Drizzle dependency or migration generation is needed. Standalone upgrades must apply their
+missing migrations in order; repeating the fresh initializer does not upgrade existing tables.
 
 The credential document's standalone browser bundle performs password proof processing. The
 Worker handles bounded Apple HTTP/WebSocket exchanges, trusted-device verification and PCS
@@ -69,7 +70,7 @@ on commit.
 Version-1 session compatibility strips only recognized obsolete catalogue fields. The next successful
 commit removes those fields from encrypted storage. Historical or unmarked old all-open continuations
 are retired without disconnecting the Apple session; direct operation selections remain valid.
-No D1 migration or reset is needed. Unknown active fields still fail strict validation.
+No D1 migration or reset is needed. Unknown active fields still fail strict validation. Authenticated snapshots with current verified login evidence remain encrypted and untouched when their schema is unsupported; this checkout returns `PROTOCOL_CHANGED`. Missing/invalid login assurance, expired retention and tampered ciphertext still fail closed under the existing invalidation rules.
 
 Dashboard polling reads saved state only. There is no scheduled handler, local background timer or
 historical fallback. Generated standalone configs omit triggers; operators must remove previously
@@ -101,8 +102,15 @@ exists. Only an authenticated continuation runs a slice. Status and start reques
 execute work. Simple bulk creation is a permanent
 ready-account capability once the job schema is installed;
 simple bulk deletion reuses the single-delete checks per item, with a read-only preview preflight and post-commit subtask report.
+Bulk updates and completion require migration `0004_bulk_change_jobs.sql` and exact-version
+ordinary childless roots. Their previews and dispatch share the same mutation planner;
+uncertain recovery compares the persisted write, including implicit date changes.
 Recovered dispatch intent is read-only reconciled and stays unknown without a valid receipt.
-The new [job documentation](reminder-jobs.md) defines lifecycle, limits, retention and migration.
+The [job documentation](reminder-jobs.md) defines lifecycle, limits, retention and migration.
+
+`inspect_reminder` reads bounded native relationships and runs the existing lifecycle and
+transfer planners to report action eligibility. Unknown relationships remain explicit;
+inspection neither reserves versions nor creates mutation intent.
 
 Read-only update preparation fingerprints bounded allowlisted linked records and binds a
 short-lived token to the exact request. The atomic executor preserves the Reminder mutation
@@ -112,6 +120,11 @@ request and all bounds, and their complete confirmed fields must match the inspe
 Controlled native stale-version experiments proved rejection without partial commits for those
 three types. The bounded scheduling graph also follows the observed Alarm `TriggerID` UUID
 to its exact AlarmTrigger. Structural completeness is separate from recipe support.
+`src/reminders/sections.ts` performs bounded Standard-list section hydration with checksum
+validation and List-version checks. Its independent encrypted continuation is bound to the
+account, generation, exact List version and page size; no reminder bodies or signed asset
+URLs are persisted. Native ordering is reported only when its explicit asset exists.
+
 `src/reminders/linked-date.ts` validates timed absolute-date backlinks, components and nonce
 consistency. Its narrow executor updates the existing Alarm nonce and Trigger components in
 the same group as the Reminder, guarding optional unchanged recurrence. Every confirmed
@@ -147,3 +160,15 @@ membership recipes; they do not invent a universal native predicate for unrefere
 The provenance directory preserves upstream references and licenses. Checked-in synthetic fixtures
 exercise the pinned protocol reference, not a live Apple account. See SECURITY.md for invariants
 and README.md for separate provisioning and identity requirements.
+
+## Connector collections and saved filters
+
+The bounded collection helper composes the existing paginated search API. It freezes the requested
+Apple generation, follows empty pages, refuses duplicate identities or incomplete pages, and sorts
+only complete results. Timezone views compare all-day calendar components separately from timed
+instants. JSON/CSV exports contain only normalized records; CSV cells neutralize formula prefixes.
+Body collection stays in request memory, with no new catalogue or background scheduler.
+
+Saved definitions are encrypted independently of Apple login in the owner-scoped
+`connector_filters` table (migration 0005). SQL enforces quota and revision guards; native Smart List
+storage is unaffected. See [connector collection contracts](connector-collections.md).

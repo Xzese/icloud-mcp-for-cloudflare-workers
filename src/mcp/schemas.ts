@@ -66,11 +66,41 @@ export const ReminderLookupOutput = z.object({
   missing: z.boolean().describe("True only when Apple reports the exact item absent. A soft-deleted item may instead be returned with record.deleted=true."),
 }).strict();
 
+const collectionMetadata = {
+  generation: counter, pagesRead: counter, complete: z.literal(true), consistency: z.literal("live-pages-not-snapshot"),
+  view: z.enum(["all", "overdue", "today", "upcoming", "untagged"]), timeZone: z.string(), referenceInstant: z.string(),
+  upcomingDays: counter, sortBy: z.enum(["due", "priority", "title", "created"]),
+};
+export const ReminderCollectionOutput = z.object({ ...collectionMetadata, records: z.array(ReminderOutput).max(1000) }).strict();
+export const ReminderExportOutput = z.object({ ...collectionMetadata, format: z.enum(["json", "csv"]), count: counter, content: z.string() }).strict();
+
 export const ReminderOrganizationOutput = z.object({
   generation: counter, reminderId: z.string(), recordChangeTag: z.string(),
   url: z.object({ id: z.string(), url: z.string() }).strict().nullable(),
   tags: z.array(z.object({ id: z.string(), name: z.string() }).strict()),
   otherAttachmentIds: z.array(z.string()).describe("Opaque IDs of attachments that are preserved; their contents are not exposed."),
+}).strict();
+
+const inspectionStatus = z.enum(["known", "unknown"]);
+const actionCheck = z.object({
+  status: z.enum(["supported", "unsupported", "requires_input"]), reason: z.string(),
+  affectedReminderIds: z.array(z.string()).max(31), requiredInputs: z.array(z.string()).max(8),
+}).strict();
+export const ReminderInspectionOutput = z.object({
+  generation: counter, record: ReminderOutput, inspectionOnly: z.literal(true),
+  schedule: z.object({ status: inspectionStatus, dueDate: text, timeZone: text, allDay: flag,
+    recurrence: RecurrenceSummary.nullable(), earlyReminder: z.object({ unit: z.enum(EARLY_UNITS), count: counter }).strict().nullable(),
+    locationAlarm: LocationAlarmSummary.nullable(), reason: text,
+  }).strict(),
+  organization: z.object({ status: inspectionStatus, url: z.object({ id: z.string(), url: z.string() }).strict().nullable(),
+    tags: z.array(z.object({ id: z.string(), name: z.string() }).strict()).max(31), otherAttachmentIds: z.array(z.string()).max(31), reason: text,
+  }).strict(),
+  category: z.object({ status: z.enum(["known", "unknown", "not_applicable"]), assignment: z.object({
+    categoryId: z.string(), name: z.string(), canonicalName: text, recordChangeTag: z.string(),
+  }).strict().nullable(), reason: text }).strict(),
+  subtasks: z.object({ status: inspectionStatus, parentReminderId: text, childIds: z.array(z.string()).max(30).nullable(),
+    familyIds: z.array(z.string()).max(31).nullable(), reason: text }).strict(),
+  actions: z.object({ complete: actionCheck, reopen: actionCheck, delete: actionCheck, move: actionCheck, copy: actionCheck, update: actionCheck }).strict(),
 }).strict();
 
 export const ShoppingCategoriesOutput = z.object({
@@ -92,6 +122,16 @@ export const ShoppingCategoriesOutput = z.object({
   pendingReason: z.enum(["continuation"]).nullable(),
   pagesRead: counter,
   writesEnabled: z.boolean(),
+}).strict();
+
+export const ReminderListSectionsOutput = z.object({
+  generation: counter, listId: z.string(), listRecordChangeTag: z.string(),
+  sections: z.array(z.object({ sectionId: z.string(), name: z.string(), canonicalName: text, recordChangeTag: z.string() }).strict()).max(200),
+  memberships: z.array(z.object({ reminderId: z.string(), sectionId: z.string() }).strict()).max(200),
+  orderedSectionIds: z.array(z.string()).max(200),
+  orderingStatus: z.enum(["explicit", "not_materialized"]),
+  complete: z.boolean(), paginationComplete: z.boolean(), continuation: z.string().uuid().nullable(),
+  pendingReason: z.enum(["continuation"]).nullable(), pagesRead: counter,
 }).strict();
 
 export const ShoppingCategoryMutationOutput = z.object({
@@ -129,6 +169,7 @@ export const AllOpenOutput = z.object({
 export const ReminderSearchOutput = z.object({
   generation: counter,
   records: z.array(ReminderOutput),
+  scannedRecords: counter.describe("Reminder records read before scalar and organization filtering on this page."),
   recordErrors: z.array(recordError),
   complete: z.boolean().describe("True only after every page in the selected owned private lists finished without errors."),
   paginationComplete: z.boolean(),
@@ -154,7 +195,12 @@ export function MutationOutput(action: "create" | "update" | "complete" | "reope
     ...(action === "complete" ? { completedOccurrence: ReminderOutput.optional().describe("Fresh completed history when recurrence advances. Absent for ordinary completion or when a supported ended daily/weekly recurrence completes its final active occurrence in place.") } : {}),
     affectedRecords: z.array(ReminderOutput).max(31).describe("Reminder records mutated atomically, including a root touched by direct child deletion. Unchanged family members are version guarded.").optional(),
   }).strict();
-  return action === "create" || action === "create_subtask" || action === "copy" ? result.extend({ idempotencyKey: z.string().uuid() }).strict() : result;
+  if (action === "move" || action === "copy") return result.extend({
+    ...(action === "copy" ? { idempotencyKey: z.string().uuid() } : {}),
+    listVersions: z.array(z.object({ listId: z.string(), recordChangeTag: z.string() }).strict()).length(2).optional()
+      .describe("Exact List versions from this confirmed transfer. Absent for read-only copy reconciliation; do not adopt unrelated later reads as operation receipts."),
+  }).strict();
+  return action === "create" || action === "create_subtask" ? result.extend({ idempotencyKey: z.string().uuid() }).strict() : result;
 }
 
 export const ExactListOutput = z.object({
@@ -222,15 +268,16 @@ export const ConnectionStatusOutput = z.object({
   phase: z.enum(["read-only", "read-write"]),
   capabilities: z.object({
     liveRead: z.boolean(), controlledRead: z.boolean(), listReminders: z.boolean(),
-    allOpenReminders: z.boolean(), search: z.boolean(), create: z.boolean(),
+    allOpenReminders: z.boolean(), search: z.boolean(), connectorCollections: z.boolean(), boundedExport: z.boolean(), savedFilters: z.boolean(), compoundCreate: z.boolean(), listDuplication: z.boolean(), create: z.boolean(),
     update: z.boolean(), complete: z.boolean(), reopen: z.boolean(), delete: z.boolean(),
     prepareUpdate: z.boolean(), linkedScheduling: z.boolean(), reminderJobs: z.boolean(),
-    bulkCreate: z.boolean(), bulkDelete: z.boolean(), autonomousJobs: z.literal(false),
+    reminderInspection: z.boolean(), bulkCreate: z.boolean(), bulkDelete: z.boolean(), bulkUpdate: z.boolean(), bulkComplete: z.boolean(), autonomousJobs: z.literal(false),
     jobExecutionMode: z.literal("request-driven"),
     subtasks: z.boolean(), urls: z.boolean(), tags: z.boolean(), moveCopy: z.boolean(),
     createList: z.boolean(), renameList: z.boolean(), deleteList: z.boolean(),
     listAppearanceRead: z.boolean(), listAppearanceUpdate: z.boolean(),
     shoppingCategoriesRead: z.boolean().optional(), shoppingCategoriesUpdate: z.boolean().optional(),
+    standardSectionsRead: z.boolean().optional(),
   }).strict(),
   mcpTools: z.array(z.string()),
   message: z.string(),

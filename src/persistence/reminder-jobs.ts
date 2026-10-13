@@ -9,7 +9,7 @@ import { configuredEnvelopes } from "./apple-sessions.ts";
 
 export interface JobRow {
   owner_id: string; account_scope: string; job_id: string; job_key: string;
-  kind: "bulk_create" | "bulk_delete"; generation: number; state: JobStateData; revision: number;
+  kind: "bulk_create" | "bulk_delete" | "bulk_update" | "bulk_complete"; generation: number; state: JobStateData; revision: number;
   manifest_hash: string | null; item_count: number; input_bytes: number; expires_at: number;
   cancel_requested: number; next_eligible_at: number; lease_id: string | null; lease_until: number;
   mutation_id: string | null; created_at: number; updated_at: number;
@@ -90,7 +90,13 @@ export class ReminderJobRepository {
     const itemHashes = await Promise.all(values.map(value => fingerprint(value.clientItemKey)));
     if (new Set(itemHashes).size !== itemHashes.length) throw conflict("Client item keys must be unique within a manifest.");
     const inputHashes = await Promise.all(values.map(value => fingerprint(value.input)));
-    const keys = await Promise.all(values.map(value => fingerprint(value.kind === "bulk_create" ? ["create", value.input.idempotencyKey.toLowerCase()] : ["delete", value.input.listId, value.input.reminderId, value.input.recordChangeTag])));
+    const keys = await Promise.all(values.map(value => value.kind === "bulk_create"
+      ? fingerprint(["create", value.input.idempotencyKey.toLowerCase()])
+      : value.kind === "bulk_delete"
+        ? fingerprint(["delete", value.input.listId, value.input.reminderId, value.input.recordChangeTag])
+        : value.kind === "bulk_update"
+          ? fingerprint(["update", value.input.listId, value.input.reminderId, value.input.recordChangeTag])
+          : fingerprint(["complete", value.input.listId, value.input.reminderId, value.input.recordChangeTag])));
     if (new Set(keys).size !== keys.length) throw conflict("Mutation keys must be unique within the manifest.");
     for (const hash of keys) {
       const receipt = await this.db.prepare("SELECT job_id FROM reminder_job_receipts WHERE owner_id = ? AND account_scope = ? AND key_hash = ?").bind(this.owner, job.account_scope, hash).first();

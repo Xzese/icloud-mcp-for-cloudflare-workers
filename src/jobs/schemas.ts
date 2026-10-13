@@ -1,14 +1,21 @@
 import { z } from "zod";
-import { CreateReminderInput, ReminderTargetInput } from "../reminders/writes.ts";
+import { CreateReminderInput, ReminderTargetInput, UpdateReminderInput } from "../reminders/writes.ts";
 import { PreparationToken } from "../reminders/preparation.ts";
 
 export const JOB_LIMITS = { items: 1000, chunkItems: 50, chunkBytes: 65_536, inputBytes: 2_097_152, activeJobs: 5, sliceItems: 3, lifetimeMs: 86_400_000, leaseMs: 120_000, attempts: 5, pageItems: 50 } as const;
 export const JobState = z.enum(["draft", "ready", "queued", "running", "waiting_retry", "paused_auth", "needs_attention", "completed", "completed_with_errors", "cancelled", "expired"]);
 export const ItemState = z.enum(["pending", "preparing", "dispatching", "verifying", "succeeded", "failed", "conflict", "unknown", "cancelled"]);
-export const JobKind = z.enum(["bulk_create", "bulk_delete"]).describe("Immutable job kind. bulk_delete soft-deletes exact simple reminders with the single-delete checks; parents, subtasks, recurring and alarmed reminders are refused.");
+const BulkUpdateChanges = UpdateReminderInput.shape.changes.pick({ title: true, notes: true, priority: true, flagged: true, dueDate: true, timeZone: true, allDay: true })
+  .strict().refine(changes => Object.keys(changes).length > 0, "At least one simple reminder change is required.")
+  .describe("Nonempty changes to title, notes, priority, flagged, dueDate, timeZone or allDay. Omitted fields remain untouched.");
+export const BulkUpdateInput = UpdateReminderInput.extend({ changes: BulkUpdateChanges }).strict();
+export type BulkUpdateInputData = z.infer<typeof BulkUpdateInput>;
+export const JobKind = z.enum(["bulk_create", "bulk_delete", "bulk_update", "bulk_complete"]).describe("Immutable request-driven job kind. Bulk changes target exact simple reminder versions; parents, subtasks, recurring, alarmed and other linked reminders are refused.");
 export const JobItem = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("bulk_create"), clientItemKey: z.string().min(1).max(128).regex(/^[A-Za-z0-9._-]+$/), input: CreateReminderInput }).strict(),
   z.object({ kind: z.literal("bulk_delete"), clientItemKey: z.string().min(1).max(128).regex(/^[A-Za-z0-9._-]+$/), input: ReminderTargetInput }).strict(),
+  z.object({ kind: z.literal("bulk_update"), clientItemKey: z.string().min(1).max(128).regex(/^[A-Za-z0-9._-]+$/), input: BulkUpdateInput }).strict(),
+  z.object({ kind: z.literal("bulk_complete"), clientItemKey: z.string().min(1).max(128).regex(/^[A-Za-z0-9._-]+$/), input: ReminderTargetInput }).strict(),
 ]);
 export const JobIdentity = z.object({ jobId: z.string().uuid().toLowerCase().describe("Exact job UUID; equal to the normalized UUID job idempotency key, including after a lost acceptance response.") }).strict();
 export const CreateJob = z.object({ kind: JobKind, idempotencyKey: z.string().uuid().describe("Stable UUID for this job. Retain it; changed reuse conflicts and expired keys are never fresh requests."), expectedGeneration: z.number().int().nonnegative().safe().describe("Required session generation from connection_status; the job never adopts a replacement session.") }).strict();
@@ -17,6 +24,7 @@ export const PreviewJob = JobIdentity.extend({ expectedRevision: z.number().int(
 export const StartJob = JobIdentity.extend({ previewToken: PreparationToken.describe("Unexpired owner/account/session-bound token from preview_reminder_job for the exact sealed manifest. Not user authorization.") }).strict();
 export const GetJob = JobIdentity.extend({ offset: z.number().int().min(0).max(1000).default(0).describe("Original zero-based item ordinal where the result page starts."), limit: z.number().int().min(1).max(50).default(50).describe("Maximum result count, 1-50. Byte budgets may shorten the page; use nextOffset.") }).strict();
 export type JobItemData = z.infer<typeof JobItem>;
+export type BulkChangeItemData = Extract<JobItemData, { kind: "bulk_update" | "bulk_complete" }>;
 export type JobStateData = z.infer<typeof JobState>;
 export type ItemStateData = z.infer<typeof ItemState>;
 
@@ -35,7 +43,7 @@ export const JobOutput = z.object({
   executionMode: z.literal("request-driven"),
   revision: counter, expiresAt: counter, nextRetryAt: counter.nullable(), cancellationRequested: z.boolean(),
   counts: z.object({ total: counter, pending: counter, preparing: counter, dispatching: counter, verifying: counter, succeeded: counter, failed: counter, conflict: counter, unknown: counter, cancelled: counter }).strict(),
-  results: z.array(z.object({ ordinal: counter, clientItemKey: z.string(), input: z.union([CreateReminderInput, ReminderTargetInput]), status: ItemState, attempts: counter, result: JobResult.nullable() }).strict()),
+  results: z.array(z.object({ ordinal: counter, clientItemKey: z.string(), input: z.union([CreateReminderInput, ReminderTargetInput, BulkUpdateInput]), status: ItemState, attempts: counter, result: JobResult.nullable() }).strict()),
   nextOffset: counter.nullable(),
   previewToken: PreparationToken.nullable(),
   previewExpiresAt: counter.nullable(),

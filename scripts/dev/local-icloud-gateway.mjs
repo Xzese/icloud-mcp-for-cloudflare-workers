@@ -1,5 +1,5 @@
 // Development-only front door. Never imported by the Site or its production bundle.
-export default {
+const localICloudGateway = {
   async fetch(request, env) {
     const url = new URL(request.url);
     const origin = request.headers.get("origin");
@@ -31,3 +31,5 @@ export default {
     return new Response(response.body, { status: response.status, statusText: response.statusText, headers: responseHeaders });
   },
 };
+
+export default localICloudGateway;

@@ -1,16 +1,22 @@
 # Native Apple Reminders capability map
 
-Status: **implementation in progress; remaining backlog mapped**, 12 October 2026. PR #23
-builds on PRs #21/#22 and adds bounded search, separate URL/tag reads and writes, and ordinary
-reminder move/copy tools, plus guarded ordinary and scheduled family completion/reopening/deletion and ordinary-create
-List guards. Root-only recurring completion adds bounded daily, weekly and last-day monthly
-recipes with durable occurrence reconciliation and explicit weekly/daily/last-day monthly deletion scopes, including end-day retirement. The remaining native feature families below
-are not yet implemented.
-Apple's private Reminders web protocol remains undocumented.
+Status: **bounded native recipes implemented; remaining backlog mapped**, 13 October 2026.
+The current checkout includes merged PRs #21–#24. Search, URL/tag organization, ordinary
+move/copy, Shopping category reads/manual moves, list appearance, guarded family lifecycle
+and bounded recurring lifecycle are implemented. PR #24 additionally preserves acknowledged
+early alerts and observed monthly rules during supported date moves.
 
-The current delivery scope is Shopping category reads/manual item moves, the existing
-search follow-up and explicit concurrency verification. The broader inventory below is
-a backlog for separate deliveries, not a completion requirement for this scope.
+The current follow-up adds normalized reminder inspection, per-reminder action checks,
+request-driven bulk updates/completion for supported simple roots, and connector collections:
+explicit-timezone overdue/today/upcoming/untagged views, complete-result sorting, bounded
+JSON/CSV export and encrypted owner-scoped saved filter definitions. These compose existing
+native recipes. Durable compound creation and bounded plain-list duplication compose those
+existing recipes. Fresh disposable native captures additionally support bounded Standard
+section reads and non-ended timed interval-one daily completion with one absolute-date pair.
+Individual transfer eligibility is unchanged.
+The acceptance records below are historical evidence for their named native operations,
+not claims of live acceptance for this follow-up. Apple's private Reminders web protocol
+remains undocumented, and the broader capability inventory remains a separate backlog.
 
 ## Versions and baseline
 
@@ -19,12 +25,12 @@ the OS version and About Reminders. The live investigation used synthetic remind
 Test list and explicitly disposable test lists. No shared invitations, contact selections,
 photo-library uploads or device settings were changed for this map.
 
-| Source revision | Status at this audit | Capabilities used as the baseline |
+| Source revision | Current checkout status | Capabilities used as the baseline |
 |---|---|---|
 | `origin/main` at `f4da3d8` | Main baseline | Private list discovery, paginated and exact reminder reads, all-open reads, plain title/notes, priority/flag, simple dates, create and bounded completion/reopening/soft deletion. |
-| [PR #21](https://github.com/Xzese/icloud-reminders-mcp-for-cloudflare-workers/pull/21) at `42bd3cf` | Committed, pushed, live verified; awaiting merge | Durable bulk jobs, one-level subtask relationships and bounded linked schedules, including recurrence/early/location creation, editing, removal and combined date transitions. |
-| [PR #22](https://github.com/Xzese/icloud-reminders-mcp-for-cloudflare-workers/pull/22) at `3ef9370` | Committed, pushed, live verified; awaiting merge; based on #21 | Exact list/version reads, standard private list creation, rename and verified-empty deletion. |
-| [PR #23](https://github.com/Xzese/icloud-reminders-mcp-for-cloudflare-workers/pull/23) | This implementation PR, based on #22 | Bounded search, native URL/tag organization, ordinary reminder move/copy, guarded ordinary and scheduled family lifecycle, create List guards and the remaining capability map. Open PR features are not represented as merged. |
+| [PR #21](https://github.com/Xzese/icloud-reminders-mcp-for-cloudflare-workers/pull/21) at `42bd3cf` | Merged as `c0903d6`; native acceptance recorded | Durable bulk jobs, one-level subtask relationships and bounded linked schedules, including recurrence/early/location creation, editing, removal and combined date transitions. |
+| [PR #22](https://github.com/Xzese/icloud-reminders-mcp-for-cloudflare-workers/pull/22) at `3ef9370` | Merged as `b8f119b`; native acceptance recorded | Exact list/version reads, standard private list creation, rename and verified-empty deletion. |
+| [PR #23](https://github.com/Xzese/icloud-reminders-mcp-for-cloudflare-workers/pull/23) | Merged as `2b3b0e8`; native acceptance recorded | Bounded search, native URL/tag organization, ordinary reminder move/copy, guarded ordinary and scheduled family lifecycle, create List guards and the remaining capability map. |
 
 “Live verified” means the connector's stored result was read back and appeared correctly in
 Apple Reminders for the tested recipes. It does not establish notification delivery, every
@@ -48,6 +54,7 @@ included in this document.
 | LIVE-21 | Native recurrence/early/location captures and connector round trips, including mixed date clearing, date restoration, hourly-to-all-day retirement and fresh early alerts. See [PR #21 protocol evidence](https://github.com/Xzese/icloud-reminders-mcp-for-cloudflare-workers/blob/42bd3cf/docs/linked-record-protocol.md). |
 | LIVE-23 | Native URL/tag and move/copy captures; production MCP search, URL replacement/clearing, tag replacement/clearing, fresh copy and original-key read-only reconciliation, identity-preserving move, and a native URL reverse edit. All appeared correctly in Reminders. Both disposable lists and their samples were removed after acceptance; no personal records were mutated. |
 | LIVE-22 | Native list create/rename/delete captures; production connector create/rename/delete visibly confirmed. Matching keys caused no second write; stale/different-name requests conflicted; open and completed members prevented deletion. Disposable lists were cleaned up. See [PR #22 evidence](https://github.com/Xzese/icloud-reminders-mcp-for-cloudflare-workers/blob/3ef9370/docs/list-management.md). |
+| LIVE-DAILY-20261013 | Native non-ended timed interval-one daily completion across the London spring clock change, with separate active/history pairs, stable recurrence identity and independent history reopening. Local planner and synthetic Worker acceptance; no live connector write or deployment. See [daily evidence](#timed-daily-completion-evidence). |
 | LIVE-LIFECYCLE | Fresh native parent/subtask completion, selective reopening and soft deletion; recurring successor/history, clock-change and deletion-scope captures; production Worker ordinary-family acceptance and lost-acknowledgement read-only reconciliation. See [lifecycle evidence](lifecycle-protocol.md). Bounded root recurring completion, daily final completion/reopening, cadence-aligned timed weekly endings, explicit ended/non-ended timed weekly and all-day daily deletion scopes, plus no-end all-day last-day monthly deletion and ordinary/scheduled family lifecycle are implemented; other recurring lifecycle remains outstanding. |
 
 Native menu visibility establishes an opportunity to investigate. It does not establish where
@@ -68,19 +75,19 @@ items marked missing are not exposed by the current MCP tools.
 | Early reminders | LIVE-21 | #21: one minutes/hours/days/weeks/months offset | Creation requires a validated exact-version native witness in the same list. Additional offsets/variants and creation with no witness need evidence. |
 | Arrival/departure location alerts | LIVE-21 | #21: one resolved place, radius and proximity, with a known date alarm | Text geocoding, car/Bluetooth triggers and other location variants are missing. Stored location parity does not verify device notification permissions. |
 | Multiple/special alarms | UI-4; LIVE-21 bounds | One date alarm plus one location alarm supported in #21 | Capture further graph types individually; do not assume the known trigger shape applies to them. |
-| Durable bulk work | LIVE-21 and production integration | #21: encrypted jobs for create and soft delete | Update/complete jobs remain outstanding. Use existing bounded jobs for future recipes only after individual operations have verified contracts. Job status is a connector feature, not a native app view. |
+| Durable bulk work | LIVE-21 and production integration | Encrypted jobs for create, soft delete, simple updates and completion | Update/complete require migration 0004 and exact childless roots without linked schedules. Broader jobs need verified individual operation contracts. Job status is a connector feature, not a native app view. |
 | One-level subtasks | UI-5; LIVE-21; LIVE-LIFECYCLE | Bounded create, reparent/detach, independent dates and guarded complete/reopen/delete | Parent completion changes open children; reopening preserves independently completed children. One absolute-date pair per nonrecurring family member is supported. Deeper nesting, other alarm graphs and family transfers remain outstanding. |
 | Tags and tag filtering | UI-3/4/5; LIVE-23 | #23: typed literal tag reads and per-reminder selection replacement | Tags are per-reminder records; retain selected identities, create fresh records and retire removed ones atomically. Exact literal tag all/any and tagged/untagged search filters are implemented; global tag rename remains future work. |
 | Move between lists; copy/duplicate | UI-4/5; LIVE-23 | #23: undated, open, childless ordinary roots between owned standard private lists | Preserve move identity; create fresh copy/URL/tag identities. Require both List versions and source version; preserve other memberships. Scheduled, family, assignment, section and non-URL asset transfers remain excluded. Copy text is plain text. |
-| Search and built-in smart views | UI-2; LIVE-23 | #23: title/notes text, status, exact list, flag, priority and due-range filters | One live Apple page per call; zero matches may still carry a continuation. Without listId, scan all selectable owned private lists discovered at start. Native tag all/any, tag/URL presence and separate-URL text filters are implemented. Native Smart List storage and globally sorted result sets remain future work. |
-| Sorting and manual ordering | UI-2/5; native List SortingStyle=manual | No ordering/sort-write tool | Complete-result sorting can be a read convenience. Native order changes require ordering-document and token captures; do not guess array replacement. |
-| Sections and column view | UI-1/2/5 | Missing | Discover section identities, membership and ordering using a disposable list. Add typed reads before section CRUD/moves. Columns present sections; storage of the view preference has not been captured. |
+| Search and built-in smart views | UI-2; LIVE-23 | #23: title/notes text, status, exact list, flag, priority and due-range filters | One live Apple page per call; zero matches may still carry a continuation. Without listId, scan all selectable owned private lists discovered at start. Native tag all/any, tag/URL presence and separate-URL text filters are implemented. Bounded complete-result sorting is a connector convenience; native Smart List storage remains unverified. |
+| Sorting and manual ordering | UI-2/5; native List SortingStyle=manual | No ordering/sort-write tool | Bounded complete-result sorting is implemented as a read convenience. Native order changes require ordering-document and token captures; do not guess array replacement. |
+| Sections and column view | UI-1/2/5; Standard read evidence below | Standard-list section identities, memberships and explicit ordering reads implemented | Section CRUD/moves/reordering still need write recipes and acceptance. Columns present sections; storage of the view preference has not been captured. |
 | Standard list CRUD | LIVE-22; LIVE-LIFECYCLE | #22: create/read/rename/empty delete; ordinary create now guards List | Connector create/delete serialize through the List guard. Native root creation/attachment advanced List versions in observed samples; a universal native membership lock remains unproven. Appearance/types/groups and nonempty cascades remain outstanding. |
 | List colours, badge/emoji and pinning | UI-1/3; twelve native colours, emoji and pin/unpin captures | #23: typed appearance reads and twelve-preset/emoji updates | Default Color is absent; explicit presets and emoji use native JSON strings. Standard badges and pin writes remain outstanding; pin adds PinnedDate, while unpin also changes parentAccount tokens and sidebar placement. |
 | List groups and organisation | UI-1; IsGroup list metadata | Groups excluded from selectable mutation targets | Capture group membership, order, rename and removal. Distinguish removing a group from deleting its lists. |
 | Shopping/grocery lists and categories | UI-3; category flags in LIVE-22; scoped category acceptance below | Category reads and manual moves to existing same-list categories implemented | Empty materialised categories are read through a category-only metadata feed. Category management, list conversion and unmaterialised suggestions remain separate work. |
 | Native custom Smart Lists | UI-1/3 | Missing | Read stored all/any filter definitions and identity first. Server-side filters are useful independently and must not be advertised as a native synced Smart List. |
-| Templates | UI-1/3 | Missing | A connector snapshot/copy tool can come first. Native save/import, template identity, update and sharing need their own captures and acceptance. |
+| Templates | UI-1/3 | Bounded plain-list duplication is a connector convenience; native templates missing | Native save/import, template identity, update and sharing need their own captures and acceptance. |
 | Shared lists and reminder assignment | UI-1/2; Apple documentation | Private-zone tools only; bounded shared diagnostics do not provide normal shared CRUD | Establish shared-zone access, participants, roles, revocation and assignment identity with an explicitly approved sharing test. Do not route shared writes through the private client. |
 | Photos, scans and other attachments | UI-5; AttachmentIDs/related metadata | Partial metadata; no attachment upload/download tool | Discover native asset/encryption/link lifecycle; bound types/sizes and signed URL handling. Use synthetic files for acceptance. Separate URLs from photo/scan assets. |
 | Urgent reminders | UI-2/4/5; Apple iOS guide | Missing | Investigate a potentially synced urgency flag and its date prerequisites. Alarm delivery remains device-dependent; a remote write cannot establish delivery or configure alarm permission. |
@@ -89,7 +96,7 @@ items marked missing are not exposed by the current MCP tools.
 | Recently deleted history and restore | Apple iOS guide; existing soft-deleted exact reads | Partial reconciliation; no restore/purge tool | Capture restore and retention behaviour separately from completion reopening. Native permanent deletion and list restoration are not inferred from a Deleted marker. |
 | Calendar, Siri, widgets, share-sheet and natural-language entry | Apple guides; UI deadline shortcuts | Native integrations; no remote UI tools | Scheduled data can be used by native clients, but Calendar display was not tested. Optional parsing must produce explicit date/time-zone inputs; do not promise device actions or Calendar event creation. |
 | Apple Intelligence suggestions/Auto-Categorise | UI-1; Apple Mac guide | Missing | Determine how resulting categories/reminders are stored and preserve them. A connector classifier is not Apple's native model or device service. |
-| Print, export and import | UI-1; Apple guides | Missing | Bounded JSON/CSV export can be a connector convenience. Native print/layout/template/file import formats require independent evidence. |
+| Print, export and import | UI-1; Apple guides | Missing | Bounded JSON/CSV export is implemented as a connector convenience. Native print/layout/template/file import formats require independent evidence. |
 
 ## Implemented search and organization contracts
 
@@ -617,9 +624,8 @@ patterns, families and the remaining capability inventory remain separate backlo
 
 ## Remaining implementation order
 
-1. **Extend read completeness.** Search includes native tag/URL filters and Shopping
-   category reads include materialised empty sections. Add broader section
-   metadata after bounded hydration designs. Keep progress and
+1. **Extend read completeness.** Search includes native tag/URL filters; Shopping
+   categories and Standard section reads include materialised empty sections. Keep progress and
    completed-history scope explicit; avoid a cached catalogue of reminder bodies.
 2. **Extend organization fidelity.** Ordinary URL/tag and move/copy recipes are implemented.
    Investigate global tag rename, scheduled transfers, assets and whole families separately.
@@ -910,3 +916,154 @@ appearance/lifecycle Lists and 31 synthetic reminders from this work, including 
 histories. Exact API retirement reads, the refreshed catalogue and native sidebar confirmed
 cleanup. The existing Test list had no MCP-prefixed samples; unrelated Lists remained and
 Recently Deleted was not purged.
+
+## Current follow-up and evidence blockers
+
+The unfinished inspection and bulk delivery has been preserved and integrated. Bulk changes
+remain limited to exact-version childless roots without linked schedules. Migration 0004
+expands the job constraint while retaining existing jobs. Migrations 0006/0007 add independent
+encrypted ledgers for compound creation and bounded plain-list duplication, with no replay
+after a persisted uncertain stage. Those workflows remain bounded by their existing single-item
+planners; unsupported schedules, families, sections and assets are refused. All-day conversions continue to
+require individual prepared updates.
+
+Connector view/export tools compose complete live search pagination, with explicit reference
+instant and IANA timezone. The owner may save relative definitions in independent encrypted
+storage using migration 0005. They are not native synced Smart Lists or templates. See
+[collection contracts](connector-collections.md).
+
+The initial Standard-section investigation reached native UI verification of an explicitly disposable
+Standard list with one populated and one empty section. A controlled reminder query returned
+one synthetic member but no auxiliary List/section records. That does **not** establish
+Standard membership or ordering asset schemas. The local capture environment has moved to a
+newer multi-service session format that this checkout cannot parse. The incompatible test
+reader invalidated that local test login; the test Worker was stopped and the disposable
+List removed by native recoverable deletion. The separate hosted connector remained READY
+with its existing generation and fixed expiry. No production deployment was performed.
+
+A regression now refuses authenticated sessions with current login assurance and unsupported
+schemas without clearing their encrypted snapshot. Native diagnostics require a compatible
+session reader. The Drive implementation thread restored the local login through normal
+sign-in and the approved retention migration. A read-only status check through its compatible
+server at `http://127.0.0.1:5173` confirmed READY, generation 3, 30-day retention and both
+services READY. No credentials were copied, no server restarted and no database opened by
+this older checkout. Further diagnostics must use the compatible server and preserve its
+service permission checks. Subsequent isolated native captures established the Standard
+read contract below. No guessed section writes have been exposed.
+
+Outstanding native captures are still required for ended timed daily completion, timed daily
+series reopening/deletion, fortnightly/ordinary monthly/yearly and tagged recurring lifecycle; dated moves and later alarm/family transfers;
+Standard section CRUD/moves/order writes, groups, pinning and standard badges. Keep all alarm,
+history, identity and unknown-field preservation checks from the existing evidence recipes.
+Shared zones/assignment, attachments, restore/purge, urgency/messaging and native Smart List/
+template storage remain separate investigations. Automatic Shopping classification remains
+unresolved under the Cloudflare-only requirement. Local classification and notification/Focus
+permission changes are outside the normal connector write contract.
+
+The local implementation also includes [compound creation](create-workflows.md) and
+[plain-list duplication](list-duplication.md), with encrypted progress and read-only uncertain
+outcome handling. They make no claim of new native compound/template storage. A first copy
+into an empty destination reuses the verified first-child parent-before-Reminder ordering,
+without broadening copied fields. Exact source URL/tag versions are retained from preflight
+and guarded again at native dispatch.
+
+Earlier local acceptance on 2026-10-13 passed all 212 behavioral tests, lint, typecheck,
+public-config checks, the Sites build and synthetic built-Worker integration, artifact
+verification, and the standalone Cloudflare build/dry-run/integration checks. The packaged
+immutable migrations matched the canonical history and fresh/upgraded schemas. Independent
+review found no remaining correctness issues after the scan-budget and related-version
+guard corrections. These are local synthetic checks, not new live Apple acceptance or a
+deployment. Native protocol evidence remains outstanding; local access has since been
+restored as recorded above.
+
+## Standard section read evidence
+
+On 13 October 2026, a newly native-created disposable Standard list contained
+`Synthetic Alpha` with one synthetic reminder and `Synthetic Empty` with no members.
+Exact CloudKit reads confirmed two active owned `ListSection` identities and their List
+references. `DisplayName` is an encrypted string; `CanonicalName` was absent. The List's
+`MembershipsOfRemindersInSectionsAsData` decoded the same version `20230430` membership
+format already observed for Shopping, and its checksum verified. This is fresh Standard
+evidence, rather than an inference from the Shopping schema.
+
+Initially the List had no `SectionIDsOrderingAsData`. With explicit user approval, the user
+dragged Empty above Alpha in native Edit Sections. Exact reads then found that ordering
+asset with version `20230430` and the two identifiers in the displayed order. Identities
+and the reminder's Alpha membership remained unchanged. No default order is inferred when
+the asset is absent. This capture verifies a read shape; it does not establish an atomic
+connector reorder or section-write recipe.
+
+The type-filtered metadata feed returned both identities, including the empty section, and
+unrelated-list records were discarded. Subsequent pages could contain no selected records
+while still carrying an advancing continuation. The bounded capture deliberately stopped
+before feed completion and makes no absence claim. Public reads expose that incompleteness.
+
+Capture used an encrypted SQLite backup opened read-only, parsed only with the compatible
+Drive checkout. Credentials stayed in memory. Its transport allowed only exact CloudKit
+lookup, category metadata feed, and validated downloads of the disposable List's observed
+assets; writes, authentication, PCS and permission endpoints were denied. The source login
+and database were never passed through the older mutable session reader. Captures retained
+only sanitized synthetic IDs, field shapes and decoded asset structure in ignored state.
+
+## Timed daily completion evidence
+
+On 13 October 2026, native Reminders created an interval-one Daily root in an explicitly
+disposable Standard list, due 27 March 2027 at 09:00 Europe/London, with no end condition
+and exactly one absolute-date Alarm/AlarmTrigger pair. One native completion preserved the
+active identity and recurrence rule while advancing to 28 March at 09:00 local time
+(08:00 UTC), across the spring clock change. The old pair was retired; separate fresh pairs
+backed the active occurrence and completed history at the original due date. History had
+no recurrence link. Reopening only that history preserved both of its alarm identities and
+fields and left the entire active graph unchanged.
+
+The opaque urgency asset retained its checksum and size while native writes changed its
+transport encryption metadata. A read-only payload inspection established account-level
+presentation data, with all values masked and no account identifiers stored in evidence.
+The connector preserves this field without interpreting it or writing urgency, Focus or
+notification permissions. Its daily intent additionally requires stable presentation metadata
+on read-back; unexpected replacement produces WRITE_OUTCOME_UNKNOWN and read-only recovery.
+
+The bounded daily completion recipe reuses the verified atomic history/alarm transition.
+Synthetic coverage checks DST advancement, history reopening, lost acknowledgements,
+presentation drift and refusal of ended daily rules. This is native protocol evidence and
+local implementation acceptance, not a live deployment or a live connector-write claim.
+Ended timed daily completion, active-series reopening/deletion, other daily intervals,
+tags, families and early/location alarms remain unsupported by this recipe.
+
+## Follow-up local acceptance
+
+The Standard-section and timed-daily follow-up passed all 216 behavioral tests, full lint
+without warnings, typecheck, public configuration checks, the Sites build, built-Worker
+integration, packaged artifact verification and standalone Cloudflare build/dry-run/integration.
+Independent section and daily lifecycle reviews found no remaining issues after the
+section hydration regression was corrected. Existing databases still require pending
+`0004`–`0007` migrations for the earlier bulk/filter/workflow deliveries; sections and the
+optional daily intent guard need no new SQL migration.
+
+Both newly created disposable lists were removed through native recoverable deletion;
+Recently Deleted was not purged. An isolated compatible read-only snapshot confirmed the
+daily List's native Deleted marker and successful owned-zone reads. The restored source
+session remained READY at generation 3 with its unchanged fixed expiry and 30-day retention.
+The compatible localhost server was unavailable at final check and was not restarted or
+reconfigured. No source-session writes or production deployment were performed.
+
+## Service integration and schema rollout
+
+The follow-up integrates the configurable Reminders/Drive services from PR #25. Its immutable
+`0002_service_settings.sql` and `0003_drive_operations.sql` migrations remain unchanged;
+the Reminders upgrades append as `0004` bulk changes, `0005` filters, `0006` create workflows
+and `0007` list duplication. New tools enforce service permissions, including revision changes
+during asynchronous preparation, persistence and result release. The final transport boundary
+checks the pinned settings revision and live Apple lease together before an upstream request.
+
+The integrated checkout passed 265 behavioral tests, lint and typecheck. Independent review
+verified the session/permission race repairs, with focused disconnect, revocation and retained
+receipt regressions. The required built-Worker, artifact and standalone checks passed.
+
+An owner-authorized schema-only rollout applied the four appended migrations to the existing
+private Site, preserving its newer application source and access settings. Live inspection
+confirmed the new tables, retained jobs/items/receipts and both READY services at their unchanged
+session generation and fixed expiry. The bounded database viewer confirmed returned item
+fields and encrypted projections; it does not expose full ciphertext for byte comparison.
+No Apple reminders were modified. This schema rollout does not deploy the new application
+features in the PR.

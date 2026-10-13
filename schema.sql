@@ -23,7 +23,7 @@ CREATE TABLE IF NOT EXISTS reminder_jobs (
   account_scope TEXT NOT NULL,
   job_id TEXT NOT NULL,
   job_key TEXT NOT NULL,
-  kind TEXT NOT NULL CHECK (kind IN ('bulk_create', 'bulk_delete')),
+  kind TEXT NOT NULL CHECK (kind IN ('bulk_create', 'bulk_delete', 'bulk_update', 'bulk_complete')),
   generation INTEGER NOT NULL,
   state TEXT NOT NULL DEFAULT 'draft',
   revision INTEGER NOT NULL DEFAULT 0,
@@ -94,6 +94,47 @@ CREATE TABLE IF NOT EXISTS reminder_job_accounts (
 );
 CREATE INDEX IF NOT EXISTS reminder_job_selection ON reminder_job_items(owner_id, job_id, state, ordinal);
 CREATE INDEX IF NOT EXISTS reminder_job_owners ON reminder_jobs(owner_id, state);
+-- Connector filters are independent of the Apple session and store only authenticated ciphertext.
+CREATE TABLE IF NOT EXISTS connector_filters (
+  owner_id TEXT NOT NULL,
+  filter_id TEXT NOT NULL,
+  revision INTEGER NOT NULL CHECK (revision > 0),
+  envelope TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  PRIMARY KEY (owner_id, filter_id)
+);
+
+CREATE INDEX IF NOT EXISTS connector_filters_owner_order
+ON connector_filters(owner_id, created_at, filter_id);
+-- Content and exact Apple versions live only in the authenticated envelope.
+CREATE TABLE IF NOT EXISTS reminder_create_workflows (
+  owner_scope TEXT NOT NULL,
+  workflow_id TEXT NOT NULL,
+  account_scope TEXT NOT NULL,
+  generation INTEGER NOT NULL CHECK (generation >= 0),
+  request_hash TEXT NOT NULL,
+  revision INTEGER NOT NULL DEFAULT 0 CHECK (revision >= 0),
+  state TEXT NOT NULL CHECK (state IN ('pending', 'paused', 'completed', 'blocked', 'recovery_required')),
+  envelope TEXT NOT NULL,
+  lease_id TEXT,
+  lease_until INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (owner_scope, workflow_id)
+);
+-- Exact source snapshots and all operation stages are stored only in the encrypted envelope.
+CREATE TABLE IF NOT EXISTS reminder_list_duplications (
+  owner_scope TEXT NOT NULL,
+  duplication_id TEXT NOT NULL,
+  account_scope TEXT NOT NULL,
+  generation INTEGER NOT NULL CHECK (generation >= 0),
+  request_hash TEXT NOT NULL,
+  revision INTEGER NOT NULL DEFAULT 0 CHECK (revision >= 0),
+  state TEXT NOT NULL CHECK (state IN ('preparing', 'active', 'uncertain', 'completed')),
+  envelope TEXT NOT NULL,
+  lease_id TEXT,
+  lease_until INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (owner_scope, duplication_id)
+);
 
 -- Owner-scoped, revisioned service preferences. Apple credentials remain separate.
 CREATE TABLE IF NOT EXISTS owner_service_settings (

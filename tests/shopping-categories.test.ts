@@ -2,12 +2,13 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { createHash, randomUUID } from "node:crypto";
 import { AppError } from "../src/errors.ts";
-import { CloudKitRemindersClient, type CloudKitConnection, type CloudKitRecord } from "../src/icloud/cloudkit.ts";
+import { CloudKitRemindersClient, type CloudKitConnection, type CloudKitLookupResult, type CloudKitRecord, type CloudKitRecordItem } from "../src/icloud/cloudkit.ts";
 import { downloadShoppingAsset, uploadShoppingAsset } from "../src/icloud/shopping-assets.ts";
 import {
   decodeGroceryCorrections,
   decodeSectionMemberships,
   encodeGroceryCorrections,
+  encodeSectionOrdering,
   encodeSectionMemberships,
   groceryCorrectionsChecksum,
   membershipsChecksum,
@@ -22,6 +23,7 @@ import {
 import { buildCreateList } from "../src/reminders/list-writes.ts";
 import { buildCreateReminder } from "../src/reminders/writes.ts";
 import { planShoppingCategory, verifyShoppingPreservation } from "../src/reminders/shopping-plan.ts";
+import { GetReminderListSectionsRequest, readStandardSectionsPage, SectionScanSchema, type SectionScan, type StandardSectionsClient } from "../src/reminders/sections.ts";
 import { AppleHTTP } from "../src/transport/apple-http.ts";
 import { CookieJar } from "../src/transport/cookie-jar.ts";
 
@@ -85,6 +87,240 @@ function sectionRecord(overrides: Record<string, unknown> = {}) {
     ...overrides,
   };
 }
+
+function standardListRecord(options: { recordChangeTag?: string; fields?: Record<string, unknown>; raw?: Record<string, unknown>; zoneID?: CloudKitRecord["zoneID"] } = {}): CloudKitRecord {
+  const created = buildCreateList({ name: "Standard list", idempotencyKey: "00000000-0000-4000-8000-000000000010" });
+  return {
+    ...created,
+    recordType: "List",
+    recordChangeTag: options.recordChangeTag ?? "list-version-1",
+    zoneID: options.zoneID ?? { ...zone },
+    raw: options.raw ?? {},
+    fields: {
+      ...created.fields,
+      ShouldCategorizeGroceryItems: { type: "INT64", value: 0, isEncrypted: true },
+      ReminderIDs: { type: "STRING", value: "[]" },
+      ...options.fields,
+    },
+  };
+}
+
+function standardSectionRecord(id: string, name: string, parentListId = listID, overrides: Partial<CloudKitRecord> = {}): CloudKitRecord {
+  return {
+    recordName: `ListSection/${id}`,
+    recordType: "ListSection",
+    recordChangeTag: `section-${id.slice(-1)}`,
+    zoneID: { ...zone },
+    raw: {},
+    fields: {
+      List: { type: "REFERENCE", value: { recordName: parentListId, action: "VALIDATE" } },
+      DisplayName: { type: "STRING", value: name },
+      Deleted: { type: "INT64", value: 0 },
+    },
+    ...overrides,
+  };
+}
+
+function lookupResult(requestedRecordNames: string[], records: CloudKitRecordItem[] = [],
+  recordErrors: CloudKitLookupResult["recordErrors"] = [], unresolvedRecordNames: string[] = []): CloudKitLookupResult {
+  return { requestedRecordNames, records, recordErrors, unresolvedRecordNames,
+    complete: recordErrors.length === 0 && unresolvedRecordNames.length === 0 };
+}
+
+function sectionAsset(key: string) {
+  return { type: "ASSETID", value: { key } };
+}
+
+function standardSectionsClient(options: {
+  lists: CloudKitRecord[];
+  sections?: CloudKitRecordItem[];
+  assets?: Map<string, Uint8Array>;
+  page?: { records: CloudKitRecordItem[]; complete: boolean; continuation: string | null };
+}) {
+  const lists = [...options.lists];
+  const sectionRecords = new Map((options.sections ?? []).map(record => [record.recordName, record]));
+  const assets = options.assets ?? new Map<string, Uint8Array>();
+  const calls = { listLookups: 0, sectionLookups: [] as string[][], feedLookups: 0, downloadedAssets: [] as string[] };
+  const client: StandardSectionsClient = {
+    remindersZoneOwner: zone.ownerRecordName,
+    async lookup(recordNames) {
+      assert.deepEqual(recordNames, [listID]);
+      calls.listLookups++;
+      const list = lists.shift();
+      return lookupResult(recordNames, list ? [list] : [], list ? [] : [{ recordName: listID, serverErrorCode: "UNKNOWN_ITEM", reason: null, raw: {} }]);
+    },
+    async lookupListSections(recordNames) {
+      calls.sectionLookups.push([...recordNames]);
+      const records: CloudKitRecordItem[] = [];
+      const recordErrors: CloudKitLookupResult["recordErrors"] = [];
+      const unresolved: string[] = [];
+      for (const id of recordNames) {
+        const record = sectionRecords.get(id);
+        if (record) records.push(record);
+        else {
+          recordErrors.push({ recordName: id, serverErrorCode: "UNKNOWN_ITEM", reason: null, raw: {} });
+        }
+      }
+      return lookupResult(recordNames, records, recordErrors, unresolved);
+    },
+    async queryListSectionsPage() {
+      calls.feedLookups++;
+      return options.page ?? { records: [], complete: true, continuation: null };
+    },
+    async downloadSectionAsset(field) {
+      const key = (field as { value?: { key?: unknown } }).value?.key;
+      assert.equal(typeof key, "string");
+      calls.downloadedAssets.push(key as string);
+      const data = assets.get(key as string);
+      assert.ok(data, `missing synthetic section asset ${String(key)}`);
+      return data;
+    },
+  };
+  return { client, calls };
+}
+
+test("Standard section pages retain explicit ordering, empty sections, and only native List membership", async () => {
+  const memberId = sectionIDs[0];
+  const membershipData: ShoppingSectionMemberships = {
+    minimumSupportedVersion: SHOPPING_PROTOCOL_VERSION,
+    memberships: [{ memberID: memberId, groupID: sectionIDs[0], modifiedOn: 757_382_400 }],
+  };
+  const orderingData: ShoppingSectionOrdering = {
+    minimumSupportedVersion: SHOPPING_PROTOCOL_VERSION,
+    orderedIdentifiers: [sectionIDs[1], sectionIDs[0]],
+  };
+  const membershipBytes = encodeSectionMemberships(membershipData);
+  const orderingBytes = encodeSectionOrdering(orderingData);
+  const assets = new Map([["membership", membershipBytes], ["ordering", orderingBytes]]);
+  const list = standardListRecord({ fields: {
+    ReminderIDs: { type: "STRING", value: JSON.stringify([`Reminder/${memberId}`]) },
+    MembershipsOfRemindersInSectionsAsData: sectionAsset("membership"),
+    MembershipsOfRemindersInSectionsChecksum: { type: "STRING", value: await membershipsChecksum(membershipData), isEncrypted: true },
+    SectionIDsOrderingAsData: sectionAsset("ordering"),
+  } });
+  const alpha = standardSectionRecord(sectionIDs[0], "Alpha");
+  const empty = standardSectionRecord(sectionIDs[1], "Empty");
+  const unrelated = standardSectionRecord("00000000-0000-4000-8000-000000000099", "Another list", "List/00000000-0000-4000-8000-000000000099");
+  const { client, calls } = standardSectionsClient({
+    lists: [list, list],
+    sections: [alpha, empty],
+    assets,
+    page: { records: [empty, unrelated, alpha], complete: true, continuation: null },
+  });
+
+  const result = await readStandardSectionsPage(client, listID);
+  assert.deepEqual(result, {
+    listRecordChangeTag: "list-version-1",
+    sections: [
+      { sectionId: `ListSection/${sectionIDs[0]}`, name: "Alpha", canonicalName: null, recordChangeTag: "section-1" },
+      { sectionId: `ListSection/${sectionIDs[1]}`, name: "Empty", canonicalName: null, recordChangeTag: "section-2" },
+    ],
+    memberships: [{ reminderId: `Reminder/${memberId}`, sectionId: `ListSection/${sectionIDs[0]}` }],
+    orderedSectionIds: [`ListSection/${sectionIDs[1]}`, `ListSection/${sectionIDs[0]}`],
+    orderingStatus: "explicit",
+    complete: true,
+    nativeContinuation: null,
+  });
+  assert.equal(calls.listLookups, 2, "the first and final List reads bind the returned page to one version");
+  assert.equal(calls.feedLookups, 1);
+  assert.deepEqual(calls.sectionLookups, [[`ListSection/${sectionIDs[0]}`, `ListSection/${sectionIDs[1]}`]], "unrelated feed records are discarded before exact section reads");
+});
+
+test("Standard section pages preserve an empty incomplete feed page and distinguish absent ordering", async () => {
+  const list = standardListRecord();
+  const nativeCursor = "4e94c699-0c30-4826-ae5c-c7cbcdcccf52";
+  const { client, calls } = standardSectionsClient({
+    lists: [list, list],
+    page: { records: [], complete: false, continuation: nativeCursor },
+  });
+  const result = await readStandardSectionsPage(client, listID, { cursor: null, limit: 1 });
+  assert.equal(result.complete, false);
+  assert.equal(result.nativeContinuation, nativeCursor);
+  assert.deepEqual(result.sections, []);
+  assert.deepEqual(result.orderedSectionIds, []);
+  assert.equal(result.orderingStatus, "not_materialized");
+  assert.deepEqual(calls.sectionLookups, []);
+  assert.equal(calls.listLookups, 2);
+
+  assert.deepEqual(GetReminderListSectionsRequest.parse({ listId: listID }), { listId: listID, limit: 200 });
+  const digest = "a".repeat(64);
+  const scan: SectionScan = SectionScanSchema.parse({ token: randomUUID(), expiresAt: 1, accountHash: digest,
+    listId: listID, listRecordChangeTag: "list-version-1", limit: 200, cursor: nativeCursor, seen: [digest], pages: 1 });
+  assert.equal(scan.cursor, nativeCursor);
+  assert.equal(GetReminderListSectionsRequest.safeParse({ listId: listID, continuation: "not-a-uuid" }).success, false);
+  assert.equal(SectionScanSchema.safeParse({ ...scan, pages: 1001 }).success, false);
+});
+
+test("Standard section reads reject checksum drift, unresolved references, and List version changes", async () => {
+  const membershipData: ShoppingSectionMemberships = {
+    minimumSupportedVersion: SHOPPING_PROTOCOL_VERSION,
+    memberships: [{ memberID: sectionIDs[0], groupID: sectionIDs[0], modifiedOn: 757_382_400 }],
+  };
+  const membershipBytes = encodeSectionMemberships(membershipData);
+  const assetFields = {
+    MembershipsOfRemindersInSectionsAsData: sectionAsset("membership"),
+    MembershipsOfRemindersInSectionsChecksum: { type: "STRING", value: "0".repeat(128), isEncrypted: true },
+  };
+  const invalidChecksum = standardListRecord({ fields: assetFields });
+  const badAssetClient = standardSectionsClient({ lists: [invalidChecksum, invalidChecksum], assets: new Map([["membership", membershipBytes]]) });
+  await assert.rejects(readStandardSectionsPage(badAssetClient.client, listID), hasCode("PROTOCOL_CHANGED"));
+
+  const missingReferenceList = standardListRecord({ fields: {
+    ReminderIDs: { type: "STRING", value: JSON.stringify([`Reminder/${sectionIDs[0]}`]) },
+    MembershipsOfRemindersInSectionsAsData: sectionAsset("membership"),
+    MembershipsOfRemindersInSectionsChecksum: { type: "STRING", value: await membershipsChecksum(membershipData), isEncrypted: true },
+  } });
+  const missingClient = standardSectionsClient({ lists: [missingReferenceList, missingReferenceList], assets: new Map([["membership", membershipBytes]]) });
+  await assert.rejects(readStandardSectionsPage(missingClient.client, listID), hasCode("CONFLICT"));
+
+  const feedOnlyEmpty = standardSectionRecord(sectionIDs[1], "Empty");
+  const feedOnlyClient = standardSectionsClient({ lists: [standardListRecord(), standardListRecord()], page: { records: [feedOnlyEmpty], complete: true, continuation: null } });
+  feedOnlyClient.client.lookupListSections = async ids => ({ requestedRecordNames: ids, records: [], recordErrors: [], unresolvedRecordNames: ids, complete: false });
+  await assert.rejects(readStandardSectionsPage(feedOnlyClient.client, listID), hasCode("PROTOCOL_CHANGED"));
+
+  const tombstoneOrdering: ShoppingSectionOrdering = { minimumSupportedVersion: SHOPPING_PROTOCOL_VERSION, orderedIdentifiers: [sectionIDs[0]] };
+  const tombstoneList = standardListRecord({ fields: {
+    ReminderIDs: { type: "STRING", value: JSON.stringify([`Reminder/${sectionIDs[0]}`]) },
+    MembershipsOfRemindersInSectionsAsData: sectionAsset("membership"),
+    MembershipsOfRemindersInSectionsChecksum: { type: "STRING", value: await membershipsChecksum(membershipData), isEncrypted: true },
+    SectionIDsOrderingAsData: sectionAsset("ordering"),
+  } });
+  const tombstoneClient = standardSectionsClient({
+    lists: [tombstoneList, tombstoneList],
+    sections: [{ recordName: `ListSection/${sectionIDs[0]}`, deleted: true, zoneID: { ...zone }, raw: {} }],
+    assets: new Map([["membership", membershipBytes], ["ordering", encodeSectionOrdering(tombstoneOrdering)]]),
+  });
+  const filteredTombstone = await readStandardSectionsPage(tombstoneClient.client, listID);
+  assert.deepEqual(filteredTombstone.sections, []);
+  assert.deepEqual(filteredTombstone.memberships, []);
+  assert.deepEqual(filteredTombstone.orderedSectionIds, []);
+
+  const first = standardListRecord({ recordChangeTag: "list-version-1" });
+  const changed = standardListRecord({ recordChangeTag: "list-version-2" });
+  const changedClient = standardSectionsClient({ lists: [first, changed] });
+  await assert.rejects(readStandardSectionsPage(changedClient.client, listID), hasCode("CONFLICT"));
+  const staleContinuationClient = standardSectionsClient({ lists: [changed] });
+  await assert.rejects(readStandardSectionsPage(staleContinuationClient.client, listID, { expectedListRecordChangeTag: "list-version-1" }), hasCode("CONFLICT"));
+});
+
+test("Standard section reads reject Shopping, Smart, shared, and foreign ownership contexts", async () => {
+  const cases: Array<{ name: string; list: CloudKitRecord; code: string }> = [
+    { name: "Shopping", list: standardListRecord({ fields: { ShouldCategorizeGroceryItems: { type: "INT64", value: 1 } } }), code: "UNSUPPORTED_FEATURE" },
+    { name: "Smart", list: standardListRecord({ fields: { SmartListQuery: { type: "STRING", value: "synthetic" } } }), code: "UNSUPPORTED_FEATURE" },
+    { name: "shared", list: standardListRecord({ raw: { share: { recordName: "Share/synthetic" } } }), code: "FORBIDDEN" },
+    { name: "foreign", list: standardListRecord({ zoneID: { ...zone, ownerRecordName: "_another-synthetic-owner" } }), code: "FORBIDDEN" },
+  ];
+  for (const item of cases) {
+    const client = standardSectionsClient({ lists: [item.list] });
+    await assert.rejects(readStandardSectionsPage(client.client, listID), hasCode(item.code), item.name);
+  }
+
+  const list = standardListRecord();
+  const sharedSection = standardSectionRecord(sectionIDs[0], "Shared", listID, { raw: { share: { recordName: "Share/synthetic" } } });
+  const sharedSectionClient = standardSectionsClient({ lists: [list, list], sections: [sharedSection],
+    page: { records: [sharedSection], complete: true, continuation: null } });
+  await assert.rejects(readStandardSectionsPage(sharedSectionClient.client, listID), hasCode("FORBIDDEN"));
+});
 
 test("shopping checksums preserve native framing, descending order, Apple dates, and strict asset shapes", async () => {
   const memberships: ShoppingSectionMembership[] = [

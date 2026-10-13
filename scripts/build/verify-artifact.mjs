@@ -1,5 +1,7 @@
 import { readFile, readdir, stat, writeFile, mkdir } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
+import { DatabaseSync } from 'node:sqlite';
+import assert from 'node:assert/strict';
 import path from 'node:path';
 
 const root = process.cwd();
@@ -38,17 +40,41 @@ if (!config.d1_databases?.some(x => x.binding === 'DB') || !config.compatibility
 const hosting = JSON.parse(await readFile(path.join(root, '.openai/hosting.json'), 'utf8'));
 if (hosting.d1 !== 'DB' || !hosting.capabilities?.includes('mcp')) throw new Error('Required Sites capabilities are missing.');
 const schema = await readFile(path.join(root, 'schema.sql'), 'utf8');
-const migration = await readFile(path.join(root, 'migrations/0001_reminder_jobs.sql'), 'utf8');
-if (!schema.includes(migration.slice(migration.indexOf('CREATE TABLE')).trim())) throw new Error('Fresh-install and additive job schemas differ.');
 const migrations = (await readdir(path.join(root, 'migrations'))).filter(file => /^\d{4}_[a-z0-9_]+\.sql$/.test(file)).sort();
 if (JSON.stringify((await readdir(path.join(root, 'dist/.openai/drizzle'))).sort()) !== JSON.stringify(migrations)) throw new Error('Packaged Sites migration history is incomplete.');
 for (const file of migrations) {
   if (await readFile(path.join(root, 'dist/.openai/drizzle', file), 'utf8') !== await readFile(path.join(root, 'migrations', file), 'utf8')) throw new Error(`Packaged migration differs from canonical source: ${file}`);
 }
+// Compare installed schemas, not historical SQL text: applied migrations remain immutable.
+const fresh = new DatabaseSync(':memory:'), upgraded = new DatabaseSync(':memory:');
+try {
+  fresh.exec('PRAGMA foreign_keys = ON'); upgraded.exec('PRAGMA foreign_keys = ON');
+  fresh.exec(schema);
+  for (const file of migrations) {
+    upgraded.exec('BEGIN');
+    upgraded.exec(await readFile(path.join(root, 'migrations', file), 'utf8'));
+    upgraded.exec('COMMIT');
+  }
+  const structure = db => db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name").all().map(({ name }) => ({
+    name, columns: db.prepare('SELECT * FROM pragma_table_info(?)').all(name),
+    foreignKeys: db.prepare('SELECT * FROM pragma_foreign_key_list(?)').all(name),
+    indexes: db.prepare('SELECT name, "unique", origin, partial FROM pragma_index_list(?)').all(name).map(index => ({
+      unique: index.unique, origin: index.origin, partial: index.partial,
+      columns: db.prepare('SELECT seqno, cid, name FROM pragma_index_info(?)').all(index.name),
+    })).sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b))),
+  }));
+  assert.deepEqual(structure(upgraded), structure(fresh), 'Fresh-install and upgraded schemas differ.');
+  for (const db of [fresh, upgraded]) {
+    assert.deepEqual(db.prepare('PRAGMA foreign_key_check').all(), []);
+    const insert = db.prepare("INSERT INTO reminder_jobs (owner_id,account_scope,job_id,job_key,kind,generation,expires_at,created_at,updated_at) VALUES ('schema-check','schema-check',?,?,?,0,1,0,0)");
+    for (const kind of ['bulk_create', 'bulk_delete', 'bulk_update', 'bulk_complete']) insert.run(kind, kind, kind);
+    assert.throws(() => insert.run('invalid', 'invalid', 'invalid'), /CHECK constraint failed/);
+  }
+} finally { fresh.close(); upgraded.close(); }
 await mkdir(path.join(root, 'docs'), { recursive: true });
 await writeFile(path.join(root, 'docs/artifact-manifest.json'), JSON.stringify({
   kind: 'local-production-build', compatibilityDate: config.compatibility_date,
   entrypoint: 'dist/server/index.js', sitesCapabilities: hosting.capabilities,
-  appleConnectionImplemented: true, liveAppleValidated: false, liveFlagsConfiguredByBuild: false, schemaVersion: 4, jobExecutionMode: 'request-driven', linkedSchedulingEnabled: false, bulkDeletionEnabled: false, loginPolicy: 'device-only-v2', supportedLoginAssuranceVersions: [2, 3], retentionPolicy: 'absolute-30d-v1', maxLocalSessionLifetimeMs: 2_592_000_000, checks: ['local-key-exclusion', 'public-asset-boundary', 'binding-contract', 'additive-job-schema-parity'], files: entries,
+  appleConnectionImplemented: true, liveAppleValidated: false, liveFlagsConfiguredByBuild: false, schemaVersion: 7, migrations, jobExecutionMode: 'request-driven', linkedSchedulingEnabled: false, bulkDeletionEnabled: false, loginPolicy: 'device-only-v2', supportedLoginAssuranceVersions: [2, 3], retentionPolicy: 'absolute-30d-v1', maxLocalSessionLifetimeMs: 2_592_000_000, checks: ['local-key-exclusion', 'public-asset-boundary', 'binding-contract', 'additive-job-schema-parity'], files: entries,
 }, null, 2) + '\n');
 console.log(JSON.stringify({ result: 'passed', files: entries.length, bytes: entries.reduce((sum, x) => sum + x.bytes, 0), manifest: 'docs/artifact-manifest.json', deployed: false }));

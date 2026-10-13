@@ -885,7 +885,7 @@ export class CloudKitRemindersClient {
         !Object.hasOwn(root.fields, "ParentReminder") && !Object.hasOwn(root.fields, "DueDate") && !Object.hasOwn(root.fields, "TimeZone"),
       "Only undated, open, top-level Reminder copies are supported.");
     }
-    const parseLinkIds = (value: unknown, key: string, type: "Attachment" | "Hashtag"): string[] => {
+    const parseLinkIds = (value: unknown, key: string): string[] => {
       if (value === undefined) return [];
       const field = value as { type?: unknown; value?: unknown };
       requireInput((field.type === "STRING_LIST" || field.type === "UNKNOWN_LIST" && Array.isArray(field.value) && field.value.length === 0) &&
@@ -895,8 +895,8 @@ export class CloudKitRemindersClient {
       `The ${key} copy list must contain bounded native UUIDs.`);
       return field.value as string[];
     };
-    const createdAttachmentIds = parseLinkIds(root.fields.AttachmentIDs, "AttachmentIDs", "Attachment");
-    const createdHashtagIds = parseLinkIds(root.fields.HashtagIDs, "HashtagIDs", "Hashtag");
+    const createdAttachmentIds = parseLinkIds(root.fields.AttachmentIDs, "AttachmentIDs");
+    const createdHashtagIds = parseLinkIds(root.fields.HashtagIDs, "HashtagIDs");
     requireInput(operationType === "update" ? root.fields.AttachmentIDs === undefined && root.fields.HashtagIDs === undefined : true,
       "A move preserves existing organization relationships without rewriting their root lists.");
 
@@ -1020,8 +1020,8 @@ export class CloudKitRemindersClient {
       "Only active, open, undated, top-level reminders without alarms or recurrence can be copied.");
       requireInput(checkedGuards.some(record => record.recordType === "List" && record.recordName === sourceListId &&
         record.recordChangeTag === sourceListSnapshot.recordChangeTag), "A copy must version-guard its unchanged source List.");
-      const sourceHashtags = parseLinkIds(sourceReminder.fields.HashtagIDs, "HashtagIDs", "Hashtag");
-      const sourceAttachments = parseLinkIds(sourceReminder.fields.AttachmentIDs, "AttachmentIDs", "Attachment");
+      const sourceHashtags = parseLinkIds(sourceReminder.fields.HashtagIDs, "HashtagIDs");
+      const sourceAttachments = parseLinkIds(sourceReminder.fields.AttachmentIDs, "AttachmentIDs");
       const relatedGuards = checkedGuards.filter(record => record.recordType === "Hashtag" || record.recordType === "Attachment");
       requireInput(relatedGuards.length === sourceHashtags.length + sourceAttachments.length &&
         new Set(relatedGuards.map(record => record.recordName)).size === relatedGuards.length,
@@ -1120,6 +1120,13 @@ export class CloudKitRemindersClient {
     const ops: { operationType: "create" | "update"; record: CloudKitWriteRecord | ListWrite | { recordName: string; recordType: "Attachment" | "Hashtag"; fields: Record<string, { type: string; value: unknown; isEncrypted?: boolean }> } }[] = [
       { operationType, record: root }, ...memberships.map(record => ({ operationType: "update" as const, record })), ...dependencyWrites,
     ];
+    if (operationType === "create" && destinationBefore.length === 0) {
+      // Reuse the verified first-child ordering: initialise the parent List
+      // before creating its intrinsic Reminder, including a fresh copy.
+      const destinationIndex = ops.findIndex(item => item.record.recordName === destinationId);
+      requireInput(destinationIndex > 0, "A first copy requires its destination membership update.");
+      ops.unshift(...ops.splice(destinationIndex, 1));
+    }
     const allGuards = [...checkedGuards];
     requireInput(ops.length + allGuards.length <= 32 && new Set([...ops.map(item => item.record.recordName), ...allGuards.map(record => record.recordName)]).size === ops.length + allGuards.length,
       "The transfer exceeds the atomic record budget or contains duplicate identities.");
@@ -1144,7 +1151,7 @@ export class CloudKitRemindersClient {
         }
       }
     }
-    return result as CloudKitRecord[];
+    return [confirmedRoot, ...result.filter(item => item.recordName !== root.recordName)] as CloudKitRecord[];
   }
 
   async modifyRecords(operations: { operationType: "create" | "update"; record: CloudKitWriteRecord }[], beforeDispatch?: () => Promise<void>, versionGuards: CloudKitRecord[] = []): Promise<CloudKitRecord[]> {

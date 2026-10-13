@@ -1,9 +1,9 @@
 import { z } from "zod";
 import type { Reminder } from "../icloud/cloudkit.ts";
 import { LiteralTagName } from "./organization.ts";
+import { ListId } from "./identifiers.ts";
 
 const isoDateTime = z.string().datetime({ offset: true });
-const listId = z.string().min(6).max(512).regex(/^List\/[^/\u0000-\u0020\u007f]+$/);
 
 const SearchFilterFields = z.object({
   text: z.string().min(1).max(512).refine(value => value.trim().length > 0, "Search text cannot be blank.")
@@ -14,7 +14,7 @@ const SearchFilterFields = z.object({
     .describe("Filter by native priority (0, 1, 5, or 9).").optional(),
   dueFrom: isoDateTime.describe("Inclusive lower bound for the due date, as ISO 8601.").optional(),
   dueTo: isoDateTime.describe("Inclusive upper bound for the due date, as ISO 8601.").optional(),
-  listId: listId.describe("Exact owned List/ ID; do not supply the list title.").optional(),
+  listId: ListId.describe("Exact owned List/ ID; do not supply the list title.").optional(),
   tags: z.array(LiteralTagName).min(1).max(16).refine(values => new Set(values).size === values.length, "Tag filters must contain unique exact literal names.")
     .describe("1–16 unique, exact case-sensitive native tag names.").optional(),
   tagMatch: z.enum(["all", "any"]).describe("How supplied tags match; omission means all tags are required.").optional(),

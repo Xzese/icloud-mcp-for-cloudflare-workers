@@ -14,6 +14,8 @@ import { DriveOperationRepository } from "../src/persistence/drive-operations.ts
 import { Envelopes } from "../src/crypto/envelopes.ts";
 import { b64 } from "../src/crypto/bytes.ts";
 import { AppError } from "../src/errors.ts";
+import { createWorkflowAppleFacade } from "../src/reminders/create-workflow.ts";
+import { listDuplicationAppleFacade } from "../src/reminders/list-duplication-apple.ts";
 
 const owner = "synthetic-services-owner";
 const code = (value: string) => (error: unknown) => error instanceof AppError && error.code === value;
@@ -175,6 +177,15 @@ test("enabling Reminders after Drive-only selection explicitly approves it from 
       return Response.json({ status: "success" });
     };
     assert.equal((await f.service.status()).services.reminders.ready, false);
+    const before = f.db.sqlite.prepare("SELECT * FROM apple_session_state").get();
+    const listId = `List/${crypto.randomUUID().toUpperCase()}`, reminderId = `Reminder/${crypto.randomUUID().toUpperCase()}`;
+    await assert.rejects(createWorkflowAppleFacade(f.env, owner, f.service).binding(), code("DEVICE_APPROVAL_PENDING"));
+    await assert.rejects(listDuplicationAppleFacade(f.env, owner, f.service), code("DEVICE_APPROVAL_PENDING"));
+    await assert.rejects(f.service.readReminderListSectionsForMCP({ expectedGeneration: f.generation, listId }), code("DEVICE_APPROVAL_PENDING"));
+    await assert.rejects(f.service.inspectReminder({ expectedGeneration: f.generation, listId, reminderId }), code("DEVICE_APPROVAL_PENDING"));
+    await assert.rejects(f.service.collectRemindersForMCP({ view: "all", timeZone: "UTC", referenceInstant: "2026-10-13T12:00:00Z", sortBy: "title", filters: { status: "open" } }, f.generation), code("DEVICE_APPROVAL_PENDING"));
+    assert.equal(paths.length, 0, "New Reminders workflows never request approval implicitly from a common READY account.");
+    assert.deepEqual(f.db.sqlite.prepare("SELECT * FROM apple_session_state").get(), before);
     const approved = await f.service.approveReminders(f.generation);
     assert.equal(approved.services.reminders.ready, true);
     assert.equal(paths.length, 2);
@@ -219,6 +230,8 @@ test("Reminders reads fail closed before dispatch and before release; continuati
   const list = { recordName: "List/SYNTHETIC", recordType: "List", zoneID, fields: { Name: { type: "STRING", value: "Synthetic list" } } };
   const read = (continuation?: string) => f.service.readForMCP(ControlledRead.parse({ action: "reminders", expectedGeneration: f.generation, listId: list.recordName, includeCompleted: false, continuation }));
   try {
+    const duplication = await listDuplicationAppleFacade(f.env, owner, f.service);
+    await duplication.assertCurrent(f.generation, original.connection.dsid);
     let requests = 0, disableAtQuery = false;
     globalThis.fetch = async url => {
       requests++;
@@ -232,6 +245,7 @@ test("Reminders reads fail closed before dispatch and before release; continuati
     const first = await read();
     assert.equal(first.result.continuation, "synthetic-next-page");
     await f.settings.save({ expectedRevision: 0, settings: structuredClone(DEFAULT_SERVICE_SETTINGS) });
+    await assert.rejects(duplication.assertCurrent(f.generation, original.connection.dsid), code("CONFLICT"));
     const before = requests;
     await assert.rejects(read("synthetic-next-page"), code("CONFLICT"));
     assert.equal(requests, before);

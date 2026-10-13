@@ -8,7 +8,7 @@ import { loginAssurance } from "../src/auth/apple/policy.ts";
 import { Envelopes } from "../src/crypto/envelopes.ts";
 import { b64 } from "../src/crypto/bytes.ts";
 import { ReminderJobService, canonicalItem } from "../src/jobs/service.ts";
-import { JobItem, JOB_LIMITS, AppendJob } from "../src/jobs/schemas.ts";
+import { JobItem, JOB_LIMITS, AppendJob, BulkUpdateInput } from "../src/jobs/schemas.ts";
 import { aggregateState, retryAt } from "../src/jobs/state.ts";
 import { AppError } from "../src/errors.ts";
 import { accountScope, fingerprint } from "../src/lib/canonical.ts";
@@ -116,14 +116,50 @@ test("canonical creation defaults, UUID case and date representations produce de
   assert.equal(CreateReminderInput.safeParse({ listId, idempotencyKey: key, title: "Title", ownerId: "forged" }).success, false);
 });
 
-test("migration is additive and repeated application leaves the existing session envelope and fences intact", async () => {
+test("bulk update schema is strict, nonempty, and canonicalization preserves omitted and null fields", () => {
+  const target = { listId, reminderId: "Reminder/SYNTHETIC", recordChangeTag: "tag-1" };
+  assert.equal(BulkUpdateInput.safeParse({ ...target, changes: {} }).success, false);
+  assert.equal(BulkUpdateInput.safeParse({ ...target, changes: { title: "Changed", recurrence: null } }).success, false);
+  const value = JobItem.parse({ kind: "bulk_update", clientItemKey: "update", input: { ...target,
+    changes: { dueDate: "2030-03-04T09:00:00+01:00", notes: "" } } });
+  const normalized = canonicalItem(value);
+  assert.equal(normalized.kind, "bulk_update");
+  if (normalized.kind !== "bulk_update") throw new Error("Expected bulk update input.");
+  assert.deepEqual(normalized.input.changes, { dueDate: "2030-03-04T08:00:00.000Z", notes: "" });
+  const cleared = canonicalItem(JobItem.parse({ kind: "bulk_update", clientItemKey: "clear", input: { ...target, changes: { dueDate: null } } }));
+  assert.equal(cleared.kind === "bulk_update" && cleared.input.changes.dueDate, null);
+});
+
+test("kind-constraint migration preserves encrypted jobs, replay ledgers and the Apple session", async () => {
   const f = await fixture();
   try {
+    // Recreate the deployed 0001 shape before inserting representative existing data.
+    f.db.sqlite.exec("PRAGMA foreign_keys = OFF");
+    f.db.sqlite.exec("DROP TABLE reminder_job_outbox; DROP TABLE reminder_job_chunks; DROP TABLE reminder_job_receipts; DROP TABLE reminder_job_items; DROP TABLE reminder_job_accounts; DROP TABLE reminder_jobs;");
+    f.db.sqlite.exec(readFileSync(new URL("../migrations/0001_reminder_jobs.sql", import.meta.url), "utf8"));
+    f.db.sqlite.exec("PRAGMA foreign_keys = ON");
+    const prior = await draft(f);
+    await assert.rejects(f.jobs.create({ kind: "bulk_update", expectedGeneration: f.generation, idempotencyKey: crypto.randomUUID() }), hasCode("CONFIGURATION_REQUIRED"));
+    await assert.rejects(f.jobs.create({ kind: "bulk_complete", expectedGeneration: f.generation, idempotencyKey: crypto.randomUUID() }), hasCode("CONFIGURATION_REQUIRED"));
+    const priorItem = (await f.jobs.repository.items(await f.jobs.repository.get(prior.jobId)))[0];
+    const priorEnvelope = priorItem.input_envelope;
+    const beforeReceipts = f.db.sqlite.prepare("SELECT * FROM reminder_job_receipts").all();
+    const beforeChunks = f.db.sqlite.prepare("SELECT * FROM reminder_job_chunks").all();
     const before = f.db.sqlite.prepare("SELECT * FROM apple_session_state").get();
-    const migration = readFileSync(new URL("../migrations/0001_reminder_jobs.sql", import.meta.url), "utf8");
-    f.db.sqlite.exec(migration); f.db.sqlite.exec(migration);
+    const migration = readFileSync(new URL("../migrations/0004_bulk_change_jobs.sql", import.meta.url), "utf8");
+    f.db.sqlite.exec("BEGIN"); f.db.sqlite.exec(migration); f.db.sqlite.exec("COMMIT");
+    f.db.sqlite.exec("BEGIN"); f.db.sqlite.exec(migration); f.db.sqlite.exec("COMMIT");
     assert.deepEqual(f.db.sqlite.prepare("SELECT * FROM apple_session_state").get(), before);
     assert.equal((await f.sessions.load()).session.login.expiresAt, f.session.login.expiresAt);
+    assert.equal((await f.jobs.repository.items(await f.jobs.repository.get(prior.jobId)))[0].input_envelope, priorEnvelope);
+    assert.deepEqual(f.db.sqlite.prepare("SELECT * FROM reminder_job_receipts").all(), beforeReceipts);
+    assert.deepEqual(f.db.sqlite.prepare("SELECT * FROM reminder_job_chunks").all(), beforeChunks);
+    assert.equal((await f.jobs.repository.input(await f.jobs.repository.get(prior.jobId), priorItem)).kind, "bulk_create");
+    assert.deepEqual(f.db.sqlite.prepare("PRAGMA foreign_key_check").all(), []);
+    const added = await f.jobs.create({ kind: "bulk_update", expectedGeneration: f.generation, idempotencyKey: crypto.randomUUID() });
+    assert.equal(added.kind, "bulk_update");
+    const completed = await f.jobs.create({ kind: "bulk_complete", expectedGeneration: f.generation, idempotencyKey: crypto.randomUUID() });
+    assert.equal(completed.kind, "bulk_complete");
   } finally { f.close(); }
 });
 
@@ -293,7 +329,99 @@ async function deleteJob(f: Awaited<ReturnType<typeof fixture>>, targets: { list
     items: targets.map((input, index) => ({ kind: "bulk_delete", clientItemKey: `delete-${index}`, input })) });
   return f.jobs.preview({ jobId: job.jobId, expectedRevision: appended.revision });
 }
+async function appendChange(f: Awaited<ReturnType<typeof fixture>>, kind: "bulk_update" | "bulk_complete", items: unknown[]) {
+  const job = await f.jobs.create({ kind, expectedGeneration: f.generation, idempotencyKey: crypto.randomUUID() });
+  return f.jobs.append({ jobId: job.jobId, expectedRevision: job.revision, chunkKey: crypto.randomUUID(), items });
+}
 const deletedField = (f: Awaited<ReturnType<typeof fixture>>, id: string) => (f.records.get(id)!.fields as Record<string, { value: number }>).Deleted.value;
+
+test("bulk update and completion reserve separate action receipts without replaying an update key", async () => {
+  const f = await fixture();
+  try {
+    const [target] = await created(f, 1);
+    const update = { kind: "bulk_update", clientItemKey: "update", input: { ...target, changes: { title: "Reserved update" } } };
+    const complete = { kind: "bulk_complete", clientItemKey: "complete", input: target };
+    const first = await appendChange(f, "bulk_update", [update]);
+    await appendChange(f, "bulk_complete", [complete]);
+    assert.equal((await f.jobs.repository.counts(await f.jobs.repository.get(first.jobId))).total, 1);
+    await assert.rejects(appendChange(f, "bulk_update", [{ ...update, clientItemKey: "update-again" }]), hasCode("CONFLICT"));
+    assert.equal(f.db.sqlite.prepare("SELECT COUNT(*) AS count FROM reminder_job_receipts").get()?.count, 3);
+    assert.equal(f.network.modifies, 1);
+  } finally { f.close(); }
+});
+
+test("bulk update and completion preflight exact simple roots; lost acknowledgements remain read-only unknown", async () => {
+  const f = await fixture();
+  try {
+    const [simple, stale, parent, completed, uncertain, undated] = await created(f, 6);
+    attachChild(f, parent.reminderId);
+    const before = f.network.modifies;
+    const changed = await appendChange(f, "bulk_update", [
+      { kind: "bulk_update", clientItemKey: "simple", input: { ...simple, changes: { title: "Updated synthetic title", flagged: true } } },
+      { kind: "bulk_update", clientItemKey: "stale", input: { ...stale, recordChangeTag: "stale-tag", changes: { notes: "Stale update" } } },
+      { kind: "bulk_update", clientItemKey: "parent", input: { ...parent, changes: { priority: 5 } } },
+    ]);
+    const preview = await f.jobs.preview({ jobId: changed.jobId, expectedRevision: changed.revision });
+    assert.deepEqual(preview.results.map(result => result.result?.code ?? null), [null, "CONFLICT", "UNSUPPORTED_FEATURE"]);
+    await f.jobs.start({ jobId: preview.jobId, previewToken: preview.previewToken });
+    const updated = await f.jobs.continue({ jobId: preview.jobId });
+    assert.equal(updated.state, "completed_with_errors"); assert.equal(updated.counts.succeeded, 1, JSON.stringify(updated.results)); assert.equal(f.network.modifies, before + 1);
+
+    const completion = await appendChange(f, "bulk_complete", [{ kind: "bulk_complete", clientItemKey: "complete", input: completed }]);
+    const completionPreview = await f.jobs.preview({ jobId: completion.jobId, expectedRevision: completion.revision });
+    await f.jobs.start({ jobId: completionPreview.jobId, previewToken: completionPreview.previewToken });
+    const done = await f.jobs.continue({ jobId: completion.jobId });
+    assert.equal(done.state, "completed"); assert.equal(done.counts.succeeded, 1);
+    assert.equal((f.records.get(completed.reminderId)!.fields as Record<string, { value: number }>).Completed.value, 1);
+    assert.equal(f.network.modifies, before + 2);
+
+    const uncertainJob = await appendChange(f, "bulk_update", [{ kind: "bulk_update", clientItemKey: "uncertain", input: { ...uncertain, changes: { title: "May have committed" } } }]);
+    const uncertainPreview = await f.jobs.preview({ jobId: uncertainJob.jobId, expectedRevision: uncertainJob.revision });
+    await f.jobs.start({ jobId: uncertainPreview.jobId, previewToken: uncertainPreview.previewToken });
+    f.network.loseAck = true;
+    const first = await f.jobs.continue({ jobId: uncertainJob.jobId });
+    assert.equal(first.counts.unknown, 1); assert.equal(first.results[0].result?.operationConfirmed, false);
+    const reconciled = await new ReminderJobService(f.env, owner).continue({ jobId: uncertainJob.jobId });
+    assert.equal(reconciled.counts.unknown, 1); assert.equal(reconciled.results[0].result?.desiredStateObserved, true);
+    assert.equal(reconciled.results[0].result?.operationConfirmed, false); assert.equal(f.network.modifies, before + 3);
+
+    const allDayItems = Array.from({ length: 2 }, (_, index) => JobItem.parse({ kind: "bulk_create", clientItemKey: `all-day-${index}`, input: {
+      listId, idempotencyKey: crypto.randomUUID(), title: `All-day synthetic ${index}`, dueDate: "2030-03-04T00:00:00.000Z", timeZone: "Europe/London", allDay: true,
+    } }));
+    const allDayJob = await ready(f, allDayItems);
+    assert.equal((await f.jobs.continue({ jobId: allDayJob.jobId })).state, "completed");
+    const allDayTargets = allDayItems.map(value => ({ listId,
+      reminderId: `Reminder/${value.kind === "bulk_create" ? value.input.idempotencyKey.toUpperCase() : ""}`,
+      recordChangeTag: String(f.records.get(`Reminder/${value.kind === "bulk_create" ? value.input.idempotencyKey.toUpperCase() : ""}`)!.recordChangeTag),
+    }));
+    const clearJob = await appendChange(f, "bulk_update", [{ kind: "bulk_update", clientItemKey: "clear-all-day", input: { ...allDayTargets[0], changes: { dueDate: null } } }]);
+    const clearPreview = await f.jobs.preview({ jobId: clearJob.jobId, expectedRevision: clearJob.revision });
+    await f.jobs.start({ jobId: clearPreview.jobId, previewToken: clearPreview.previewToken });
+    f.network.loseAck = true;
+    const clearUnknown = await f.jobs.continue({ jobId: clearJob.jobId });
+    assert.equal(clearUnknown.counts.unknown, 1);
+    const clearRow = (await f.jobs.repository.items(await f.jobs.repository.get(clearJob.jobId)))[0];
+    const plannedClear = await f.jobs.repository.decrypt(await f.jobs.repository.get(clearJob.jobId), clearRow.ordinal, "mutation", clearRow.mutation_envelope) as { fields: Record<string, { value: unknown }> };
+    assert.equal(plannedClear.fields.DueDate.value, null); assert.equal(plannedClear.fields.TimeZone.value, null); assert.equal(plannedClear.fields.AllDay.value, 0);
+    const clearObserved = await f.jobs.continue({ jobId: clearJob.jobId });
+    assert.equal(clearObserved.counts.unknown, 1); assert.equal(clearObserved.results[0].result?.desiredStateObserved, true);
+    assert.equal(f.network.modifies, before + 6);
+
+    const conversionJob = await appendChange(f, "bulk_update", [
+      { kind: "bulk_update", clientItemKey: "timed-conversion", input: { ...allDayTargets[1], changes: {
+        allDay: false, dueDate: "2030-03-04T09:00:00Z", timeZone: "Europe/London",
+      } } },
+      { kind: "bulk_update", clientItemKey: "all-day-conversion", input: { ...undated, changes: {
+        allDay: true, dueDate: "2030-03-04T00:00:00Z",
+      } } },
+    ]);
+    const conversionPreview = await f.jobs.preview({ jobId: conversionJob.jobId, expectedRevision: conversionJob.revision });
+    assert.deepEqual(conversionPreview.results.map(result => result.result?.code), ["UNSUPPORTED_FEATURE", "UNSUPPORTED_FEATURE"]);
+    await f.jobs.start({ jobId: conversionPreview.jobId, previewToken: conversionPreview.previewToken });
+    assert.equal((await f.jobs.continue({ jobId: conversionJob.jobId })).counts.failed, 2);
+    assert.equal(f.network.modifies, before + 6);
+  } finally { f.close(); }
+});
 
 test("bulk deletion is permanent and preview refuses stale, missing, duplicate and parent targets before dispatch", async () => {
   const f = await fixture();
@@ -563,4 +691,61 @@ test("permission revocation after Apple confirmation retains an uncertain job in
     assert.equal(reconciled.counts.succeeded, 0);
     assert.equal(f.network.modifies, 1, "Reconciliation never resubmits Apple's accepted mutation.");
   } finally { f.close(); }
+});
+
+test("the final job transport fences disconnect and settings races while retaining legacy defaults", async () => {
+  for (const hook of ["intent", "dispatch-check", "post-hook-permission", "transport-permission", "settings-revoked", "settings-reenabled", "settings-installed"] as const) {
+    const f = await fixture();
+    try {
+      const settings = new ServiceSettingsRepository(f.env, owner);
+      if (hook === "settings-installed") f.db.sqlite.exec("DROP TABLE owner_service_settings");
+      if (hook === "settings-reenabled") await settings.save({ expectedRevision: 0, settings: (await settings.load()).settings });
+      const job = await ready(f), before = structuredClone([...f.records]);
+      let intentSaved = false, changed = false, hooksChecked = false, permissionChecks = 0;
+      f.db.afterStatement = async sql => {
+        if (sql.startsWith("UPDATE reminder_job_items SET state = 'dispatching'")) intentSaved = true;
+        if (intentSaved && sql.startsWith("SELECT j.cancel_requested")) hooksChecked = true;
+        if (hooksChecked && sql.startsWith("SELECT revision, settings_json FROM owner_service_settings")) permissionChecks++;
+        if (intentSaved && (hook === "intent" || hook === "dispatch-check" && hooksChecked
+          || hook === "post-hook-permission" && permissionChecks === 1
+          || ["transport-permission", "settings-revoked", "settings-reenabled"].includes(hook) && permissionChecks === 2
+          || hook === "settings-installed" && hooksChecked && sql.startsWith("SELECT 1 AS active FROM apple_session_state"))) {
+          f.db.afterStatement = null;
+          if (hook === "settings-installed") {
+            f.db.sqlite.exec(readFileSync(new URL("../migrations/0002_service_settings.sql", import.meta.url), "utf8"));
+          } else if (hook === "settings-revoked" || hook === "settings-reenabled") {
+            const current = await settings.load();
+            await settings.save({ expectedRevision: current.revision, settings: { ...current.settings, reminders: { ...current.settings.reminders, write: false } } });
+            if (hook === "settings-reenabled") await settings.save({ expectedRevision: current.revision + 1, settings: current.settings });
+          } else {
+            const response = await applicationRoute(new Request(f.env.APP_ORIGIN + "/api/auth/disconnect", {
+              method: "POST", headers: { origin: f.env.APP_ORIGIN, "oai-authenticated-user-id": owner, "content-type": "application/json" }, body: "{}",
+            }), f.env);
+            assert.equal(response?.status, 200);
+          }
+          changed = true;
+        }
+      };
+      await f.jobs.continue({ jobId: job.jobId });
+      assert.equal(changed, true, hook);
+      assert.equal(f.network.modifies, 0, `records/modify cannot follow the race at ${hook}.`);
+      assert.deepEqual([...f.records], before);
+      assert.equal((await f.sessions.status()).state, hook.startsWith("settings-") ? "READY" : "DISCONNECTED");
+      assert.equal((await f.jobs.get({ jobId: job.jobId })).counts.succeeded, 0);
+    } finally { f.close(); }
+  }
+  for (const availability of ["missing", "stored"] as const) {
+    const f = await fixture();
+    try {
+      if (availability === "missing") f.db.sqlite.exec("DROP TABLE owner_service_settings");
+      else {
+        const settings = new ServiceSettingsRepository(f.env, owner);
+        await settings.save({ expectedRevision: 0, settings: (await settings.load()).settings });
+      }
+      const job = await ready(f);
+      const result = await f.jobs.continue({ jobId: job.jobId });
+      assert.equal(result.counts.succeeded, 1, `Stable ${availability} settings retain authorized creation.`);
+      assert.equal(f.network.modifies, 1);
+    } finally { f.close(); }
+  }
 });

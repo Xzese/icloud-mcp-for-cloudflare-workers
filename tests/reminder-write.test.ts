@@ -401,7 +401,8 @@ test("copy transport creates fresh related IDs and tolerates only signed urgency
   const result = await client.modifyTransfer("create", rootWrite, [destinationWrite], [destination], dependencies, guards, undefined, sourceListId);
   assert.equal(result.length, 8);
   assert.equal(result[0].recordName, copy.recordName);
-  assert.deepEqual((sent?.operations as { record: { parent?: unknown } }[])[0].record.parent, { recordName: destinationId });
+  assert.equal((sent?.operations as { record: { recordName: string } }[])[0].record.recordName, destinationId, "A first copy initializes native parent membership first.");
+  assert.deepEqual((sent?.operations as { record: { parent?: unknown } }[])[1].record.parent, { recordName: destinationId });
   assert.equal((sent?.operations as unknown[]).length, 8);
   corruptChecksum = true;
   await assert.rejects(client.modifyTransfer("create", rootWrite, [destinationWrite], [destination], dependencies, guards, undefined, sourceListId), (error: unknown) => error instanceof WriteOutcomeUnknownError);

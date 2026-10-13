@@ -127,7 +127,7 @@ export function readCompletionRecurrence(record: CloudKitRecord): { kind: "weekl
       if (canonicalJSON(JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(unb64(positions.value, 8192)))) === "[-1]") return { kind: "last-day-monthly", endDate };
     } catch { /* reject an unknown pattern below */ }
   }
-  throw new AppError("UNSUPPORTED_FEATURE", "Supported completion patterns are interval-one weekly, all-day daily and the observed last-day monthly rule.");
+  throw new AppError("UNSUPPORTED_FEATURE", "Supported completion patterns are interval-one weekly, all-day daily, non-ended timed daily with one absolute alarm, and the observed last-day monthly rule.");
 }
 export function recurrenceEdit(record: CloudKitRecord, input: RecurrenceInput) {
   const before = readRecurrence(record), parsed = RecurrenceChanges.parse(input);

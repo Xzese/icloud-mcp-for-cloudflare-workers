@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { canonicalJSON } from "../lib/canonical.ts";
+import { ListId } from "./identifiers.ts";
 
 export const COLOR_PRESETS = ["red", "orange", "yellow", "green", "light-blue", "blue", "indigo", "pink", "purple", "brown", "grey", "rose"] as const;
 export const ColorPreset = z.enum(COLOR_PRESETS).describe("One of the twelve built-in Reminders list colour presets.");
@@ -43,7 +44,7 @@ export const EmojiInput = z.string().max(32).refine(isSingleEmojiGrapheme,
   "Supply one emoji grapheme from the native emoji picker.").describe("One emoji grapheme, such as 🛒 or 🏷️. Plain text, multiple emoji and clearing are not supported.");
 
 const UpdateListAppearanceFields = z.object({
-  listId: z.string().min(6).max(255).regex(/^List\/[\x21-\x2e\x30-\x7e]+$/)
+  listId: ListId
     .describe("Exact list ID returned by a Reminders list read; do not use a title or invent an ID."),
   recordChangeTag: z.string().min(1).max(512).refine(value => !/[\u0000-\u001f\u007f]/.test(value))
     .describe("Current Apple version tag returned by get_reminder_list_appearance. Stale tags fail without retry."),
