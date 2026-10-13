@@ -1,4 +1,6 @@
 // Counts and protocol metadata only. No account identifiers, field values or tokens.
+import { DRIVE_MAX_METADATA_BYTES, DRIVE_MAX_TRANSFER_BYTES, DRIVE_TRANSFER_TIMEOUT_MS, validateDriveMetadataURL, driveContentURL } from "../../src/transport/drive-http.ts";
+
 export function localAppleHeaders(input) {
   const headers = new Headers(input);
   // Miniflare adds a fictitious zone marker (worker.example.com). That is local
@@ -6,6 +8,33 @@ export function localAppleHeaders(input) {
   headers.delete("cf-worker");
   return headers;
 }
+
+export function localAppleContentHeaders(input) {
+  const incoming = new Headers(input);
+  // Forward only protocol framing. Signed content URLs are bearer credentials,
+  // and must never receive Apple session or other caller-supplied credentials.
+  const headers = new Headers();
+  for (const name of ["accept", "content-type"]) {
+    const value = incoming.get(name);
+    if (value !== null) headers.set(name, value);
+  }
+  return headers;
+}
+
+export function classifyDriveRelayURL(url) {
+  try { validateDriveMetadataURL(url); return "metadata"; }
+  catch { /* Try the two signed content URL shapes below. */ }
+  try { driveContentURL(url.href, "download"); return "download"; }
+  catch { /* Try the upload URL shape below. */ }
+  const dsid = /^\/(\d{1,32})\/singleFileUpload$/.exec(url.pathname)?.[1];
+  if (dsid) {
+    try { driveContentURL(url.href, "upload", dsid); return "upload"; }
+    catch { /* Unsupported host, query, or URL credentials. */ }
+  }
+  return null;
+}
+
+export { DRIVE_MAX_METADATA_BYTES, DRIVE_MAX_TRANSFER_BYTES, DRIVE_TRANSFER_TIMEOUT_MS };
 export function summarizeAppleFailure(url, { stage, status, bytesRead, elapsedMs, timeout, aborted, error }) {
   return {
     at: new Date().toISOString(), host: url.hostname, path: url.pathname, event: "local-apple-request-failed",
@@ -18,7 +47,45 @@ export function summarizeAppleFailure(url, { stage, status, bytesRead, elapsedMs
 }
 export function summarizeAppleResponse(url, status, body) {
   const result = { at: new Date().toISOString(), host: url.hostname, path: url.pathname, status };
+  if (/^p\d{1,3}-docws\.icloud\.com$/.test(url.hostname) && url.pathname === "/ws/com.apple.CloudDocs/upload/web") {
+    result.allocationShape = Array.isArray(body) ? "array" : body === null ? "null" : typeof body;
+    const entries = Array.isArray(body) ? body.slice(0, 2) : [body];
+    result.allocations = entries.map(entry => {
+      const fields = {};
+      for (const key of ["document_id", "url", "status", "size", "content_type"]) {
+        const value = entry?.[key];
+        fields[key] = value === null ? "null" : Array.isArray(value) ? "array" : typeof value;
+      }
+      let target;
+      if (typeof entry?.url === "string") try {
+        const address = new URL(entry.url);
+        target = { host: ["cws.icloud-content.com", "cvws.icloud-content.com"].includes(address.hostname) || /^p\d{1,3}-contentws\.icloud\.com$/.test(address.hostname) ? address.hostname : "other",
+          route: /^\/\d{1,32}\/singleFileUpload$/.test(address.pathname) ? "account-single-file-upload" : "other",
+          signedTokenPresent: address.searchParams.has("tk") };
+      } catch { target = { invalid: true }; }
+      return { fields, ...(target ? { target } : {}) };
+    });
+  }
   if (!body || typeof body !== "object" || Array.isArray(body)) return result;
+  if (/^p\d{1,3}-(?:drivews|docws)\.icloud\.com$/.test(url.hostname) && status >= 400) {
+    const reason = [body.errorMessage, body.errorReason, body.reason, body.message].filter(value => typeof value === "string").join(" ").toLowerCase();
+    result.protocolErrorTerms = ["invalid", "missing", "object", "array", "item", "folder", "file", "body", "json", "request", "root", "argument", "parameter", "not found"].filter(term => reason.includes(term));
+  }
+  if (/^p\d{1,3}-docws\.icloud\.com$/.test(url.hostname) && url.pathname === "/ws/com.apple.CloudDocs/update/documents") {
+    result.commitStatus = Number.isSafeInteger(body.status?.status_code) ? body.status.status_code : null;
+    result.resultCount = Array.isArray(body.results) ? body.results.length : null;
+    result.documents = (Array.isArray(body.results) ? body.results.slice(0, 2) : []).map(entry => {
+      const doc = entry?.document;
+      const fields = {};
+      for (const key of ["document_id", "item_id", "zone", "parent_id", "name", "extension", "etag", "type", "size"]) {
+        const value = doc?.[key];
+        fields[key] = value === null ? "null" : Array.isArray(value) ? "array" : typeof value;
+      }
+      return { status: Number.isSafeInteger(entry?.status?.status_code) ? entry.status.status_code : null, fields,
+        parentIdentityKind: typeof doc?.parent_id !== "string" ? "absent" : doc.parent_id.startsWith("FOLDER::com.apple.CloudDocs::") ? "owned-folder" : "opaque",
+        nameIncludesExtension: typeof doc?.name === "string" && doc.name.includes(".") };
+    });
+  }
   if (url.hostname === "setup.icloud.com" && url.pathname === "/setup/ws/1/accountLogin") {
     result.services = {};
     for (const [name, service] of Object.entries(body.webservices ?? {})) {

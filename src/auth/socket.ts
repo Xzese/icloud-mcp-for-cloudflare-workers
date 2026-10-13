@@ -1,3 +1,4 @@
+import { ServiceSettingsRepository } from "../persistence/service-settings.ts";
 import { AppError, publicError } from "../errors.ts";
 import { hex } from "../crypto/bytes.ts";
 import type { RuntimeEnv } from "../platform/sites.ts";
@@ -15,6 +16,8 @@ export async function appleAuthSocket(request: Request, env: RuntimeEnv, owner: 
   if (request.headers.get("sec-websocket-protocol") !== APPLE_AUTH_PROTOCOL) throw new AppError("VALIDATION_ERROR", "Use the supported Apple connection protocol.");
   const query = new URL(request.url).searchParams; const generation = query.get("generation") ?? "";
   if (query.size !== 1 || !/^(0|[1-9][0-9]{0,15})$/.test(generation) || !Number.isSafeInteger(Number(generation))) throw new AppError("VALIDATION_ERROR", "Refresh connection status before starting sign-in.");
+  const settingsRepository = new ServiceSettingsRepository(env, owner);
+  await settingsRepository.load();
   const repository = new AppleSessionRepository(env, owner);
   const fence = await repository.begin(Number(generation));
   const [client, server] = Object.values(new WebSocketPair());
@@ -26,7 +29,7 @@ export async function appleAuthSocket(request: Request, env: RuntimeEnv, owner: 
   const flow = new AppleSignInFlow(new AppleAuthHTTP(undefined, undefined, abort.signal), abort.signal, async (session, result) => {
     if (abort.signal.aborted || closed()) throw new AppError("RESTART_REQUIRED", "The connection was lost. Restart sign-in.", 409);
     await repository.commit(fence, session, result.state, result.state === "DEVICE_APPROVAL_PENDING" ? result.action : undefined);
-  }, undefined, appleGates(env).retentionWritesEnabled);
+  }, undefined, appleGates(env).retentionWritesEnabled, async () => (await settingsRepository.load()).settings);
   const clean = () => {
     if (closed()) return;
     const successful = phase === "complete";

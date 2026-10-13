@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { DatabaseSync, type SQLInputValue } from "node:sqlite";
 import { readFileSync } from "node:fs";
+import { sessionServices } from "../src/auth/apple/services.ts";
 import { AppleSessionRepository, RecurringIntentSchema, mergeSavedLists, type AppleSession } from "../src/persistence/apple-sessions.ts";
 import { AppleConnectionService, ControlledRead, SearchReminderInput } from "../src/auth/service.ts";
 import { AppError } from "../src/errors.ts";
@@ -254,7 +255,7 @@ test("renewal reuses accepted credentials and exchanges saved tokens once withou
     assert.deepEqual(requests.map(request => request.path), ["/setup/ws/1/validate"]);
     assert.equal(requests[0].body, null);
     const accepted = await repository.load();
-    assert.equal(accepted.session.connection.cloudKitURL.includes("p42-"), true);
+    assert.equal(accepted.session.connection.cloudKitURL?.includes("p42-"), true);
     assert.equal(accepted.session.renewal?.lastValidatedAt, clock.now);
     assert.equal(accepted.session.renewal?.lastRenewedAt, null);
     assert.deepEqual(accepted.session.login, original.login);
@@ -575,7 +576,7 @@ test("Apple sessions are encrypted, owner-scoped, and restore the cookie jar", a
   const db = new SQLiteD1(); const repository = appleRepo(db);
   const setup = await repository.begin(0);
   const unknownMetadata = { retentionDays: null, retentionSource: null, lastValidatedAt: null, lastAppleSuccessAt: null, lastRenewedAt: null, nextRetryAt: null, requiredAction: null };
-  assert.deepEqual(await repository.status(), { generation: 1, version: 1, state: "CONNECTING", action: null, nextAttemptAt: 0, transportReady: false, liveReadValidated: false, expiresAt: null, ...unknownMetadata });
+  assert.deepEqual(await repository.status(), { generation: 1, version: 1, state: "CONNECTING", action: null, nextAttemptAt: 0, transportReady: false, services: null, accountAuthenticated: false, liveReadValidated: false, expiresAt: null, ...unknownMetadata });
   const session = appleSession();
   session.savedLists = mergeSavedLists([], [{ id: "List/SAVED-PRIVATE-ID", title: "Private saved list" }]);
   session.directListSnapshot = { updatedAt: Date.now() };
@@ -588,7 +589,7 @@ test("Apple sessions are encrypted, owner-scoped, and restore the cookie jar", a
   assert.deepEqual(loaded.session, session);
   const restoredCookies = new CookieJar(loaded.session.auth.cookies);
   assert.match(restoredCookies.header(new URL("https://setup.icloud.com/setup/ws/1/accountLogin")) ?? "", /X-APPLE-WEBAUTH-TOKEN=cookie-session-secret/);
-  assert.deepEqual(await repository.status(), { generation: 1, version: 2, state: "READY", action: null, nextAttemptAt: 0, transportReady: true, liveReadValidated: false, expiresAt: session.login.expiresAt, ...unknownMetadata, retentionDays: 30, retentionSource: "interactive-consent" });
+  assert.deepEqual(await repository.status(), { generation: 1, version: 2, state: "READY", action: null, nextAttemptAt: 0, transportReady: true, services: sessionServices(session, "READY"), accountAuthenticated: true, liveReadValidated: false, expiresAt: session.login.expiresAt, ...unknownMetadata, retentionDays: 30, retentionSource: "interactive-consent" });
 
   const other = appleRepo(db, "other-owner", repository.envelopes);
   assert.equal((await other.status()).state, "DISCONNECTED");
@@ -1114,9 +1115,10 @@ test("known-list reads authorize live without any historical checkpoint and fenc
     assert.deepEqual((first.result.records as { id: string }[]).map(item => item.id), ["Reminder/OPEN"]); assert.equal(first.result.continuation, "known-next");
     assert.equal((await repository.load()).session.directListSnapshot, undefined);
     await injectPreviousSession(db, repository, { catalogueSync: { token: "expired-checkpoint", initialComplete: false, pending: true }, catalogueAuto: { lastErrorCode: "RESTART_REQUIRED", pausedForError: true } });
-    replies.push({ body: { records: [list] } }, { body: { records: [reminder("Reminder/CLOSED", 1)] } });
-    const second = await service().readForMCP(input(true, "known-next"));
-    assert.equal((second.result.records as { completed: boolean }[])[0].completed, true);
+    await assert.rejects(service().readForMCP(input(true, "known-next")), hasCode("CONFLICT"));
+    replies.push({ body: { records: [list] } }, { body: { records: [reminder("Reminder/OPEN-LATER", 0)] } });
+    const second = await service().readForMCP(input(false, "known-next"));
+    assert.equal((second.result.records as { completed: boolean }[])[0].completed, false);
     assert.equal(requests.at(-1)!.body.continuationMarker, "known-next");
     assert.ok(requests.every(request => !request.path.endsWith("/changes/zone")));
     for (const invalid of ["List/A/B", "List/ bad", "List/a\n", "Reminder/A"]) assert.equal(ControlledRead.safeParse({ ...input(), listId: invalid }).success, false);

@@ -7,6 +7,8 @@ import { AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent, 
 import ControlledReadPanel, { type ReadSummary } from "./controlled-read";
 
 interface Status {
+  accountConnected: boolean;
+  services: { reminders: { enabled: boolean; ready: boolean; read: boolean; write: boolean }; drive: { enabled: boolean; ready: boolean } };
   state: string;
   generation: number;
   nextAttemptAt: number;
@@ -86,6 +88,11 @@ export default function AppleConnection() {
     const timer = setInterval(() => setNow(Date.now()), status?.state === "DEVICE_APPROVAL_PENDING" ? 1000 : 30_000);
     return () => clearInterval(timer);
   }, [status?.state]);
+  useEffect(() => {
+    const changed = () => { setReadState(emptyRead); void refresh(); };
+    window.addEventListener("icloud-services-changed", changed);
+    return () => window.removeEventListener("icloud-services-changed", changed);
+  }, [refresh]);
   const expired = !!status?.expiresAt && status.expiresAt <= now;
   useEffect(() => { if (!expired || status?.state !== "READY") return; const timer = setTimeout(() => void refresh(), 0); return () => clearTimeout(timer); }, [expired, status?.state, refresh]);
   const onSessionRejected = useCallback((message: string) => { setError(message); void refresh(); }, [refresh]);
@@ -103,6 +110,7 @@ export default function AppleConnection() {
       if (controller.signal.aborted) return;
       if (path === "/api/auth/resume") setApproval(previous => ({ ...previous, failures: 0 }));
       await refresh();
+      window.dispatchEvent(new Event("icloud-services-changed"));
     } catch (e) {
       if (controller.signal.aborted) return;
       // A failed request can still have saved a fenced result. Restore status
@@ -139,7 +147,7 @@ export default function AppleConnection() {
   }, [status?.state, refresh]);
   const approvalPaused = !!status && approval.generation === status.generation && (approval.paused || approval.attempts >= 8);
   useEffect(() => {
-    if (!status?.gates.enabled || status.state !== "DEVICE_APPROVAL_PENDING" || expired || refreshing || busyAction || approvalPaused) return;
+    if (!status?.services.reminders.enabled || !status?.gates.enabled || status.state !== "DEVICE_APPROVAL_PENDING" || expired || refreshing || busyAction || approvalPaused) return;
     const previous = approval.generation === status.generation ? approval : null;
     const nextCheck = Math.max(status.nextAttemptAt, previous ? previous.lastAttemptAt + Math.min(60_000, 15_000 * 2 ** previous.failures) : 0);
     const timer = setTimeout(() => {
@@ -151,15 +159,16 @@ export default function AppleConnection() {
   const termsRequired = status?.requiredAction === "review-terms";
   const coolingDown = !!status?.nextRetryAt && status.nextRetryAt > now;
   const localExpired = expired || status?.requiredAction === "local-retention-expired";
-  const ready = !!status?.gates.enabled && status.state === "READY" && status.transportReady && !expired && !needsVerification && !termsRequired && !coolingDown;
+  const ready = !!status?.gates.enabled && status.accountConnected && !expired && !needsVerification && !termsRequired && !coolingDown;
+  const remindersReadable = ready && status?.services.reminders.read === true;
   const pending = status?.state === "DEVICE_APPROVAL_PENDING" && !expired;
   const busy = refreshing || busyAction !== null;
   const title = !status ? (error ? "Connection unavailable" : "Checking your connection…") : localExpired ? "Local connection window expired" : status.requiredAction === "apple-sign-in" ? "Apple sign-in required" : needsVerification ? "Apple verification required" : termsRequired ? "Review Apple terms" : coolingDown ? "Connection temporarily unavailable" : ready ? "Apple account connected" : pending ? "Approve access on your Apple device" : !status.gates.enabled ? "Apple connection is paused" : "Connect your Apple account";
-  const description = !status ? (error ? "Your connection status could not be loaded. Refresh to try again." : "We’re checking whether your Apple account is connected.") : localExpired ? "The fixed application retention window ended. A new sign-in creates a new window." : needsVerification || termsRequired || coolingDown ? status.message : ready ? "You’re ready to find your lists and manage your reminders." : pending ? (status.action === "wait-for-reminders-keys" ? "Your device approval was accepted. Apple is preparing access to your reminders." : "Allow web access when Apple asks on your trusted device. We’ll check approval automatically while this page is open.") : !status.gates.enabled ? "The Apple connection is currently unavailable. You can check again here when it’s enabled." : "Connect once, then use ChatGPT or this page to check your reminders.";
+  const description = !status ? (error ? "Your connection status could not be loaded. Refresh to try again." : "We’re checking whether your Apple account is connected.") : localExpired ? "The fixed application retention window ended. A new sign-in creates a new window." : needsVerification || termsRequired || coolingDown ? status.message : ready ? "Your Apple account is connected. Services above shows which access is enabled and ready." : pending ? (status.action === "wait-for-reminders-keys" ? "Your device approval was accepted. Apple is preparing access to your reminders." : "Allow web access when Apple asks on your trusted device. We’ll check approval automatically while this page is open.") : !status.gates.enabled ? "The Apple connection is currently unavailable. You can check again here when it’s enabled." : "Connect once, then enable and approve the services you want your agent to use.";
   const checks = [
     { label: "Workspace signed in", checked: true },
     { label: "Apple account connected", checked: ready },
-    { label: "Reminders access ready", checked: ready },
+    { label: "Reminders access ready", checked: remindersReadable },
     { label: "Create and edit enabled", checked: ready && status?.writeEnabled === true },
     { label: "Complete and delete enabled", checked: ready && status?.capabilities?.delete === true },
   ];
@@ -170,12 +179,12 @@ export default function AppleConnection() {
         <details className="testing-panel"><summary>Workspace setup</summary><div className="testing-content"><p>Copy this setup identity for the person configuring your workspace.</p><label htmlFor="site-identity">Your Site identity</label><input id="site-identity" value={ownerIdentity} readOnly /><div className="action-row"><Button variant="outline" onClick={() => void navigator.clipboard.writeText(ownerIdentity).then(() => setCopied(true)).catch(() => setError("Copy didn’t work. Select the setup identity and copy it manually."))}><Copy size={16} aria-hidden="true" />{copied ? "Copied" : "Copy Site identity"}</Button><Button variant="ghost" disabled={busy} onClick={() => void refresh()}>Check setup</Button></div></div></details>
       </section> : <section className="dashboard-card" aria-labelledby="connection-title">
         <div className="card-heading"><div className="card-icon"><Cloud size={23} aria-hidden="true" /></div><div><h2 id="connection-title">{title}</h2><p>{description}</p></div></div>
-        {ready ? <div className="account-banner"><ShieldCheck size={20} aria-hidden="true" /><span>You can create, edit, complete, reopen and delete reminders with ChatGPT.</span></div> : termsRequired || coolingDown ? <p className="fine-print" role="status">Your encrypted connection is preserved. {status?.nextRetryAt ? `Retry after ${dateText(status.nextRetryAt)}.` : "Resolve the required action through Apple's official interface."}</p> : pending ? <div className="action-row"><Button className="action-primary" disabled={busy || now < (status?.nextAttemptAt ?? 0)} onClick={() => void action("/api/auth/resume")}><RefreshCw size={17} className={busyAction ? "animate-spin" : undefined} aria-hidden="true" />{busyAction ? "Checking approval…" : "Check Apple approval"}</Button><p className="fine-print" role="status">{approvalPaused ? "Automatic approval checks are paused. Check again manually to start a new bounded attempt; your Apple account is preserved." : "We’re checking Apple approval automatically. You can also check now."}</p></div> : status?.gates.enabled && <><a className="button-link action-primary" href="/connect/apple" target="_top">{status.state === "CONNECTING" ? "Continue Apple sign-in" : "Connect Apple account"}<ArrowRight size={17} aria-hidden="true" /></a><div className="notice"><Info size={17} className="notice-icon" aria-hidden="true" /><p>This uses an unofficial iCloud connection. On the next page, this app processes your Apple password to sign in and Apple verifies your device.</p></div></>}
+        {ready ? <div className="account-banner"><ShieldCheck size={20} aria-hidden="true" /><span>Your agent can use the service permissions you save above.</span></div> : termsRequired || coolingDown ? <p className="fine-print" role="status">Your encrypted connection is preserved. {status?.nextRetryAt ? `Retry after ${dateText(status.nextRetryAt)}.` : "Resolve the required action through Apple's official interface."}</p> : pending ? <div className="action-row"><Button className="action-primary" disabled={busy || now < (status?.nextAttemptAt ?? 0)} onClick={() => void action("/api/auth/resume")}><RefreshCw size={17} className={busyAction ? "animate-spin" : undefined} aria-hidden="true" />{busyAction ? "Checking approval…" : "Check Apple approval"}</Button><p className="fine-print" role="status">{approvalPaused ? "Automatic approval checks are paused. Check again manually to start a new bounded attempt; your Apple account is preserved." : "We’re checking Apple approval automatically. You can also check now."}</p></div> : status?.gates.enabled && <><a className="button-link action-primary" href="/connect/apple" target="_top">{status.state === "CONNECTING" ? "Continue Apple sign-in" : "Connect Apple account"}<ArrowRight size={17} aria-hidden="true" /></a><div className="notice"><Info size={17} className="notice-icon" aria-hidden="true" /><p>This uses an unofficial iCloud connection. On the next page, this app processes your Apple password to sign in and Apple verifies your device.</p></div></>}
         {status?.retentionSource === "owner-authorised-migration" && <p className="fine-print">Your saved connection now uses a {status.retentionDays}-day session window. No new Apple sign-in was needed for this update.</p>}
         <div className="action-row"><Button variant="outline" disabled={busy || readState.busy} onClick={() => void refresh()}><RefreshCw size={16} className={refreshing ? "animate-spin" : undefined} aria-hidden="true" />{refreshing ? "Checking connection…" : "Refresh connection"}</Button></div>
       </section>}
       {error && !ownerIdentity && <p className="connection-error notice notice-warning" role="alert">{error}</p>}
-      {ready ? <ControlledReadPanel key={status!.generation} generation={status!.generation} disabled={busyAction !== null} onReadChange={onReadChange} onSessionRejected={onSessionRejected} /> : <>
+      {remindersReadable ? <ControlledReadPanel key={status!.generation} generation={status!.generation} disabled={busyAction !== null} onReadChange={onReadChange} onSessionRejected={onSessionRejected} /> : status?.services.reminders.enabled === false ? <section className="dashboard-card"><h2>Reminders disabled</h2><p className="fine-print">Enable Reminders in Services to make its tools available.</p></section> : <>
         <section className="dashboard-card"><div className="card-heading"><div className="card-icon"><ListChecks size={22} aria-hidden="true" /></div><div><h2>Your lists</h2><p>Retrieve current lists directly from Apple.</p></div></div><div className="empty-state"><ListChecks size={30} className="empty-icon" aria-hidden="true" /><p>{ownerIdentity ? "Finish workspace setup to get started." : "Connect your Apple account to refresh your lists."}</p></div></section>
         <section className="dashboard-card"><div className="card-heading"><h2>Preview reminders</h2></div><p className="fine-print">Once you’re connected, choose a list to check its open reminders.</p><details className="testing-panel"><summary>Testing &amp; details</summary><div className="testing-content"><p>Connection tests and response details will be available after you connect Apple.</p></div></details></section>
       </>}

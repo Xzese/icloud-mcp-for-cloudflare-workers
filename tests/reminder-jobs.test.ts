@@ -1,4 +1,5 @@
 import test from "node:test";
+import { ServiceSettingsRepository } from "../src/persistence/service-settings.ts";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { JobSQLiteD1 } from "./helpers/sqlite-d1.ts";
@@ -504,5 +505,62 @@ test("result pages honor byte limits and total input enforces the exact 2 MiB th
     assert.ok(jsonBytes(page.results) < 262_144);
     assert.equal(page.nextOffset, page.results.length);
     assert.equal(f.network.modifies, 0);
+  } finally { f.close(); }
+});
+
+
+test("disabling writes during a job's final dispatch check stops every mutation while preserving read-only job status", async () => {
+  const f = await fixture();
+  try {
+    const job = await ready(f, [item(0), item(1)]);
+    const settings = new ServiceSettingsRepository(f.env, owner);
+    f.db.afterStatement = async sql => {
+      if (sql.startsWith("SELECT 1 AS active FROM apple_session_state") && sql.includes("state = 'READY'")) {
+        f.db.afterStatement = null;
+        const current = await settings.load();
+        await settings.save({ expectedRevision: current.revision, settings: { ...current.settings, reminders: { ...current.settings.reminders, write: false } } });
+      }
+    };
+    const result = await f.jobs.continue({ jobId: job.jobId });
+    assert.equal(f.network.modifies, 0, "A setting change before dispatch never sends records/modify.");
+    assert.equal(result.counts.succeeded, 0);
+    assert.ok(result.results.every(item => item.result?.code === "FORBIDDEN"));
+    const before = f.network.reads;
+    await assert.rejects(f.jobs.continue({ jobId: job.jobId }), hasCode("FORBIDDEN"));
+    assert.equal(f.network.reads, before);
+    const status = await f.jobs.get({ jobId: job.jobId });
+    assert.equal(status.counts.succeeded, 0);
+    const current = await settings.load();
+    await settings.save({ expectedRevision: current.revision, settings: { ...current.settings, reminders: { ...current.settings.reminders, read: false } } });
+    await assert.rejects(f.jobs.get({ jobId: job.jobId }), hasCode("FORBIDDEN"));
+  } finally { f.close(); }
+});
+
+
+test("permission revocation after Apple confirmation retains an uncertain job intent without returning mutation success or replaying it", async () => {
+  const f = await fixture();
+  try {
+    const job = await ready(f);
+    const settings = new ServiceSettingsRepository(f.env, owner);
+    f.db.afterStatement = async sql => {
+      if (sql.startsWith("UPDATE apple_session_state SET version = version + 1, state = ?")) {
+        f.db.afterStatement = null;
+        assert.equal(f.network.modifies, 1);
+        const current = await settings.load();
+        await settings.save({ expectedRevision: current.revision, settings: { ...current.settings, reminders: { ...current.settings.reminders, write: false } } });
+      }
+    };
+    const result = await f.jobs.continue({ jobId: job.jobId });
+    assert.equal(result.counts.succeeded, 0);
+    assert.equal(result.counts.unknown, 1);
+    assert.equal(result.results[0].result?.code, "WRITE_OUTCOME_UNKNOWN");
+    assert.equal(result.results[0].result?.operationConfirmed, false);
+    assert.equal((await f.jobs.repository.items(await f.jobs.repository.get(job.jobId)))[0].dispatch_phase, "intent");
+    const current = await settings.load();
+    await settings.save({ expectedRevision: current.revision, settings: { ...current.settings, reminders: { ...current.settings.reminders, write: true } } });
+    const reconciled = await f.jobs.continue({ jobId: job.jobId });
+    assert.equal(reconciled.counts.unknown, 1);
+    assert.equal(reconciled.counts.succeeded, 0);
+    assert.equal(f.network.modifies, 1, "Reconciliation never resubmits Apple's accepted mutation.");
   } finally { f.close(); }
 });

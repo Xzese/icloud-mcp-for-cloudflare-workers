@@ -1,0 +1,391 @@
+import test, { type TestContext } from "node:test";
+import assert from "node:assert/strict";
+import { JobSQLiteD1 } from "./helpers/sqlite-d1.ts";
+import { AppleSessionRepository, type AppleSession } from "../src/persistence/apple-sessions.ts";
+import { ServiceSettingsRepository } from "../src/persistence/service-settings.ts";
+import { DriveOperationRepository } from "../src/persistence/drive-operations.ts";
+import { DriveService } from "../src/drive/service.ts";
+import { AppleConnectionService } from "../src/auth/service.ts";
+import { DRIVE_ROOT } from "../src/icloud/drive.ts";
+import { loginAssurance } from "../src/auth/apple/policy.ts";
+import { b64, digest, hex } from "../src/crypto/bytes.ts";
+import { DEFAULT_SERVICE_SETTINGS } from "../src/services/settings.ts";
+import { accountScope } from "../src/lib/canonical.ts";
+
+function syntheticDownloadURL() {
+  const url = new URL("/B/invented-signature/test.bin", "https://cvws.icloud-content.com");
+  url.searchParams.set("token", crypto.randomUUID());
+  return url.href;
+}
+
+const owner = "drive-service-owner";
+const identity = { dsid: "123456789", clientId: "synthetic-drive-client", clientBuildNumber: "2534Project66", clientMasteringNumber: "2534B22" };
+const connection = { ...identity, driveURL: "https://p01-drivews.icloud.com", documentsURL: "https://p01-docws.icloud.com" };
+const root = { drivewsid: DRIVE_ROOT, docwsid: "root", zone: "com.apple.CloudDocs", name: "root", type: "FOLDER", etag: "root-version", parentId: null };
+function file(name = "note.txt", id = "synthetic-file", parentId = DRIVE_ROOT, size = 3) {
+  return { drivewsid: `FILE::com.apple.CloudDocs::${id}`, docwsid: id, zone: "com.apple.CloudDocs", name, type: "FILE", etag: "file-version", parentId, size, dateModified: 0 };
+}
+const json = (value: unknown) => new Response(JSON.stringify(value), { headers: { "Content-Type": "application/json" } });
+const stream = (bytes: Uint8Array) => new ReadableStream<Uint8Array>({ start(controller) { controller.enqueue(bytes); controller.close(); } });
+async function drain(body: ReadableStream<Uint8Array>) { const reader = body.getReader(); for (;;) { if ((await reader.read()).done) break; } }
+async function fixture(t: TestContext, handler: (url: URL, init: RequestInit) => Promise<Response> | Response) {
+  const db = new JobSQLiteD1();
+  const env = { ...db.env(), REMINDERS_OWNER_ID: owner, ENCRYPTION_KEY_ID: "synthetic", ENCRYPTION_KEYS_JSON: JSON.stringify({ synthetic: b64(crypto.getRandomValues(new Uint8Array(32))) }), LIVE_APPLE_CONNECTION_APPROVED: "controlled-device-v2", APPLE_CRYPTO_REVIEW_APPROVED: "device-proof-v2", APPLE_SESSION_RETENTION_WRITES: "absolute-30d-v1" };
+  const sessions = new AppleSessionRepository(env, owner), settings = new ServiceSettingsRepository(env, owner);
+  const session: AppleSession = { connection: { ...identity, cloudKitURL: "https://p01-ckdatabasews.icloud.com/database/1/com.apple.reminders/production/private" }, login: loginAssurance(), pcs: { consentRequested: true, pcsAttempts: 1, consentChecks: 1, expiresAt: Date.now() + 300_000, nextAttemptAt: 0 }, auth: { clientId: identity.clientId, headers: {}, cookies: [{ name: "X-APPLE-WEBAUTH-VALIDATE", value: "v=1:t=synthetic-validation-token", domain: "icloud.com", hostOnly: false, path: "/", secure: true, expiresAt: null }] }, services: { version: 1, reminders: { state: "DEVICE_APPROVAL_PENDING", pcs: { consentRequested: true, pcsAttempts: 1, consentChecks: 1, expiresAt: Date.now() + 300_000, nextAttemptAt: 0 }, action: "wait-for-reminders-keys" }, drive: { state: "READY", connection } } };
+  const begun = await sessions.begin((await sessions.status()).generation);
+  await sessions.commit(begun, session, "DEVICE_APPROVAL_PENDING", "wait-for-reminders-keys");
+  await settings.save({ expectedRevision: 0, settings: { ...structuredClone(DEFAULT_SERVICE_SETTINGS), drive: { enabled: true, browse: true, contents: true, upload: true, organize: true } } });
+  const original = globalThis.fetch;
+  globalThis.fetch = (async (input, init) => handler(new URL(input instanceof Request ? input.url : String(input)), init ?? {})) as typeof fetch;
+  t.after(() => { globalThis.fetch = original; db.sqlite.close(); });
+  return { db, env, sessions, settings, service: new DriveService(env, owner), generation: begun.generation };
+}
+async function uploadInput(name: string, bytes = new TextEncoder().encode("abc")) {
+  return { parentId: DRIVE_ROOT, name, operationId: crypto.randomUUID(), size: bytes.length, sha256: hex(await digest(bytes)), contentType: "text/plain", contentBase64: b64(bytes) };
+}
+
+test("Drive readiness is independent of Reminders; a permission flip stops dispatch and result release", async t => {
+  let metadata = 0, writes = 0;
+  const f = await fixture(t, url => {
+    if (url.pathname === "/createFolders") { writes++; return json({ folders: [] }); }
+    metadata++; return json([{ ...root, items: [], directChildrenCount: 0 }]);
+  });
+  const listed = await f.service.list({});
+  assert.equal(listed.folder.id, DRIVE_ROOT);
+  assert.equal((await f.sessions.load()).state, "DEVICE_APPROVAL_PENDING");
+  const id = crypto.randomUUID();
+  f.db.afterStatement = async sql => {
+    if (sql.startsWith("UPDATE drive_operations SET phase") && f.db.sqlite.prepare("SELECT phase FROM drive_operations WHERE operation_id = ?").get(id)?.phase === "committing") {
+      f.db.afterStatement = null;
+      const saved = await f.settings.load();
+      await f.settings.save({ expectedRevision: saved.revision, settings: { ...saved.settings, drive: { ...saved.settings.drive, organize: false } } });
+    }
+  };
+  await assert.rejects(f.service.createFolder({ parentId: DRIVE_ROOT, name: "New folder", operationId: id }), { code: "WRITE_OUTCOME_UNKNOWN" });
+  assert.equal(writes, 0);
+  assert.equal(metadata, 2);
+  let flipped = false;
+  f.db.afterStatement = async sql => {
+    if (!flipped && (sql.startsWith("UPDATE apple_session_state SET version = version + 1, state") || sql.startsWith("UPDATE apple_session_state SET envelope = ?, updated_at"))) {
+      flipped = true; f.db.afterStatement = null;
+      const saved = await f.settings.load();
+      await f.settings.save({ expectedRevision: saved.revision, settings: { ...saved.settings, drive: { ...saved.settings.drive, browse: false, contents: false, upload: false } } });
+    }
+  };
+  await assert.rejects(f.service.list({}), { code: "FORBIDDEN" });
+  assert.equal(f.db.sqlite.prepare("SELECT resume_id FROM apple_session_state WHERE owner_id = ?").get(owner)?.resume_id, null);
+});
+
+test("inline upload verifies content before allocation and confirmed/uncertain replay never duplicates writes", async t => {
+  let allocations = 0, transfers = 0, commits = 0, uncertain = false;
+  const files: ReturnType<typeof file>[] = [];
+  const f = await fixture(t, async (url, init) => {
+    if (["/retrieveItemDetailsInFolders", "/retrieveItemDetails"].includes(url.pathname)) {
+      const payload = JSON.parse(String(init.body));
+      const lookup = Array.isArray(payload) ? payload[0] : payload;
+      const { drivewsid } = lookup.items?.[0] ?? lookup;
+      return json([drivewsid === DRIVE_ROOT ? { ...root, items: files, directChildrenCount: files.length } : files.find(item => item.drivewsid === drivewsid)]);
+    }
+    if (url.pathname.endsWith("/upload/web")) { allocations++; return json([{ document_id: `upload-${allocations}`, url: `https://p01-contentws.icloud.com/123456789/singleFileUpload?tk=synthetic-token-${allocations}` }]); }
+    if (url.hostname === "p01-contentws.icloud.com") {
+      transfers++;
+      assert.equal(new Headers(init.headers).has("cookie"), false);
+      assert.equal(f.db.sqlite.prepare("SELECT resume_id FROM apple_session_state WHERE owner_id = ?").get(owner)?.resume_id, null);
+      await drain(init.body as ReadableStream<Uint8Array>);
+      return json({ singleFile: { referenceChecksum: "synthetic-reference", size: 3, fileChecksum: "synthetic-checksum", wrappingKey: "synthetic-wrapping-key" } });
+    }
+    if (url.pathname.endsWith("/update/documents")) {
+      commits++;
+      const payload = JSON.parse(String(init.body));
+      assert.equal(payload.allow_conflict, true);
+      const current = file(payload.path.path, payload.document_id, DRIVE_ROOT, 3);
+      current.etag = "uploaded-version"; current.dateModified = payload.mtime; files.push(current);
+      if (uncertain) throw new Error("synthetic connection closed after acceptance");
+      return json({ status: { status_code: 0 }, results: [{ status: { status_code: 0 }, document: { document_id: payload.document_id, zone: "com.apple.CloudDocs", parent_id: DRIVE_ROOT, name: payload.path.path, type: "FILE", etag: current.etag, size: 3 } }] });
+    }
+    throw new Error(`Unexpected synthetic path ${url.pathname}`);
+  });
+  const input = await uploadInput("uploaded.txt");
+  await assert.rejects(f.service.upload({ ...input, contentBase64: b64(new TextEncoder().encode("bad")) }), { code: "VALIDATION_ERROR" });
+  assert.equal(allocations, 0);
+  const result = await f.service.upload(input);
+  assert.equal(result.phase, "confirmed");
+  assert.equal(result.result?.item.documentId, "upload-1");
+  assert.deepEqual(await f.service.upload(input), result);
+  assert.deepEqual(await f.service.uploadContent(input.operationId.toUpperCase(), stream(new TextEncoder().encode("abc"))), result);
+  assert.deepEqual([allocations, transfers, commits], [1, 1, 1]);
+  const envelope = String(f.db.sqlite.prepare("SELECT envelope FROM drive_operations WHERE operation_id = ?").get(input.operationId)?.envelope);
+  assert.equal(envelope.includes("uploaded.txt"), false);
+  assert.equal(envelope.includes("synthetic-reference"), false);
+  assert.equal(JSON.stringify(result).includes("wrapping"), false);
+  const repository = new DriveOperationRepository(f.env, owner);
+  const scope = { account: await accountScope(owner, identity.dsid), generation: f.generation, permissionRevision: 1, expiresAt: (await f.sessions.load()).session.login.expiresAt };
+  const stored = await repository.data(await repository.get(input.operationId, scope));
+  assert.equal("contentBase64" in stored.input, false);
+  uncertain = true;
+  const second = await uploadInput("uncertain.txt");
+  await assert.rejects(f.service.upload(second), { code: "WRITE_OUTCOME_UNKNOWN" });
+  await assert.rejects(f.service.upload({ ...second, operationId: second.operationId.toUpperCase() }), { code: "WRITE_OUTCOME_UNKNOWN" });
+  await assert.rejects(f.service.uploadContent(second.operationId.toUpperCase(), stream(new TextEncoder().encode("abc"))), { code: "WRITE_OUTCOME_UNKNOWN" });
+  assert.equal((await f.service.operation({ operationId: second.operationId.toUpperCase() })).phase, "unknown");
+  assert.deepEqual([allocations, transfers, commits], [2, 2, 2]);
+  await assert.rejects(f.service.uploadContent(crypto.randomUUID(), stream(new Uint8Array())), { code: "FORBIDDEN" });
+  assert.equal((await f.service.list({})).items.length, 2); // Failed handles release the account lease.
+});
+
+test("inline read boundaries and text previews preserve UTF-8 and cancel unread bytes", async t => {
+  let payload = new Uint8Array(64 * 1024).fill(65);
+  let forwardedBytes = 0, cancelled = false, requests = 0;
+  const f = await fixture(t, url => {
+    requests++;
+    if (url.pathname === "/retrieveItemDetails") return json({ items: [file("preview.txt", "preview", DRIVE_ROOT, payload.length)] });
+    if (url.pathname.endsWith("/download/by_id")) return json({ data_token: { url: syntheticDownloadURL() } });
+    if (url.hostname !== "cvws.icloud-content.com") throw new Error("No upload request should be sent for an oversized inline file");
+    let offset = 0;
+    forwardedBytes = 0; cancelled = false;
+    return new Response(new ReadableStream<Uint8Array>({
+      pull(controller) {
+        if (offset === payload.length) { controller.close(); return; }
+        const chunk = payload.subarray(offset, offset + 4096);
+        offset += chunk.length; forwardedBytes += chunk.length; controller.enqueue(chunk);
+      },
+      cancel() { cancelled = true; },
+    }, { highWaterMark: 0 }));
+  });
+  const full = await f.service.read({ itemId: file("preview.txt", "preview").drivewsid });
+  assert.equal(full.bytesRead, 64 * 1024); assert.equal(full.content.length, 64 * 1024); assert.equal(full.truncated, false);
+  payload = new Uint8Array(64 * 1024 + 1).fill(65);
+  await assert.rejects(f.service.read({ itemId: full.item.id }), error => (error as Error).message.includes("previewBytes") && (error as Error).message.includes("Download"));
+  const preview = await f.service.read({ itemId: full.item.id, previewBytes: 8192 });
+  assert.equal(preview.bytesRead, 8192); assert.equal(preview.content.length, 8192); assert.equal(preview.truncated, true);
+  assert.equal(cancelled, true); assert.ok(forwardedBytes < payload.length);
+  const beforeInvalid = requests;
+  await assert.rejects(f.service.read({ itemId: full.item.id, previewBytes: 8193 }), { code: "VALIDATION_ERROR" });
+  await assert.rejects(f.service.read({ itemId: full.item.id, previewBytes: 8, encoding: "base64" }), { code: "VALIDATION_ERROR" });
+  await assert.rejects(f.service.upload(await uploadInput("too-large.txt", payload)), error => (error as Error).message.includes("64 KiB") && (error as Error).message.includes("dashboard Upload"));
+  assert.equal(requests, beforeInvalid);
+  payload = new TextEncoder().encode("abc€suffix");
+  const splitCharacter = await f.service.read({ itemId: full.item.id, previewBytes: 5 });
+  assert.equal(splitCharacter.content, "abc"); assert.equal(splitCharacter.bytesRead, 5); assert.equal(splitCharacter.truncated, true);
+  payload = new Uint8Array();
+  const empty = await f.service.read({ itemId: full.item.id, previewBytes: 8192 });
+  assert.equal(empty.content, ""); assert.equal(empty.bytesRead, 0); assert.equal(empty.truncated, false);
+});
+
+test("download handles are scoped and single use, pin exact versions, and deliver attachment content without cookies", async t => {
+  const current = file("<résumé>.html");
+  let downloads = 0, prepared = 0;
+  const f = await fixture(t, (url, init) => {
+    if (url.pathname === "/retrieveItemDetails") return json([{ ...current }]);
+    if (url.pathname.endsWith("/download/by_id")) { prepared++; return json({ data_token: { url: syntheticDownloadURL() } }); }
+    downloads++;
+    assert.equal(new Headers(init.headers).has("cookie"), false);
+    return new Response(new TextEncoder().encode("abc"), { headers: { "Content-Type": "text/html", "Set-Cookie": "evil=synthetic", "Location": "https://example.invalid" } });
+  });
+  const handle = await f.service.download({ itemId: current.drivewsid });
+  assert.equal(handle.url, `/api/drive/downloads/${handle.handleId}`);
+  assert.equal(JSON.stringify(handle).includes("icloud-content"), false);
+  f.db.sqlite.prepare("UPDATE drive_handles SET generation = generation + 1 WHERE handle_id = ?").run(handle.handleId);
+  await assert.rejects(f.service.downloadContent(handle.handleId), { code: "CONFLICT" });
+  f.db.sqlite.prepare("UPDATE drive_handles SET generation = generation - 1 WHERE handle_id = ?").run(handle.handleId);
+  const response = await f.service.downloadContent(handle.handleId);
+  assert.match(response.headers.get("content-disposition")!, /^attachment;.*filename\*=UTF-8''%3Cr%C3%A9sum%C3%A9%3E.html$/);
+  assert.equal(response.headers.get("set-cookie"), null);
+  assert.equal(await response.text(), "abc");
+  await assert.rejects(f.service.downloadContent(handle.handleId), { code: "CONFLICT" });
+  assert.deepEqual([prepared, downloads], [1, 1]);
+  const stale = await f.service.download({ itemId: current.drivewsid });
+  current.etag = "changed-version";
+  await assert.rejects(f.service.downloadContent(stale.handleId), { code: "CONFLICT" });
+  assert.deepEqual([prepared, downloads], [1, 1]);
+  assert.throws(() => new DriveService(f.env, "other-owner"), { code: "FORBIDDEN" });
+});
+
+test("streaming permission changes and bad digests prevent upload finalization and download byte release", async t => {
+  let finalize = 0, disableDuringUpload = false;
+  const f = await fixture(t, async (url, init) => {
+    if (["/retrieveItemDetailsInFolders", "/retrieveItemDetails"].includes(url.pathname)) {
+      const payload = JSON.parse(String(init.body));
+      const lookup = Array.isArray(payload) ? payload[0] : payload;
+      const { drivewsid } = lookup.items?.[0] ?? lookup;
+      return json([drivewsid === DRIVE_ROOT ? { ...root, items: [], directChildrenCount: 0 } : file("note.txt", "synthetic-file", DRIVE_ROOT, 3)]);
+    }
+    if (url.pathname.endsWith("/upload/web")) return json([{ document_id: "streamed-upload", url: "https://p01-contentws.icloud.com/123456789/singleFileUpload?tk=synthetic-stream-token" }]);
+    if (url.hostname === "p01-contentws.icloud.com") {
+      if (disableDuringUpload) {
+        const saved = await f.settings.load();
+        await f.settings.save({ expectedRevision: saved.revision, settings: { ...saved.settings, drive: { ...saved.settings.drive, upload: false } } });
+      }
+      await drain(init.body as ReadableStream<Uint8Array>);
+      return json({ singleFile: { referenceChecksum: "synthetic-ref", size: 3, fileChecksum: "synthetic-sum", wrappingKey: "synthetic-key" } });
+    }
+    if (url.pathname.endsWith("/update/documents")) { finalize++; throw new Error("Finalization must not run"); }
+    if (url.pathname.endsWith("/download/by_id")) return json({ data_token: { url: syntheticDownloadURL() } });
+    return new Response(new ReadableStream<Uint8Array>({ async pull(controller) {
+      const saved = await f.settings.load();
+      await f.settings.save({ expectedRevision: saved.revision, settings: { ...saved.settings, drive: { ...saved.settings.drive, contents: false } } });
+      controller.enqueue(new TextEncoder().encode("abc")); controller.close();
+    } }, { highWaterMark: 0 }));
+  });
+  const input = await uploadInput("digest.txt");
+  const metadata = Object.fromEntries(Object.entries(input).filter(([key]) => key !== "contentBase64"));
+  await f.service.prepareUpload(metadata);
+  await assert.rejects(f.service.uploadContent(input.operationId, stream(new TextEncoder().encode("bad"))), { code: "VALIDATION_ERROR" });
+  assert.equal(finalize, 0);
+  const cancelled = await uploadInput("cancelled.txt");
+  await f.service.prepareUpload(Object.fromEntries(Object.entries(cancelled).filter(([key]) => key !== "contentBase64")));
+  const abort = new AbortController(); abort.abort();
+  await assert.rejects(f.service.uploadContent(cancelled.operationId, stream(new TextEncoder().encode("abc")), abort.signal));
+  assert.equal(finalize, 0);
+  const changed = await uploadInput("permission.txt");
+  const changedMetadata = Object.fromEntries(Object.entries(changed).filter(([key]) => key !== "contentBase64"));
+  await f.service.prepareUpload(changedMetadata);
+  disableDuringUpload = true;
+  await assert.rejects(f.service.uploadContent(changed.operationId, stream(new TextEncoder().encode("abc"))), { code: "FORBIDDEN" });
+  assert.equal(finalize, 0);
+  const handle = await f.service.download({ itemId: file().drivewsid });
+  const response = await f.service.downloadContent(handle.handleId);
+  await assert.rejects(response.arrayBuffer(), { code: "FORBIDDEN" });
+  assert.equal(finalize, 0);
+});
+
+test("search uses bounded selected-tree continuations and refuses stale scope and filename collisions", async t => {
+  let folderReads = 0;
+  const folders = [1, 2, 3, 4].map(id => ({ drivewsid: `FOLDER::com.apple.CloudDocs::folder-${id}`, docwsid: `folder-${id}`, zone: "com.apple.CloudDocs", name: `Folder ${id}`, type: "FOLDER", etag: "folder-version", parentId: DRIVE_ROOT }));
+  const f = await fixture(t, (url, init) => {
+    assert.equal(url.pathname, "/retrieveItemDetailsInFolders");
+    folderReads++;
+    const [{ drivewsid }] = JSON.parse(String(init.body));
+    const selected = folders.find(item => item.drivewsid === drivewsid);
+    return json([drivewsid === DRIVE_ROOT ? { ...root, items: folders, directChildrenCount: folders.length } : { ...selected, items: [file("match.txt", `file-${selected!.docwsid}`, selected!.drivewsid)], directChildrenCount: 1 }]);
+  });
+  const first = await f.service.search({ query: "match" });
+  assert.equal(folderReads, 3);
+  assert.equal(first.items.length, 2);
+  assert.equal(first.complete, false);
+  assert.equal(first.scope, "selected-folder-tree");
+  const next = await f.service.search({ query: "match", continuation: first.continuation });
+  assert.equal(folderReads, 5);
+  assert.equal(next.items.length, 2);
+  assert.equal(next.complete, true);
+  await assert.rejects(f.service.search({ query: "match", continuation: first.continuation }), { code: "CONFLICT" });
+  await assert.rejects(f.service.createFolder({ operationId: crypto.randomUUID(), parentId: DRIVE_ROOT, name: "folder 1" }), { code: "CONFLICT" });
+  const scoped = await f.service.search({ query: "match" });
+  await assert.rejects(f.service.search({ query: "different", continuation: scoped.continuation }), { code: "CONFLICT" });
+});
+
+test("expired mutation leases never repeat a write, and exact retained post-write versions reconcile safely", async t => {
+  let writes = 0;
+  const current = file("after.txt");
+  const f = await fixture(t, url => {
+    if (url.pathname === "/renameItems") { writes++; throw new Error("A retained commit must never be dispatched"); }
+    return json([{ ...current }]);
+  });
+  const scope = { account: await accountScope(owner, identity.dsid), generation: f.generation, permissionRevision: 1, expiresAt: (await f.sessions.load()).session.login.expiresAt };
+  const operations = new DriveOperationRepository(f.env, owner), id = crypto.randomUUID();
+  const input = { operationId: id, itemId: current.drivewsid, etag: "before-version", name: "after.txt" };
+  let row = await operations.claim(await operations.create(id, "rename", input, scope), scope);
+  row = await operations.checkpoint(row, "committing", { input, itemId: current.drivewsid });
+  f.db.sqlite.prepare("UPDATE drive_operations SET lease_until = 1 WHERE operation_id = ?").run(id);
+  await assert.rejects(operations.assertLease(row), { code: "CONFLICT" });
+  await assert.rejects(f.service.rename(input), { code: "WRITE_OUTCOME_UNKNOWN" });
+  assert.equal(writes, 0);
+  const witnessedId = crypto.randomUUID(), witnessedInput = { ...input, operationId: witnessedId };
+  row = await operations.claim(await operations.create(witnessedId, "rename", witnessedInput, scope), scope);
+  const item = (await f.service.get({ itemId: current.drivewsid })).item;
+  row = await operations.checkpoint(row, "committing", { input: witnessedInput, itemId: item.id, receipt: item });
+  await operations.release(row);
+  const recovered = await f.service.rename(witnessedInput);
+  assert.equal(recovered.phase, "confirmed");
+  assert.equal(recovered.result?.item.etag, current.etag);
+  assert.equal(writes, 0);
+});
+
+test("organize journey verifies exact versions, rejects ancestor moves, and confirms create/rename/move identities", async t => {
+  const target = { drivewsid: "FOLDER::com.apple.CloudDocs::target", docwsid: "target", zone: "com.apple.CloudDocs", name: "Target", type: "FOLDER", etag: "target-version", parentId: DRIVE_ROOT };
+  const items = new Map<string, typeof target>([[target.drivewsid, target]]);
+  let mutations = 0;
+  const f = await fixture(t, (url, init) => {
+    const payload = JSON.parse(String(init.body));
+    if (url.pathname === "/retrieveItemDetailsInFolders") {
+      const selected = payload[0].drivewsid === DRIVE_ROOT ? root : items.get(payload[0].drivewsid)!;
+      const children = [...items.values()].filter(item => item.parentId === selected.drivewsid);
+      return json([{ ...selected, items: children, directChildrenCount: children.length }]);
+    }
+    mutations++;
+    if (url.pathname === "/createFolders") {
+      const created = { ...target, drivewsid: "FOLDER::com.apple.CloudDocs::created", docwsid: "created", name: payload.folders[0].name, parentId: payload.destinationDrivewsId, etag: "created-version" };
+      items.set(created.drivewsid, created);
+      return json({ folders: [{ drivewsid: created.drivewsid, status: "OK" }] });
+    }
+    const selected = items.get(payload.items[0].drivewsid)!;
+    assert.equal(payload.items[0].etag, selected.etag);
+    if (url.pathname === "/renameItems") { selected.name = payload.items[0].name; selected.etag = "renamed-version"; }
+    else if (url.pathname === "/moveItems") { selected.parentId = payload.destinationDrivewsId; selected.etag = "moved-version"; }
+    else throw new Error(`Unexpected synthetic mutation ${url.pathname}`);
+    return json({ items: [{ ...selected, status: "OK" }] });
+  });
+  const created = await f.service.createFolder({ parentId: DRIVE_ROOT, name: "New folder", operationId: crypto.randomUUID() });
+  assert.equal(created.phase, "confirmed");
+  const item = created.result!.item;
+  await assert.rejects(f.service.rename({ itemId: item.id, etag: "stale-version", name: "Renamed", operationId: crypto.randomUUID() }), { code: "CONFLICT" });
+  assert.equal(mutations, 1);
+  const renamed = await f.service.rename({ itemId: item.id, etag: item.etag, name: "Renamed", operationId: crypto.randomUUID() });
+  assert.equal(renamed.result?.item.name, "Renamed");
+  const child = { ...target, drivewsid: "FOLDER::com.apple.CloudDocs::child", docwsid: "child", name: "Child", parentId: item.id };
+  items.set(child.drivewsid, child);
+  await assert.rejects(f.service.move({ itemId: item.id, etag: renamed.result!.item.etag, destinationId: child.drivewsid, operationId: crypto.randomUUID() }), { code: "CONFLICT" });
+  assert.equal(mutations, 2);
+  const moved = await f.service.move({ itemId: item.id, etag: renamed.result!.item.etag, destinationId: target.drivewsid, operationId: crypto.randomUUID() });
+  assert.equal(moved.phase, "confirmed");
+  assert.equal(moved.result?.item.parentId, target.drivewsid);
+  await assert.rejects(f.service.rename({ itemId: DRIVE_ROOT, etag: root.etag, name: "Root", operationId: crypto.randomUUID() }), { code: "UNSUPPORTED_FEATURE" });
+  assert.equal(mutations, 3);
+});
+
+test("denied Drive access requires explicit approval, preserves Reminders, and never replays a rejected mutation", async t => {
+  const current = file("consent.txt");
+  let denyRead = true, reads = 0, approvalRequests = 0, writes = 0;
+  const f = await fixture(t, (url, init) => {
+    if (url.pathname.endsWith("/requestWebAccessState")) { approvalRequests++; return json({ isICDRSDisabled: false }); }
+    if (url.pathname === "/renameItems") { writes++; return new Response(null, { status: 450 }); }
+    assert.ok(["/retrieveItemDetailsInFolders", "/retrieveItemDetails"].includes(url.pathname));
+    reads++;
+    if (denyRead) return new Response(null, { status: 450, headers: { "Set-Cookie": "X-APPLE-WEBAUTH-VALIDATE=v=1:t=synthetic-renewed-validation; Path=/; Secure" } });
+    const payload = JSON.parse(String(init.body));
+    const lookup = Array.isArray(payload) ? payload[0] : payload;
+    const { drivewsid } = lookup.items?.[0] ?? lookup;
+    return json([drivewsid === DRIVE_ROOT ? { ...root, items: [current], directChildrenCount: 1 } : current]);
+  });
+  const saved = await f.sessions.load(), fence = await f.sessions.claimRenewal(saved.fence.generation, saved.fence.version);
+  await f.sessions.commitResume(fence, { ...saved.session, services: { ...saved.session.services!, reminders: { state: "READY" } } }, "READY");
+  const before = await f.sessions.load(), auth = new AppleConnectionService(f.env, owner);
+  await assert.rejects(f.service.list({}), { code: "REAUTH_REQUIRED" });
+  const rejected = await f.sessions.load();
+  assert.equal(rejected.session.services?.drive.state, "DEVICE_APPROVAL_PENDING");
+  assert.deepEqual(rejected.session.services?.reminders, before.session.services?.reminders);
+  assert.deepEqual(rejected.session.pcs, before.session.pcs);
+  assert.equal(rejected.state, "READY");
+  assert.ok(rejected.session.auth.cookies.some(cookie => cookie.name === "X-APPLE-WEBAUTH-VALIDATE" && cookie.value === "v=1:t=synthetic-renewed-validation"));
+  const status = await auth.status();
+  assert.equal(status.services.drive.ready, false);
+  assert.equal(status.services.drive.action, "approve-device-consent");
+  assert.equal(status.services.reminders.ready, true);
+  await assert.rejects(f.service.list({}), { code: "DEVICE_APPROVAL_PENDING" });
+  assert.deepEqual([reads, approvalRequests, writes], [1, 0, 0]);
+  denyRead = false;
+  const approved = await auth.approveDrive(f.generation);
+  assert.equal(approved.services.drive.ready, true);
+  assert.equal((await f.service.list({})).items[0]?.id, current.drivewsid);
+  const operationId = crypto.randomUUID();
+  const input = { operationId, itemId: current.drivewsid, etag: current.etag, name: "renamed.txt" };
+  await assert.rejects(f.service.rename(input), { code: "WRITE_OUTCOME_UNKNOWN" });
+  assert.equal((await auth.status()).services.drive.ready, false);
+  assert.equal((await auth.status()).services.reminders.ready, true);
+  await auth.approveDrive(f.generation);
+  await assert.rejects(f.service.rename({ ...input, operationId: operationId.toUpperCase() }), { code: "WRITE_OUTCOME_UNKNOWN" });
+  assert.equal((await f.service.operation({ operationId: operationId.toUpperCase() })).phase, "unknown");
+  assert.equal(writes, 1);
+  assert.equal(approvalRequests, 2);
+});

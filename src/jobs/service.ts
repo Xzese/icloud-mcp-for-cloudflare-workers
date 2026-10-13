@@ -9,6 +9,9 @@ import type { RuntimeEnv } from "../platform/sites.ts";
 import { buildCreateReminder } from "../reminders/writes.ts";
 import { checkPreparation, createPreparation, preparationContext } from "../reminders/preparation.ts";
 import { AppendJob, CreateJob, GetJob, JobIdentity, JobOutput, JobResult, JOB_LIMITS, PreviewJob, StartJob, type JobItemData } from "./schemas.ts";
+import { ServiceSettingsRepository } from "../persistence/service-settings.ts";
+import { requireServicePermission, type ServicePermission } from "../services/settings.ts";
+import { requireServiceReady, requireRemindersConnection } from "../auth/apple/services.ts";
 import { isTerminalJob } from "./state.ts";
 import { runJobSlice } from "./runner.ts";
 
@@ -27,15 +30,21 @@ export class ReminderJobService {
   readonly env: RuntimeEnv;
   readonly owner: string;
   constructor(env: RuntimeEnv, owner: string) { this.env = env; this.owner = owner; this.repository = new ReminderJobRepository(env, owner); }
+  async requirePermission(permission: ServicePermission) {
+    requireServicePermission((await new ServiceSettingsRepository(this.env, this.owner).load()).settings, permission);
+  }
   async binding(job?: JobRow, generation?: number) {
     requireAppleEnabled(this.env);
+    await this.requirePermission("reminders.write");
     const saved = await new AppleSessionRepository(this.env, this.owner).load();
     const account = await accountScope(this.owner, saved.session.connection.dsid);
-    if (saved.state !== "READY") throw new AppError("DEVICE_APPROVAL_PENDING", "Complete Apple approval before executing a job.", 409);
+    requireRemindersConnection(saved.session);
+    requireServiceReady(saved.session, saved.state, "reminders", saved.action);
     if ((job && (job.account_scope !== account || job.generation !== saved.fence.generation)) || (generation !== undefined && generation !== saved.fence.generation)) throw new AppError("CONFLICT", "This job is pinned to a different Apple account or session generation. It cannot be silently rebound.", 409);
     return { account, generation: saved.fence.generation, expiresAt: saved.session.login.expiresAt };
   }
   async output(job: JobRow, offset = 0, limit = 50, previewToken: string | null = null, previewExpiresAt: number | null = null) {
+    await this.requirePermission("reminders.read");
     const items = await this.repository.items(job, offset, limit), counts = await this.repository.counts(job);
     const decoded = await Promise.all(items.map(async item => {
       const value = await this.repository.input(job, item);
@@ -50,6 +59,7 @@ export class ReminderJobService {
       results.push(result);
     }
     const expired = job.expires_at <= Date.now() && !isTerminalJob(job.state);
+    await this.requirePermission("reminders.read");
     return JobOutput.parse({
       jobId: job.job_id, kind: job.kind, generation: job.generation,
       state: expired ? counts.unknown || counts.dispatching || counts.verifying ? "needs_attention" : "expired" : job.state,
@@ -142,7 +152,7 @@ export class ReminderJobService {
     return this.output(await this.repository.get(job.job_id));
   }
   async get(value: unknown) { const input = parse(GetJob, value); return this.output(await this.repository.get(input.jobId), input.offset, input.limit); }
-  async cancel(value: unknown) { const input = parse(JobIdentity, value); const job = await this.repository.get(input.jobId); await this.repository.cancel(job); return this.output(await this.repository.get(job.job_id)); }
+  async cancel(value: unknown) { await this.requirePermission("reminders.write"); const input = parse(JobIdentity, value); const job = await this.repository.get(input.jobId); await this.repository.cancel(job); return this.output(await this.repository.get(job.job_id)); }
   async resume(value: unknown) {
     const input = parse(JobIdentity, value), job = await this.repository.get(input.jobId);
     await this.binding(job);
@@ -155,6 +165,7 @@ export class ReminderJobService {
   }
   async continue(value: unknown) {
     const input = parse(JobIdentity, value);
+    await this.requirePermission("reminders.write");
     await runJobSlice(this, await this.repository.get(input.jobId));
     return this.output(await this.repository.get(input.jobId));
   }

@@ -1,3 +1,4 @@
+import { ServiceSettingsSchema } from "../services/settings.ts";
 import { EARLY_UNITS } from "../reminders/early-reminder.ts";
 import { LocationAlarmSummary } from "../reminders/location-alarm.ts";
 import { z } from "zod";
@@ -183,7 +184,17 @@ export const ListAppearanceMutationOutput = z.object({
   ...listAppearance, writesEnabled: z.literal(true),
 }).strict();
 
+const ServiceReadinessOutput = z.object({
+  enabled: z.boolean(), state: z.string(), ready: z.boolean(), action: z.string().nullable(),
+  nextAttemptAt: counter, lastErrorCode: z.string().nullable(),
+});
 export const ConnectionStatusOutput = z.object({
+  accountAuthenticated: z.boolean(), accountConnected: z.boolean(),
+  serviceSettings: z.object({ revision: counter, available: z.boolean(), settings: ServiceSettingsSchema }).strict(),
+  services: z.object({
+    reminders: ServiceReadinessOutput.extend({ read: z.boolean(), write: z.boolean() }).strict(),
+    drive: ServiceReadinessOutput.extend({ browse: z.boolean(), contents: z.boolean(), upload: z.boolean(), organize: z.boolean() }).strict(),
+  }).strict(),
   generation: counter,
   version: counter,
   state: z.enum(["DISCONNECTED", "CONNECTING", "DEVICE_APPROVAL_PENDING", "READY"]),

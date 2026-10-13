@@ -1491,3 +1491,24 @@ footer {
     transition-duration: 0.01ms !important;
   }
 }
+
+.service-settings, .drive-panel { margin-bottom: 24px; }
+.service-setting-group { border: 1px solid var(--border, #e4e4e7); border-radius: 12px; padding: 18px; margin: 18px 0; }
+.service-setting-group legend { font-weight: 600; padding: 0 6px; }
+.service-setting-group > p { margin-bottom: 12px; }
+.service-setting-toggle { display: flex; align-items: flex-start; gap: 10px; margin: 12px 0; cursor: pointer; }
+.service-setting-toggle input { width: 17px; height: 17px; margin-top: 3px; accent-color: #247bce; }
+.service-setting-operations { padding-left: 24px; }
+.drive-breadcrumbs { display: flex; flex-wrap: wrap; margin-bottom: 12px; }
+.drive-form { margin-top: 18px; }
+.drive-form label { display: block; font-size: 14px; margin-bottom: 8px; }
+.drive-form input { flex: 1; min-width: 120px; padding: 9px 12px; border: 1px solid var(--border, #dedee3); border-radius: 8px; }
+.drive-items { padding: 0; margin: 20px 0; list-style: none; }
+.drive-preview { margin: 20px 0; padding: 16px; border: 1px solid var(--border); border-radius: 12px; }
+.drive-preview pre { max-height: 360px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; padding: 12px; background: var(--muted); border-radius: 8px; font-size: 0.85rem; }
+.drive-items li { display: flex; align-items: center; gap: 12px; border-bottom: 1px solid var(--border, #e4e4e7); padding: 10px 0; }
+.drive-item-name { display: flex; gap: 10px; align-items: center; flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.drive-item-name svg { flex-shrink: 0; }
+.drive-operation { margin-top: 16px; }
+.drive-operation code { overflow-wrap: anywhere; }
+@media (max-width: 600px) { .drive-items li { flex-wrap: wrap; } .drive-item-name { flex-basis: 100%; } }

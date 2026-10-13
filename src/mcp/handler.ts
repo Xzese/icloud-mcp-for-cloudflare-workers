@@ -4,7 +4,7 @@ import { z } from "zod";
 import { CreateListInput, RenameListInput, DeleteListInput } from "../reminders/list-writes.ts";
 import { UpdateListAppearanceRequest } from "../reminders/list-appearance.ts";
 import { AppleConnectionService, ControlledRead, ListReadIdInput, SearchReminderInput, SearchReminderInputFieldsSchema } from "../auth/service.ts";
-import { publicError } from "../errors.ts";
+import { AppError, publicError } from "../errors.ts";
 import { omitField } from "../lib/omit-field.ts";
 import type { RuntimeEnv } from "../platform/sites.ts";
 import { CreateReminderInput, ReminderTargetInput } from "../reminders/writes.ts";
@@ -19,8 +19,21 @@ import { ReminderJobService } from "../jobs/service.ts";
 import { CreateJob, AppendJob, PreviewJob, StartJob, GetJob, JobIdentity, JobOutput } from "../jobs/schemas.ts";
 import { ExpectedGenerationInput, ListsOutput, RemindersPageOutput, AllOpenOutput, ReminderSearchOutput, ReminderLookupOutput, ReminderOrganizationOutput, MutationOutput, ConnectionStatusOutput, PrepareUpdateOutput, ListMutationOutput, ExactListOutput, ListAppearanceOutput, ListAppearanceMutationOutput, ShoppingCategoriesOutput, ShoppingCategoryMutationOutput } from "./schemas.ts";
 
+import { ServiceSettingsRepository } from "../persistence/service-settings.ts";
+import { enabledToolNames } from "../services/tool-registry.ts";
+import { registerDriveTools } from "./drive-tools.ts";
+import { limitedBytes } from "../transport/apple-http.ts";
+import { INLINE_REQUEST_BYTES, INLINE_UPLOAD_GUIDANCE } from "../drive/schemas.ts";
+
 export async function handleMCP(request: Request, env: RuntimeEnv, owner: string) {
   const server = new McpServer({ name: "hosted-icloud-reminders", version: "0.1.0" });
+  const settings = await new ServiceSettingsRepository(env, owner).load();
+  const enabled = new Set(enabledToolNames(settings.settings));
+  const registerTool: typeof server.registerTool = (name, config, callback) => {
+    const tool = server.registerTool(name, config, callback);
+    if (!enabled.has(name)) tool.disable();
+    return tool;
+  };
   const annotations = { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false };
   const readAnnotations = { readOnlyHint: true, destructiveHint: false, idempotentHint: false, openWorldHint: true };
   const expectedGeneration = ExpectedGenerationInput;
@@ -49,9 +62,9 @@ export async function handleMCP(request: Request, env: RuntimeEnv, owner: string
       return toolError(error);
     }
   };
-  server.registerTool("get_reminder_lists", { title: "Get current iCloud reminder lists", description: "Retrieve the owner's current selectable lists directly from private-zone CloudKit Lists. The server follows bounded query pagination and saves only complete encrypted snapshots. Historical scanning is not used. An unsupported or incomplete discovery returns an actionable error and preserves the previous snapshot. Shared-database list discovery is not supported; broader live completeness remains under validation. expectedGeneration pins the Apple session. No reminders are modified.", inputSchema: z.object({ expectedGeneration }).strict(), outputSchema: ListsOutput, annotations: readAnnotations }, args => liveRead({ ...args, action: "saved-lists" }));
-  server.registerTool("get_reminders", { title: "Get current reminders from an iCloud list", description: "Verify an exact listId with a live owner-bound lookup, then fetch one current Apple reminder page without historical catalogue synchronization. Open reminders only by default; includeCompleted includes completed items. Contents are live and never cached. Follow the opaque continuation with the same listId and includeCompleted option; paginationComplete indicates the final page. A saved list ID alone is not proof of access. Use the dedicated mutation tools for reminder changes.", inputSchema: z.object({ expectedGeneration, listId: ListReadIdInput.describe("Exact list ID from get_reminder_lists; do not supply the list title."), includeCompleted: z.boolean().default(false).describe("False returns open reminders only. True includes completed history; use get_reminder for an exact completed item."), limit: z.number().int().min(1).max(200).default(200).describe("Maximum Apple page size, 1–200. Use 20 or 50 if compound history pages exceed the response budget."), continuation: z.string().min(1).max(8192).nullable().optional().describe("Opaque next-page value from get_reminders. Omit or use null for the first page; retain listId, includeCompleted and session when continuing.") }).strict(), outputSchema: RemindersPageOutput, annotations: readAnnotations }, args => liveRead({ ...args, action: "reminders" }));
-  server.registerTool("get_all_open_reminders", { title: "Get open reminders across all iCloud lists", description: "Discover selectable private-zone lists directly from CloudKit, then read current open reminders across them without historical scanning. Unsupported or incomplete list discovery fails explicitly. Shared-database list discovery is not supported. Resumptions use the operation's saved list selection without rediscovery. A bounded incomplete reminder result includes progress and a single-use, ten-minute owner/session-bound continuation; combine returned records across successful pages. complete=true requires every selected list to finish. Inspect errors before retrying and respect retryAfterSeconds. Reminder contents are never persisted.", inputSchema: z.object({ expectedGeneration, continuation: z.string().uuid().nullable().optional().describe("Single-use continuation from get_all_open_reminders; omit or use null to start. Use the newly returned token for each subsequent page and combine records.") }).strict(), outputSchema: AllOpenOutput, annotations: readAnnotations }, async args => {
+  registerTool("get_reminder_lists", { title: "Get current iCloud reminder lists", description: "Retrieve the owner's current selectable lists directly from private-zone CloudKit Lists. The server follows bounded query pagination and saves only complete encrypted snapshots. Historical scanning is not used. An unsupported or incomplete discovery returns an actionable error and preserves the previous snapshot. Shared-database list discovery is not supported; broader live completeness remains under validation. expectedGeneration pins the Apple session. No reminders are modified.", inputSchema: z.object({ expectedGeneration }).strict(), outputSchema: ListsOutput, annotations: readAnnotations }, args => liveRead({ ...args, action: "saved-lists" }));
+  registerTool("get_reminders", { title: "Get current reminders from an iCloud list", description: "Verify an exact listId with a live owner-bound lookup, then fetch one current Apple reminder page without historical catalogue synchronization. Open reminders only by default; includeCompleted includes completed items. Contents are live and never cached. Follow the opaque continuation with the same listId and includeCompleted option; paginationComplete indicates the final page. A saved list ID alone is not proof of access. Use the dedicated mutation tools for reminder changes.", inputSchema: z.object({ expectedGeneration, listId: ListReadIdInput.describe("Exact list ID from get_reminder_lists; do not supply the list title."), includeCompleted: z.boolean().default(false).describe("False returns open reminders only. True includes completed history; use get_reminder for an exact completed item."), limit: z.number().int().min(1).max(200).default(200).describe("Maximum Apple page size, 1–200. Use 20 or 50 if compound history pages exceed the response budget."), continuation: z.string().min(1).max(8192).nullable().optional().describe("Opaque next-page value from get_reminders. Omit or use null for the first page; retain listId, includeCompleted and session when continuing.") }).strict(), outputSchema: RemindersPageOutput, annotations: readAnnotations }, args => liveRead({ ...args, action: "reminders" }));
+  registerTool("get_all_open_reminders", { title: "Get open reminders across all iCloud lists", description: "Discover selectable private-zone lists directly from CloudKit, then read current open reminders across them without historical scanning. Unsupported or incomplete list discovery fails explicitly. Shared-database list discovery is not supported. Resumptions use the operation's saved list selection without rediscovery. A bounded incomplete reminder result includes progress and a single-use, ten-minute owner/session-bound continuation; combine returned records across successful pages. complete=true requires every selected list to finish. Inspect errors before retrying and respect retryAfterSeconds. Reminder contents are never persisted.", inputSchema: z.object({ expectedGeneration, continuation: z.string().uuid().nullable().optional().describe("Single-use continuation from get_all_open_reminders; omit or use null to start. Use the newly returned token for each subsequent page and combine records.") }).strict(), outputSchema: AllOpenOutput, annotations: readAnnotations }, async args => {
     try {
       const apple = new AppleConnectionService(env, owner);
       const generation = args.expectedGeneration ?? (await apple.status()).generation;
@@ -63,7 +76,7 @@ export async function handleMCP(request: Request, env: RuntimeEnv, owner: string
       return toolError(error);
     }
   });
-  server.registerTool("search_reminders", {
+  registerTool("search_reminders", {
     title: "Search current iCloud reminders",
     description: "Search current reminders by a case-insensitive title or notes substring and optional status, flagged, priority, due date, exact list, literal tags, tag presence, URL presence or URL substring. Tag filters accept 1–16 exact tag names; tagMatch is all by default when tags are supplied, or any. URL text searches only the separate native URL, not titles, notes or image attachments. Status defaults to open. Without listId, the search scans every currently selectable owned private list discovered at the start; shared lists are not included. Each call reads at most one Apple reminder page and can return zero matches with a continuation. Repeat the same filters with the newly returned single-use token. Pages are live reads, not a snapshot, so reminders can change between pages. Reminder contents are never persisted.",
     // Keep the public Zod object visible to MCP clients; cross-field constraints
@@ -83,7 +96,7 @@ export async function handleMCP(request: Request, env: RuntimeEnv, owner: string
       return toolError(error);
     }
   });
-  server.registerTool("get_reminder", {
+  registerTool("get_reminder", {
     title: "Get one current iCloud reminder",
     description: "Read one exact reminder ID after authorizing the requested List, including completed or soft-deleted items, without scanning history. Use listId and reminderId from prior results. Returns normalized content and current recordChangeTag, or record=null and missing=true if Apple reports it absent. A detached owned soft-deleted root is returned with listId=null; the removed List relationship is not reconstructed. Useful to reconcile WRITE_OUTCOME_UNKNOWN before considering another change. No credentials, raw Apple records or write operations are accepted.",
     inputSchema: ReminderTargetInput.omit({ recordChangeTag: true }).extend({ expectedGeneration }).strict(),
@@ -109,7 +122,7 @@ export async function handleMCP(request: Request, env: RuntimeEnv, owner: string
       return toolError(error);
     }
   };
-  server.registerTool("get_reminder_list", {
+  registerTool("get_reminder_list", {
     title: "Get one current iCloud reminder list and version",
     description: "Look up an owned private non-group list by exact listId, including its soft-deleted state for uncertain-outcome reconciliation. Return its current name, observed count (which may be absent), and recordChangeTag for rename or empty-list deletion. No mutation occurs.",
     inputSchema: z.object({ expectedGeneration, listId: RenameListInput.shape.listId }).strict(),
@@ -122,7 +135,7 @@ export async function handleMCP(request: Request, env: RuntimeEnv, owner: string
       return { structuredContent: result, content: [{ type: "text" as const, text: JSON.stringify(result) }] };
     } catch (error) { return toolError(error); }
   });
-  server.registerTool("get_reminder_list_appearance", {
+  registerTool("get_reminder_list_appearance", {
     title: "Get a reminder list's colour and emoji",
     description: "Read the current appearance of one exact owned, standard private Reminders list. Reports a recognized built-in colour preset, default colour, custom/unsupported colour state, emoji badge, or unsupported badge without exposing native field data. Use the returned recordChangeTag for update_reminder_list_appearance. Shared lists and groups are not supported.",
     inputSchema: z.object({ listId: RenameListInput.shape.listId, expectedGeneration }).strict(),
@@ -135,7 +148,7 @@ export async function handleMCP(request: Request, env: RuntimeEnv, owner: string
       return { structuredContent: result, content: [{ type: "text" as const, text: JSON.stringify(result) }] };
     } catch (error) { return toolError(error); }
   });
-  server.registerTool("get_shopping_categories", {
+  registerTool("get_shopping_categories", {
     title: "Get categories for an iCloud Shopping list",
     description: "Read Apple's materialised categories for one exact owned Shopping list, including categories with no current reminder members. Discovery uses the private category-only metadata catalogue and reads at most one bounded reverse-feed page; an empty result may still include a continuation. This is a fresh live read, not a snapshot. For each page, keep the exact listId and Apple session generation, then use the newly returned single-use continuation within ten minutes. Reminder contents are never persisted. Apple's built-in DisplayName and canonicalName can differ by localization or app.",
     inputSchema: GetShoppingCategoriesRequest,
@@ -150,7 +163,7 @@ export async function handleMCP(request: Request, env: RuntimeEnv, owner: string
       return { structuredContent: result, content: [{ type: "text" as const, text: JSON.stringify(result) }] };
     } catch (error) { return toolError(error); }
   });
-  server.registerTool("set_reminder_category", {
+  registerTool("set_reminder_category", {
     title: "Set a reminder's Shopping category",
     description: "Move one ordinary open, undated, childless root reminder in an owned Shopping list to an existing non-null category. Supply the exact reminder and list version tags plus the destination category tag from fresh reads. The reminder moves to the end of that category and other reminder data is preserved; Apple's native grocery learning is updated for the current lowercase ASCII title. Category creation, deletion, conversion, and cross-list moves are unsupported. A stale version returns CONFLICT and is never retried automatically. After WRITE_OUTCOME_UNKNOWN, perform fresh reads before any further change.",
     inputSchema: SetShoppingCategoryRequest,
@@ -171,7 +184,7 @@ export async function handleMCP(request: Request, env: RuntimeEnv, owner: string
     { name: "delete_reminder_list", action: "delete" as const, schema: DeleteListInput,
       description: "Soft-delete an owned private Reminders list ONLY when it is fully verified empty, including completed records, and its current title matches confirmName. This is destructive. A stale tag or incomplete pagination fails. WRITE_OUTCOME_UNKNOWN requires a fresh read, not automatic retry. Nonempty list deletion is not supported." },
   ]) {
-    server.registerTool(entry.name, {
+    registerTool(entry.name, {
       title: entry.name.replaceAll("_", " "), description: entry.description,
       inputSchema: entry.schema.extend({ expectedGeneration }).strict(), outputSchema: ListMutationOutput,
       annotations: { readOnlyHint: false, destructiveHint: entry.action !== "create", idempotentHint: true, openWorldHint: true },
@@ -184,7 +197,7 @@ export async function handleMCP(request: Request, env: RuntimeEnv, owner: string
       } catch (error) { return toolError(error); }
     });
   }
-  server.registerTool("update_reminder_list_appearance", {
+  registerTool("update_reminder_list_appearance", {
     title: "Update a reminder list's colour and emoji",
     description: "Set one built-in colour preset from red, orange, yellow, green, light-blue, blue, indigo, pink, purple, brown, grey or rose, one emoji grapheme, or both. Requires an exact owned, standard private listId, its current recordChangeTag from get_reminder_list_appearance, and the current expectedGeneration. Unknown existing fields are preserved. Color and badge clearing, custom RGB values, groups, sections and shared lists are unsupported. A stale tag returns CONFLICT; WRITE_OUTCOME_UNKNOWN requires a fresh appearance read before constructing another request. The original request is never automatically retried.",
     inputSchema: UpdateListAppearanceRequest,
@@ -198,7 +211,7 @@ export async function handleMCP(request: Request, env: RuntimeEnv, owner: string
       return { structuredContent: result, content: [{ type: "text" as const, text: JSON.stringify(result) }] };
     } catch (error) { return toolError(error); }
   });
-  server.registerTool("get_reminder_organization", {
+  registerTool("get_reminder_organization", {
     title: "Get a reminder's separate URL and tags",
     description: "Read the selected reminder's native URL attachment and literal tag names, with exact related IDs and its current version. Other attachments remain opaque IDs. Requires an owned private list. No reminder content or signed asset links are persisted or returned.",
     inputSchema: ReminderTargetInput.omit({ recordChangeTag: true }).extend({ expectedGeneration }).strict(),
@@ -211,57 +224,57 @@ export async function handleMCP(request: Request, env: RuntimeEnv, owner: string
       return { structuredContent: result, content: [{ type: "text" as const, text: JSON.stringify(result) }] };
     } catch (error) { return toolError(error); }
   });
-  server.registerTool("set_reminder_url", {
+  registerTool("set_reminder_url", {
     title: "Set or clear a reminder's separate URL",
     description: "Set one credential-free HTTP(S) URL, or clear it with null, using the exact reminder version. Native URL attachments are created or retired atomically with the reminder. Other attachments and tags are preserved; multiple URL attachments are refused. After WRITE_OUTCOME_UNKNOWN, read get_reminder_organization before any further change; stale versions are never refreshed automatically.",
     inputSchema: ReminderTargetInput.merge(URLChanges).extend({ expectedGeneration }).strict(), outputSchema: MutationOutput("set_url"),
     annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: true },
   }, args => write("set_url", args));
-  server.registerTool("set_reminder_tags", {
+  registerTool("set_reminder_tags", {
     title: "Replace a reminder's tags",
     description: "Replace the complete literal tag-name selection (up to 16 unique names), or remove all tags with an empty array, using the exact reminder version. Names contain no whitespace or controls. Existing selected tag records are retained and protected; removed tags are retired and new tags created in one atomic group. This changes only the selected reminder. After uncertainty, read its organization metadata before another request.",
     inputSchema: ReminderTargetInput.merge(TagChanges).extend({ expectedGeneration }).strict(), outputSchema: MutationOutput("set_tags"),
     annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: true },
   }, args => write("set_tags", args));
-  server.registerTool("move_reminder", {
+  registerTool("move_reminder", {
     title: "Move an ordinary reminder between private lists",
     description: "Move an undated, open, childless root reminder between different owned private standard lists. Require its exact version and both list versions from get_reminder_list. Preserve its identity, content, one URL and ordinary tags; update both memberships and the native parent atomically. Dated, recurring, alarmed, assigned, sectioned, nested reminders and other attachments are refused. Descendant absence is checked with a bounded live read; a new child appearing after that read remains a concurrency limitation. Reconcile uncertain state by exact ID in both lists before another request.",
     inputSchema: MoveReminderInput.extend({ expectedGeneration }).strict(), outputSchema: MutationOutput("move"),
     annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: true },
   }, args => write("move", args));
-  server.registerTool("copy_reminder", {
+  registerTool("copy_reminder", {
     title: "Copy an ordinary reminder between private lists",
     description: "Copy an undated, open, childless ordinary root to a different owned private standard list. Require the source reminder and both list versions, plus one stable UUID idempotencyKey. Copy title and notes as plain text, priority, flag, one URL and literal tags; new reminder and related records use fresh identities. Protect the source and destination membership in the same atomic group. Recurrence, schedules, descendants, sections, assignments and other attachments are refused. Retain identical inputs and the same key after WRITE_OUTCOME_UNKNOWN: the saved request fingerprints permit matching exact-ID reconciliation with no further write, even after source/list guard tags advance. Changed inputs or changed copied content return CONFLICT. Up to 128 copy identities are retained encrypted for this Apple session; reminder bodies are never saved.",
     inputSchema: CopyReminderInput.extend({ expectedGeneration }).strict(), outputSchema: MutationOutput("copy"),
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
   }, args => write("copy", args));
-  server.registerTool("create_reminder", {
+  registerTool("create_reminder", {
     title: "Create an iCloud reminder",
     description: "Create one open reminder in listId from get_reminder_lists. Requires the authenticated owner and a ready Apple session. Supply a new UUID idempotencyKey for each distinct reminder and keep that same key and input when retrying an uncertain creation; the UUID determines the Apple record ID and prevents duplicate items. Supports title, notes, priority (0 none, 1 high, 5 medium, 9 low), flagged, dueDate with an explicit ISO 8601 offset, timeZone and allDay. An all-day reminder requires a date and time zone. No alarms, recurrence, attachments, subtasks or completion changes are created. WRITE_OUTCOME_UNKNOWN means Apple may have committed: inspect the supplied reminderId and reuse the same idempotencyKey, never create a second key for that attempt. Returned replayed=true means the matching existing item was read and no new write was sent.",
     inputSchema: CreateReminderInput.extend({ expectedGeneration }).strict(),
     outputSchema: MutationOutput("create"),
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
   }, args => write("create", args));
-  server.registerTool("create_subtask", {
+  registerTool("create_subtask", {
     title: "Create an iCloud reminder subtask",
     description: "Create one undated, open reminder under an exact open root reminder in the same list. Available to the authenticated owner with a ready Apple session; parentReminder contains its reminderId and current recordChangeTag. Retain one UUID idempotencyKey and identical inputs for reconciliation; matching replay makes no further write even after the parent tag advances. The child create and parent version guard share one atomic group. Recurring, alarmed, dated or nested parents and deeper nesting are refused. Does not create recurrence, alarms or cascade actions. Read parentReminderId in get_reminder/get_reminders to inspect relationships. WRITE_OUTCOME_UNKNOWN requires exact-ID reconciliation, never a replacement create key.",
     inputSchema: CreateSubtaskInput.extend({ expectedGeneration }).strict(), outputSchema: MutationOutput("create_subtask"),
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
   }, args => write("create_subtask", args));
-  server.registerTool("set_reminder_parent", {
+  registerTool("set_reminder_parent", {
     title: "Make an iCloud reminder a subtask or return it to top level",
     description: "Move one open undated childless reminder under an exact open root in the same list, or remove its existing parent with parentReminder=null. Requires capabilities.subtasks=true, exact list/reminder IDs and the child recordChangeTag. A destination parent includes its current reminderId and recordChangeTag. The server reads the previous parent from the versioned child and guards both affected parents atomically. Preserves content, dates and untouched tokens. Checks descendants with a bounded complete list read; refuses self-parenting, deeper nesting, cross-list moves, completed/dated/alarmed/recurring nodes and moving parents with children. This is not a bulk-delete eligibility proof or cascade operation. Stale tags return CONFLICT; never refresh them automatically to retry. Reconcile WRITE_OUTCOME_UNKNOWN before any further mutation.",
     inputSchema: SetReminderParentInput.extend({ expectedGeneration }).strict(), outputSchema: MutationOutput("set_parent"),
     annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: true },
   }, args => write("set_parent", args));
-  server.registerTool("update_reminder", {
+  registerTool("update_reminder", {
     title: "Edit an open iCloud reminder",
     description: "Edit one open reminder using listId, reminderId and the current recordChangeTag from get_reminder or get_reminders. Requires the authenticated owner and a ready Apple session. Provide a nonempty changes object with only the fields to edit: title, notes, priority (0/1/5/9), flagged, dueDate, timeZone, allDay, recurrence, earlyReminder or locationAlarm. Omitted fields stay unchanged; null clears a simple reminder's date/time zone, and clearing its date also clears the zone and all-day marker unless explicitly overridden. Text edits replace that field's text formatting; untouched documents are preserved. Timed root reminders with one supported absolute date alarm can change date/time zone atomically with the existing alarm and trigger, protecting and preserving any recurrence. Supply an explicit-offset instant with whole-second precision and an IANA zone; a zone-only change preserves the instant, not the local clock. Known linked dates can be cleared with their recurrence and date alarm retired atomically, preserving a location alarm and removing the early reminder. All-day conversion requires the desired calendar date at midnight UTC (dueDate ending in Z) and removes the time zone; reverse conversion requires explicit dueDate and timeZone. Conversions preserve existing location pairs and early payloads; all-day conversion removes hourly recurrence and preserves other known frequencies. Hourly recurrence requires a timed date. One hourly, daily, weekly, monthly or yearly recurrence can be created on a known dated schedule, edited or removed with null with interval 1–999, weekly ISO weekdays, monthly day numbers or one ordinal weekday, yearly month numbers, and an explicit-offset end instant. Omitted compatible patterns and endDate are preserved; frequency changes clear incompatible patterns. No arbitrary RRULE or anchor/calendar reinterpretation is accepted. One minute/hour/day/week/month early reminder can be created using an exact versioned open same-list source, or its existing offset can be edited while preserving private metadata. Source absence fails closed. One location alarm can be created with full place (title, address, finite latitude/longitude), proximity and radiusMeters, edited through supplied metadata, or removed with null; omitted metadata is preserved. Timed date moves preserve and version-guard the location alarm and trigger. Child scheduling protects the exact same-list open root parent. Repeated local times, multiple date or location alarms, unknown relative payloads and unknown schedules are unsupported. Use prepare_reminder_update for an exact read-only recipe preview. Repeating identical arguments makes no additional change but may return CONFLICT because the version is stale. Read and review before constructing a new request with a fresh tag. WRITE_OUTCOME_UNKNOWN means the change may have saved: read current state first. Never automatically refresh tags, retry or force-update. State changes use separate tools; cannot move lists.",
     inputSchema: PreparedUpdateInput.extend({ expectedGeneration }).strict(),
     outputSchema: MutationOutput("update"),
     annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: true },
   }, args => write("update", args));
-  server.registerTool("prepare_reminder_update", {
+  registerTool("prepare_reminder_update", {
     title: "Preview an exact reminder update",
     description: "Read and classify the exact versioned reminder graph without modifying Apple. Returns normalized before/after schedules and an expiring preparation token for supported single-record or linked-date edits. Linked-date moves update an existing absolute date alarm and trigger in place while atomically protecting unchanged recurrence. Known linked date clearing and explicit all-day conversion preserve location alarms; conversion preserves early reminders and removes hourly recurrence. Known recurrence and early reminders can be created, edited or removed through bounded atomic recipes. Early creation validates and version-guards a same-list native metadata source. Child scheduling protects its exact parent. One location alarm can be created from a resolved place, edited or removed; a date move preserves its complete pair with every participant protected. Unknown relative payloads, multiple alarms of the same type and unknown graphs are unsupported. Pass the token with identical arguments to update_reminder; changed graphs or requests are rejected. Completed historical occurrences are never redirected or reopened. A preparation token does not authorize a change.",
     inputSchema: PrepareUpdateInput, outputSchema: PrepareUpdateOutput, annotations: readAnnotations,
@@ -282,7 +295,7 @@ export async function handleMCP(request: Request, env: RuntimeEnv, owner: string
     { name: "continue_reminder_job", schema: JobIdentity, action: "continue", description: "Run at most three ledger-selected items using per-operation Apple session leases and a durable account/job lease. Request-driven mode pauses without further calls. Durable dispatch intent is saved before Apple; recovered intent is reconciled read-only and never automatically replayed. Reports lost receipts as unknown even if desired state is observed. Cancellation is checked immediately before dispatch. No credentials or raw Apple payloads are accepted." },
   ] as const;
   for (const tool of jobTools) {
-    server.registerTool(tool.name, {
+    registerTool(tool.name, {
       title: tool.name.replaceAll("_", " "), description: tool.description, inputSchema: tool.schema, outputSchema: JobOutput,
       annotations: { readOnlyHint: tool.action === "get", destructiveHint: tool.action === "start" || tool.action === "continue", idempotentHint: tool.action !== "get", openWorldHint: true },
     }, async (args: unknown) => {
@@ -298,7 +311,7 @@ export async function handleMCP(request: Request, env: RuntimeEnv, owner: string
     const family = action === "delete"
       ? "Soft-delete a bounded ordinary one-level family without recurrence. A family may contain zero or one validated timed absolute date pair per member; parent deletion also soft-deletes each exact pair by its Deleted markers, preserving backlinks and date fields. Direct child deletion soft-deletes only that child’s own pair, if present, and touches the root timestamp; root/sibling dates, pairs and states are preserved. Deleting a child detaches that child from its List and root, removes its List membership and touches the root timestamp; siblings keep their state. Deleting a root detaches it and removes its membership, then marks all discovered children deleted while retaining their List/parent links, completion dates and tokens. Exact family and List versions share one atomic group, limited to 32 records and 64 KiB. Unknown, incomplete, deeper or oversized families are refused. Native unreferenced additions are not universally locked. affectedRecords includes the deleted reminders and any touched root. Retain all exact IDs for reconciliation; get_reminder can return a detached deleted root with listId=null. No hard-delete or restore tool is exposed."
       : "Supports bounded ordinary one-level parent/subtask families without recurrence, including mixtures of undated members, simple dates and one validated timed IANA-zone absolute date pair per member. Complete/reopen retains every exact date pair. Scheduled members cannot have early/location alarms, assignments, tags or attachments. Completing a root completes its open children with one shared timestamp; already completed children keep their state and timestamp. Reopening a root reopens only children whose completion timestamp equals the root's previous timestamp. Completing or reopening a child changes only that child. The complete known family, all date pairs and List are exact-version guarded in one atomic group, limited to 32 records and 64 KiB. Unknown, incomplete, deeper or oversized families are refused. Native additions advanced root/List versions in observed samples; universal protection against unreferenced native additions is not established. affectedRecords lists records whose state changed.";
-    server.registerTool(`${action}_reminder`, {
+    registerTool(`${action}_reminder`, {
       title: `${action === "complete" ? "Complete" : action === "reopen" ? "Reopen" : "Delete"} an iCloud reminder`,
       description: `${operation}. Requires the authenticated owner, a ready Apple session, listId, reminderId and the latest recordChangeTag from get_reminder or get_reminders. Use get_reminder for exact completed-item lookup, or includeCompleted=true to page list history. Preserves omitted content, relationships and resolution tokens. ${family} Also supports a private childless nonrecurring root with exactly one absolute date alarm at a timed IANA-zone due date, without early/location alarms, assignments, tags or attachments. Complete/reopen retains the same date pair; delete detaches the root and soft-deletes that exact Alarm and Trigger by their Deleted markers, retaining their backlinks and date fields. The complete graph and List share one atomic exact-version group; no new record IDs or hard deletion. ${action === "complete" ? "Also supports root-only interval-one timed weekly recurrence, all-day daily recurrence and the observed all-day last-day monthly rule. The active ID stays open at the next calendar due date; completedOccurrence is fresh completed history at the old date. An all-day daily interval-one rule may have an inclusive EndDate: omission of recurrenceCalendarTimeZone supports only midnight UTC; an explicit IANA zone interprets the calendar date of any EndDate instant, including midnight instants. Earlier occurrences advance with history, while the final occurrence completes the same active ID without history or due/rule changes. An ended timed weekly rule must end at an exact occurrence on its stored IANA-zone weekly cadence and local clock. Its final occurrence completes the same active ID, retaining the date, rule and optional absolute date pair without new history. A weekly absolute date alarm on earlier occurrences is replaced by separate active/history pairs and its old exact pair retired atomically. Original ID/tag arguments retain durable occurrence identities; an uncertain retry reads and reconciles those exact IDs without another dispatch. Other recurrence patterns, end conditions and overdue skipping need separate recipes." : action === "reopen" ? "Also reopens the completed exact final root of a timed IANA-zone weekly interval-one rule ending on the same weekly cadence and local clock, with zero or one retained absolute date pair, or an all-day daily interval-one recurrence whose UTC due-date label equals its inclusive end calendar date. For all-day daily rules, supply the same explicit recurrenceCalendarTimeZone for nonmidnight ends; omission supports only midnight UTC. The calendar-zone argument is refused for timed weekly rules. Clears only completion, retaining the due date and rule with no new history or alarm records. Original arguments use retained read-only reconciliation after an uncertain acknowledgment. Other recurring reopening patterns are refused." : "Recurring deletion requires explicit recurringDeletionScope: occurrence or all_future, currently a childless open timed interval-one weekly root in its stored IANA zone with exactly one absolute date pair, or an all-day interval-one daily root or observed last-day monthly root at midnight UTC without stored time zone or alarms. Monthly deletion requires DaysOfTheMonth [28,29,30,31], SetPositions [-1], an actual last-day due date, and no EndDate. These recipes refuse counts and exception patterns. Ended timed weekly deletion uses its stored IANA zone: an occurrence on the local end calendar day retires the root and exact rule/pair even when the raw end clock precedes its due clock. Earlier occurrences advance only when their exact next due instant is within the raw EndDate. If no advance fits before that final day, request explicit all_future or separately review an end-date edit; occurrence returns VALIDATION_ERROR without dispatch. All-day daily may have an inclusive EndDate: omission of recurrenceCalendarTimeZone supports only midnight UTC; an explicit IANA zone interprets any end instant as its calendar date. The calendar argument is refused for no-end daily and every weekly or monthly deletion recipe. occurrence advances the same active ID without completed history; weekly hard-retires only its exact old Alarm/Trigger and creates one fresh next-date pair, while daily and last-day monthly create no new records or pairs. At the final inclusive local weekly or daily date, occurrence retires the root and rule exactly as all_future, retaining the caller scope for reconciliation; completion fields and earlier histories stay unchanged. all_future detaches the active root and soft-deletes its exact current rule and any supported pair, preserving their backlinks, prior histories and unrelated fields. Daily, last-day monthly and ended weekly retirement advance the List ordering token even if its established membership is absent, retaining unchanged membership. All participants and List use one bounded exact-version group. Scope is refused for ordinary deletion. Original ID/tag/scope/calendar-zone arguments retain immutable identities; an uncertain replay reconciles exact outcomes read-only without another dispatch."} Repeating identical arguments causes no additional reminder change but may return CONFLICT because the original version is stale. Read and review before constructing any new request with a fresh tag. WRITE_OUTCOME_UNKNOWN means Apple may have saved the action: reconcile every affected exact ID first. Never automatically retry with a fresh tag or force a write.`,
       inputSchema: ReminderTargetInput.extend({ expectedGeneration, ...(action === "delete" ? { recurringDeletionScope: RecurringDeletionScope.optional(), recurrenceCalendarTimeZone: RecurrenceCalendarTimeZone.optional() } : { recurrenceCalendarTimeZone: RecurrenceCalendarTimeZone.optional() }) }).strict(),
@@ -306,7 +319,7 @@ export async function handleMCP(request: Request, env: RuntimeEnv, owner: string
       annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: true },
     }, args => write(action, args));
   }
-  server.registerTool("connection_status", { title: "Reminders connection status", description: "Report connection state, session generation and available tools without fetching Apple data. A READY session supports bounded reads, basic mutations and one-level subtask relationship tools. Simple bulk creation also requires the installed job schema. writeEnabled and capabilities report current connection and storage availability, not feature rollout flags. Mutation tools enforce owner/session and version checks and never accept Apple credentials.", inputSchema: z.object({}).strict(), outputSchema: ConnectionStatusOutput, annotations }, async () => {
+  registerTool("connection_status", { title: "Reminders connection status", description: "Report connection state, session generation and available tools without fetching Apple data. A READY session supports bounded reads, basic mutations and one-level subtask relationship tools. Simple bulk creation also requires the installed job schema. writeEnabled and capabilities report current connection and storage availability, not feature rollout flags. Mutation tools enforce owner/session and version checks and never accept Apple credentials.", inputSchema: z.object({}).strict(), outputSchema: ConnectionStatusOutput, annotations }, async () => {
     try {
       const result = await new AppleConnectionService(env, owner).status();
       return { structuredContent: result, content: [{ type: "text", text: JSON.stringify(result) }] };
@@ -314,7 +327,22 @@ export async function handleMCP(request: Request, env: RuntimeEnv, owner: string
       return toolError(error);
     }
   });
-  const transport = new WebStandardStreamableHTTPServerTransport({ sessionIdGenerator: undefined, enableJsonResponse: true, maxRequestBodySize: 65_536 });
+  registerDriveTools(registerTool, env, owner);
+  // Only the bounded inline-upload tool can exceed the ordinary 64 KiB request
+  // budget. Never grant a larger budget to other tools or JSON-RPC batches.
+  let bytes;
+  try { bytes = await limitedBytes(new Response(request.body, { headers: request.headers }), INLINE_REQUEST_BYTES); }
+  catch (error) {
+    if (error instanceof AppError && error.code === "PROTOCOL_CHANGED") throw new AppError("VALIDATION_ERROR", INLINE_UPLOAD_GUIDANCE, 413);
+    throw error;
+  }
+  if (bytes.byteLength > 65_536) {
+    let message;
+    try { message = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes)); } catch { /* SDK handles normal-size invalid JSON. */ }
+    if (!message || Array.isArray(message) || message.method !== "tools/call" || message.params?.name !== "upload_icloud_drive_file") throw new AppError("VALIDATION_ERROR", "This MCP request exceeds the 64 KiB limit.", 413);
+  }
+  request = new Request(request, { body: Uint8Array.from(bytes).buffer });
+  const transport = new WebStandardStreamableHTTPServerTransport({ sessionIdGenerator: undefined, enableJsonResponse: true, maxRequestBodySize: INLINE_REQUEST_BYTES });
   try { await server.connect(transport); return await transport.handleRequest(request); }
   finally { await server.close(); }
 }

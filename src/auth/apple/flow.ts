@@ -3,21 +3,23 @@ import { AppError } from "../../errors.ts";
 import { integer, unb64 } from "../../crypto/bytes.ts";
 import { SRP_N } from "../../crypto/srp.ts";
 import type { PushConnector } from "../../transport/apple-websocket.ts";
-import { AppleAuthHTTP, type AuthSnapshot } from "./http.ts";
+import { AppleAuthHTTP } from "./http.ts";
 import { AppleBridge } from "./bridge.ts";
 import { parseBootOptions } from "./boot-context.ts";
 import { parseChallenge, StartMessage, type AuthInput, type SrpChallenge } from "./protocol.ts";
-import { advancePcs, freshPcsCheckpoint, type PcsCheckpoint, type PcsResult } from "./pcs.ts";
-import type { CloudKitConnection } from "../../icloud/cloudkit.ts";
-import { loginAssurance, requireNoAppleRejection, type LoginAssurance } from "./policy.ts";
+import { advancePcs, freshPcsCheckpoint, type RemindersPcsResult } from "./pcs.ts";
+import type { AppleSession } from "../../persistence/apple-sessions.ts";
+import { type ServiceSettings, DEFAULT_SERVICE_SETTINGS } from "../../services/settings.ts";
+import { type AppleServices } from "./services.ts";
+export type { AppleSession } from "../../persistence/apple-sessions.ts";
+import { loginAssurance, requireNoAppleRejection } from "./policy.ts";
 
-export interface AppleSession { auth: AuthSnapshot; connection: CloudKitConnection; pcs: PcsCheckpoint; login: LoginAssurance; }
 export type AuthEvent =
   | { type: "srp-challenge"; challenge: SrpChallenge }
   | { type: "bridge-challenge"; salt: string }
   | { type: "bridge-response"; serverShare: string; serverConfirmation: string }
   | { type: "bridge-encrypted"; encryptedCode: string }
-  | { type: "complete"; state: PcsResult["state"]; action?: string; nextAttemptAt: number; expiresAt: number };
+  | { type: "complete"; state: RemindersPcsResult["state"]; action?: string; nextAttemptAt: number; expiresAt: number };
 type Phase = "new" | "srp" | "bridge-share" | "bridge-confirmation" | "bridge-validation" | "done" | "busy" | "closed";
 export class AppleSignInFlow {
   private phase: Phase = "new";
@@ -27,9 +29,10 @@ export class AppleSignInFlow {
   private deviceVerified = false;
   private revision = 0;
   readonly http: AppleAuthHTTP; readonly signal: AbortSignal;
-  readonly persist: (session: AppleSession, result: PcsResult) => Promise<void>; readonly connect?: PushConnector;
+  readonly persist: (session: AppleSession, result: RemindersPcsResult) => Promise<void>; readonly connect?: PushConnector;
   readonly thirtyDays: boolean;
-  constructor(http: AppleAuthHTTP, signal: AbortSignal, persist: (session: AppleSession, result: PcsResult) => Promise<void>, connect?: PushConnector, thirtyDays = true) { this.http = http; this.signal = signal; this.persist = persist; this.connect = connect; this.thirtyDays = thirtyDays; }
+  readonly settings: () => Promise<ServiceSettings>;
+  constructor(http: AppleAuthHTTP, signal: AbortSignal, persist: (session: AppleSession, result: RemindersPcsResult) => Promise<void>, connect?: PushConnector, thirtyDays = true, settings: () => Promise<ServiceSettings> = async () => structuredClone(DEFAULT_SERVICE_SETTINGS)) { this.http = http; this.signal = signal; this.persist = persist; this.connect = connect; this.thirtyDays = thirtyDays; this.settings = settings; }
   private alive(revision: number) {
     if (this.signal.aborted || revision !== this.revision) throw new AppError("RESTART_REQUIRED", "This sign-in attempt expired or its connection was lost. Restart sign-in.", 409);
   }
@@ -103,10 +106,25 @@ export class AppleSignInFlow {
     if (!this.deviceVerified) throw new AppError("VERIFICATION_REQUIRED", "Complete fresh trusted-device verification before establishing Apple session trust.", 409);
     const trust = await this.http.auth("/2sv/trust"); this.http.expect(trust, [200, 204]); this.alive(revision);
     requireNoAppleRejection(trust.body);
-    const connection = await this.http.accountLogin(); this.alive(revision);
-    const result = await advancePcs(this.http, connection.dsid, freshPcsCheckpoint()); this.alive(revision);
+    const discovered = await this.http.accountLogin(); this.alive(revision);
+    const { drive, ...connection } = discovered;
+    const settings = await this.settings(); this.alive(revision);
+    // Login can request Reminders consent only when selected. Drive intent never
+    // triggers PCS: the dashboard must invoke explicit Drive approval afterwards.
+    const initial = freshPcsCheckpoint();
+    const result: RemindersPcsResult = settings.reminders.enabled && connection.cloudKitURL
+      ? await advancePcs(this.http, connection.dsid, initial, Date.now(), "reminders", async () => {
+        if (!(await this.settings()).reminders.enabled) throw new AppError("FORBIDDEN", "Reminders was disabled before Apple approval.", 403);
+        this.alive(revision);
+      })
+      : { state: "READY", checkpoint: initial };
+    this.alive(revision);
+    const services: AppleServices = { version: 1,
+      reminders: !connection.cloudKitURL ? { state: "UNAVAILABLE" } : !settings.reminders.enabled ? { state: "CONSENT_REQUIRED" } :
+        { state: result.state, pcs: result.checkpoint, ...(result.state === "DEVICE_APPROVAL_PENDING" ? { action: result.action } : {}) },
+      drive: drive ? { state: "CONSENT_REQUIRED", connection: drive } : { state: "UNAVAILABLE" } };
     const login = loginAssurance(Date.now(), this.thirtyDays);
-    await this.persist({ auth: this.http.snapshot(), connection, pcs: result.checkpoint, login }, result); this.alive(revision);
+    await this.persist({ auth: this.http.snapshot(), connection, pcs: result.checkpoint, login, services }, result); this.alive(revision);
     this.phase = "done"; this.bridge?.close(); this.bridge = null;
     return { type: "complete", state: result.state, ...(result.state === "DEVICE_APPROVAL_PENDING" ? { action: result.action } : {}), nextAttemptAt: result.checkpoint.nextAttemptAt, expiresAt: login.expiresAt };
   }

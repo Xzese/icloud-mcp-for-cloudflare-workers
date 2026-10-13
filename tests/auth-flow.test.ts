@@ -1,4 +1,5 @@
 import test from "node:test";
+import { DEFAULT_SERVICE_SETTINGS, type ServiceSettings } from "../src/services/settings.ts";
 import assert from "node:assert/strict";
 import fixtures from "./fixtures/protocol.json" with { type: "json" };
 import { b64, concat, hex, unb64, unhex, utf8 } from "../src/crypto/bytes.ts";
@@ -113,7 +114,7 @@ test("phone, voice and legacy trusted-device routes stop before verification, tr
   assert.equal(harness.requests.length, 3); assert.equal(persisted, false);
 });
 
-function bridgeHarness(options: { validation?: Reply; account?: Reply; stepZero?: ReplyPlan; pushIdentity?: string; pushAlias?: string | "echo-request"; serverFlowId?: string; laterIdentity?: string } = {}) {
+function bridgeHarness(options: { settings?: ServiceSettings; validation?: Reply; account?: Reply; stepZero?: ReplyPlan; pushIdentity?: string; pushAlias?: string | "echo-request"; serverFlowId?: string; laterIdentity?: string } = {}) {
   const topic = "synthetic.topic";
   const topicHash = unhex(fixtures.push.topicHash);
   const otherTopic = new Uint8Array(20).fill(9);
@@ -179,7 +180,7 @@ function bridgeHarness(options: { validation?: Reply; account?: Reply; stepZero?
     return channel;
   };
   let saved: any = null;
-  const flow = new AppleSignInFlow(http, signal, async (session, result) => { saved = { session, result }; }, connect);
+  const flow = new AppleSignInFlow(http, signal, async (session, result) => { saved = { session, result }; }, connect, true, async () => options.settings ?? structuredClone(DEFAULT_SERVICE_SETTINGS));
   return { flow, requests, sent, events, fetchPlans, topic, topicHash, otherTopic, tokenHex, saved: () => saved };
 }
 
@@ -333,6 +334,7 @@ test("the auth socket rejects a valid message bound to another transaction befor
           return { success: true, meta: { changes: 1 } };
         },
         async first<T>() {
+          if (sql.startsWith("SELECT revision, settings_json FROM owner_service_settings")) return null;
           if (sql.startsWith("SELECT version FROM apple_session_state")) {
             return (database.initialized && Number(values[2]) === database.generation ? { version: database.version } : null) as T | null;
           }
@@ -562,4 +564,29 @@ test("server auth envelopes reject replay, mixed attempts and premature or incon
   assert.equal(seq.consume({ type: "srp-challenge", ...binding, direction: "server", sequence: 1, challenge }).type, "srp-challenge");
   assert.throws(() => seq.consume({ type: "complete", ...binding, direction: "server", sequence: 2, state: "DEVICE_APPROVAL_PENDING", nextAttemptAt: 0, expiresAt: Date.now() + 86_400_000 }));
   const fresh = new AuthResponseSequence(0); assert.throws(() => fresh.consume({ ...hello, type: "complete", state: "READY" }));
+});
+
+
+test("Drive-only and selected combined login share trusted proof but never request Drive or disabled Reminders consent", async () => {
+  for (const discoverReminders of [false, true]) {
+    const settings = structuredClone(DEFAULT_SERVICE_SETTINGS);
+    settings.reminders.enabled = false;
+    settings.drive = { enabled: true, browse: true, contents: true, upload: false, organize: false };
+    const h = bridgeHarness({ settings, account: { body: { ...accountReply, webservices: {
+      ...(discoverReminders ? { ckdatabasews: { url: "https://p01-ckdatabasews.icloud.com" } } : {}),
+      drivews: { url: "https://p01-drivews.icloud.com" }, docws: { url: "https://p01-docws.icloud.com" },
+    } } } });
+    await beginHsa2(h.flow);
+    await h.flow.advance({ type: "bridge-share", ...binding, sequence: 1, data: b64(unhex(fixtures.bridge.clientMessage)) });
+    await h.flow.advance({ type: "bridge-confirmation", ...binding, sequence: 2, data: b64(unhex(fixtures.bridge.confirmation)) });
+    const completed = await h.flow.advance({ type: "bridge-validation", ...binding, sequence: 3, code: fixtures.bridge.plaintext });
+    assert.equal(completed.type, "complete");
+    assert.equal(completed.state, "READY");
+    assert.equal(h.saved().session.login.factor, "trusted-device-spake2");
+    assert.equal(h.saved().session.services.reminders.state, discoverReminders ? "CONSENT_REQUIRED" : "UNAVAILABLE");
+    assert.equal(h.saved().session.services.drive.state, "CONSENT_REQUIRED");
+    assert.equal(h.saved().session.connection.cloudKitURL === undefined, !discoverReminders);
+    assert.ok(!h.requests.some(request => /requestPCS|requestWebAccessState|enableDeviceConsentForPCS/.test(request.path)));
+    assert.equal(h.saved().session.auth.clientId, h.saved().session.services.drive.connection.clientId);
+  }
 });

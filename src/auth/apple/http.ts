@@ -1,9 +1,10 @@
-// Observed pyicloud protocol at the pinned MIT revision. Only Reminders setup
-// services are exposed here. Raw account responses and headers stay server-side.
+// Observed pyicloud protocol at the pinned MIT revision. Shared account setup
+// discovers bounded Reminders and Drive metadata endpoints. Raw account responses and headers stay server-side.
 import { z } from "zod";
 import { AppError } from "../../errors.ts";
 import { AppleHTTP, validatedAppleURL, APPLE_USER_AGENT, appleWebHeaders } from "../../transport/apple-http.ts";
 import { CookieJar, type Cookie } from "../../transport/cookie-jar.ts";
+import { validatedDriveServiceURL, type DiscoveredAppleConnection } from "./services.ts";
 import { requireNoAppleRejection } from "./policy.ts";
 
 export const AUTH_ROOT = "https://idmsa.apple.com/appleauth/auth";
@@ -133,19 +134,37 @@ export class AppleAuthHTTP {
     if (body.hsaTrustedBrowser === false) throw new AppError("VERIFICATION_REQUIRED", "Apple no longer accepts this browser's trusted-session state. Verify your device again.", 409);
     if (body.hsaTrustedBrowser !== true || body.hsaChallengeRequired !== undefined && typeof body.hsaChallengeRequired !== "boolean" ||
       body.termsUpdateNeeded !== undefined && typeof body.termsUpdateNeeded !== "boolean") throw new AppError("PROTOCOL_CHANGED", "Apple did not return a supported trusted-session state.");
-    const dsInfo = object(body.dsInfo); const dsid = dsInfo?.dsid;
-    const rawURL = object(object(body.webservices)?.ckdatabasews)?.url;
-    if (!((typeof dsid === "string" && /^\d{1,32}$/.test(dsid)) || (typeof dsid === "number" && Number.isSafeInteger(dsid) && dsid > 0)) || typeof rawURL !== "string") throw new AppError("PROTOCOL_CHANGED", "Apple did not return the required Reminders account services.");
-    if (expectedAccount !== undefined && String(dsid) !== expectedAccount) throw new AppError("PROTOCOL_CHANGED", "Apple returned a different account. No reminder access or account replacement was allowed.");
-    let root: URL; try { root = new URL(rawURL); } catch { throw new AppError("PROTOCOL_CHANGED", "Apple returned an invalid Reminders service."); }
-    if ((root.pathname !== "/" && root.pathname !== "") || root.search || root.hash || root.username || root.password) throw new AppError("PROTOCOL_CHANGED", "Apple returned an unsupported Reminders service path.");
-    let cloudKitURL: string;
-    try { cloudKitURL = validatedAppleURL(`${root.origin}/database/1/com.apple.reminders/production/private`, true).href; }
-    catch (error) {
-      if (!(error instanceof AppError)) throw error;
-      throw new AppError("PROTOCOL_CHANGED", "Apple returned a Reminders service outside the supported allowlist.");
+    return this.discoveredAccount(body, expectedAccount);
+  }
+  private discoveredAccount(body: Record<string, unknown>, expectedAccount?: string): DiscoveredAppleConnection {
+    const dsid = object(body.dsInfo)?.dsid;
+    if (!((typeof dsid === "string" && /^\d{1,32}$/.test(dsid)) || (typeof dsid === "number" && Number.isSafeInteger(dsid) && dsid > 0))) throw new AppError("PROTOCOL_CHANGED", "Apple did not return a supported account identity.");
+    if (expectedAccount !== undefined && String(dsid) !== expectedAccount) throw new AppError("PROTOCOL_CHANGED", "Apple returned a different account. No service access or account replacement was allowed.");
+    const identity = { dsid: String(dsid), clientId: this.clientId, clientBuildNumber: CLIENT_BUILD, clientMasteringNumber: CLIENT_MASTERING };
+    const services = object(body.webservices);
+    if (!services) throw new AppError("PROTOCOL_CHANGED", "Apple omitted account service discovery.");
+    let cloudKitURL: string | undefined;
+    if (services.ckdatabasews !== undefined) {
+      const rawURL = object(services.ckdatabasews)?.url;
+      if (typeof rawURL !== "string") throw new AppError("PROTOCOL_CHANGED", "Apple returned an invalid Reminders service.");
+      let root: URL; try { root = new URL(rawURL); } catch { throw new AppError("PROTOCOL_CHANGED", "Apple returned an invalid Reminders service."); }
+      if (root.pathname !== "/" || root.search || root.hash || root.username || root.password || root.port && root.port !== "443" || root.protocol !== "https:") throw new AppError("PROTOCOL_CHANGED", "Apple returned an unsupported Reminders service path.");
+      try { cloudKitURL = validatedAppleURL(`${root.origin}/database/1/com.apple.reminders/production/private`, true).href; }
+      catch { throw new AppError("PROTOCOL_CHANGED", "Apple returned a Reminders service outside the supported allowlist."); }
     }
-    return { dsid: String(dsid), cloudKitURL, clientId: this.clientId, clientBuildNumber: CLIENT_BUILD, clientMasteringNumber: CLIENT_MASTERING };
+    let drive: DiscoveredAppleConnection["drive"];
+    for (const name of ["drivews", "docws"] as const) {
+      if (services[name] !== undefined) {
+        const value = object(services[name])?.url;
+        if (typeof value !== "string") throw new AppError("PROTOCOL_CHANGED", "Apple returned an invalid Drive service.");
+        validatedDriveServiceURL(value, name);
+      }
+    }
+    if (services.drivews !== undefined && services.docws !== undefined) {
+      drive = { ...identity, driveURL: validatedDriveServiceURL(String(object(services.drivews)?.url), "drivews").origin,
+        documentsURL: validatedDriveServiceURL(String(object(services.docws)?.url), "docws").origin };
+    }
+    return { ...identity, ...(cloudKitURL ? { cloudKitURL } : {}), ...(drive ? { drive } : {}) };
   }
   async accountLogin(expectedAccount?: string) {
     const token = this.value("X-Apple-Session-Token");
@@ -157,12 +176,6 @@ export class AppleAuthHTTP {
     if (body?.termsUpdateNeeded === true) throw new AppError("TERMS_ACTION_REQUIRED", "Review Apple's updated terms in the official iCloud interface before reconnecting.", 409);
     requireNoAppleRejection(body);
     if (body?.hsaChallengeRequired === true || body?.hsaTrustedBrowser !== true) throw new AppError("VERIFICATION_REQUIRED", "Apple has not confirmed a trusted session. Restart device verification.", 409);
-    const dsInfo = object(body?.dsInfo); const dsid = dsInfo?.dsid;
-    const rawURL = object(object(body?.webservices)?.ckdatabasews)?.url;
-    if (!((typeof dsid === "string" && /^\d{1,32}$/.test(dsid)) || (typeof dsid === "number" && Number.isSafeInteger(dsid) && dsid > 0)) || typeof rawURL !== "string") throw new AppError("PROTOCOL_CHANGED", "Apple did not return the required Reminders account services.");
-    let root: URL; try { root = new URL(rawURL); } catch { throw new AppError("PROTOCOL_CHANGED", "Apple returned an invalid Reminders service."); }
-    if ((root.pathname !== "/" && root.pathname !== "") || root.search || root.hash || root.username || root.password) throw new AppError("PROTOCOL_CHANGED", "Apple returned an unsupported Reminders service path.");
-    const cloudKitURL = validatedAppleURL(`${root.origin}/database/1/com.apple.reminders/production/private`, true).href;
-    return { dsid: String(dsid), cloudKitURL, clientId: this.clientId, clientBuildNumber: CLIENT_BUILD, clientMasteringNumber: CLIENT_MASTERING };
+    return this.discoveredAccount(body!);
   }
 }
