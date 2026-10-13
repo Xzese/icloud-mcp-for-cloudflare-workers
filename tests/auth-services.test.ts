@@ -102,7 +102,9 @@ test("Drive approval uses the common cookie jar and lease while Reminders is pen
   const original = session();
   original.services = { version: 1, reminders: { state: "DEVICE_APPROVAL_PENDING", pcs: original.pcs, action: "approve-device-consent" },
     drive: { state: "CONSENT_REQUIRED", connection: drive() } };
-  const f = await fixture(original, "DEVICE_APPROVAL_PENDING"), nativeFetch = globalThis.fetch;
+  const f = await fixture(original, "DEVICE_APPROVAL_PENDING"), nativeFetch = globalThis.fetch, nativeNow = Date.now;
+  let now = nativeNow(), consented = false, pcsCalls = 0;
+  Date.now = () => now;
   try {
     await settingsWithDrive(f);
     const requests: { path: string; body: unknown }[] = [];
@@ -110,9 +112,11 @@ test("Drive approval uses the common cookie jar and lease while Reminders is pen
       const path = new URL(String(url)).pathname;
       requests.push({ path, body: init?.body ? JSON.parse(String(init.body)) : null });
       assert.match(new Headers(init?.headers).get("cookie") ?? "", /synthetic-common-cookie/);
-      if (path.endsWith("requestWebAccessState")) return Response.json({ isICDRSDisabled: true, isDeviceConsentedForPCS: true });
+      if (path.endsWith("requestWebAccessState")) return Response.json({ isICDRSDisabled: true, isDeviceConsentedForPCS: consented });
+      if (path.endsWith("enableDeviceConsentForPCS")) return Response.json({ isDeviceConsentNotificationSent: true });
       assert.ok(path.endsWith("requestPCS"));
-      assert.deepEqual(JSON.parse(String(init?.body)), { appName: "iclouddrive", derivedFromUserAction: true });
+      assert.deepEqual(JSON.parse(String(init?.body)), { appName: "iclouddrive", derivedFromUserAction: pcsCalls !== 1 });
+      if (pcsCalls++ === 0) return Response.json({ message: "Cookies not available yet on server." });
       return Response.json({ status: "success" }, { headers: { "set-cookie": "synthetic-drive-pcs=synthetic-pcs; Domain=icloud.com; Secure; Path=/" } });
     };
     const local = await f.service.status();
@@ -121,11 +125,21 @@ test("Drive approval uses the common cookie jar and lease while Reminders is pen
     assert.equal(local.services.drive.ready, false);
     await f.service.loadDriveState(f.generation);
     assert.equal(requests.length, 0);
+    const requested = await f.service.approveDrive(f.generation);
+    assert.equal(requested.services.drive.state, "DEVICE_APPROVAL_PENDING");
+    assert.equal(requested.services.drive.action, "approve-device-consent");
+    await assert.rejects(f.service.approveDrive(f.generation), code("RATE_LIMITED"));
+    assert.equal(requests.length, 2, "Checks before Apple's retry time send no request.");
+    now += 5001; consented = true;
+    const waiting = await f.service.approveDrive(f.generation);
+    assert.equal(waiting.services.drive.action, "wait-for-drive-keys");
+    now += 5001;
     const approved = await f.service.approveDrive(f.generation);
     assert.equal(approved.state, "DEVICE_APPROVAL_PENDING");
     assert.equal(approved.services.drive.ready, true);
     assert.equal(approved.services.reminders.ready, false);
-    assert.equal(requests.length, 2);
+    assert.equal(requests.length, 6);
+    assert.equal(requests.filter(request => request.path.endsWith("enableDeviceConsentForPCS")).length, 1, "Checking the current attempt never sends another device prompt.");
     const saved = await f.repository.load();
     assert.deepEqual(saved.session.services?.reminders, original.services.reminders);
     assert.deepEqual(saved.session.login, original.login);
@@ -138,12 +152,12 @@ test("Drive approval uses the common cookie jar and lease while Reminders is pen
     await f.repository.releaseResume(lease);
     await f.service.approveDrive(f.generation);
     await f.service.status();
-    assert.equal(requests.length, 2, "READY and status calls never request keys again.");
+    assert.equal(requests.length, 6, "READY and status calls never request keys again.");
     await f.service.approveDrive(f.generation, true);
-    assert.equal(requests.length, 4, "Explicit restart requests fresh Drive PCS even when the saved state is READY.");
+    assert.equal(requests.length, 8, "Explicit restart requests fresh Drive PCS even when the saved state is READY.");
     assert.deepEqual((await f.repository.load()).session.services?.reminders, original.services.reminders);
     assert.deepEqual((await f.repository.load()).session.login, original.login);
-  } finally { globalThis.fetch = nativeFetch; f.db.sqlite.close(); }
+  } finally { globalThis.fetch = nativeFetch; Date.now = nativeNow; f.db.sqlite.close(); }
 });
 
 test("enabling Reminders after Drive-only selection explicitly approves it from common READY without altering Drive errors", async () => {

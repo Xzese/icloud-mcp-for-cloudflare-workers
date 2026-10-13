@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { DEFAULT_SERVICE_SETTINGS, ServiceSettingsSchema, type ServiceSettings } from "@/services/settings";
 
@@ -11,14 +11,18 @@ interface ConnectionReadiness {
   accountConnected: boolean;
   services: { reminders: Readiness; drive: Readiness };
 }
+type Service = "drive" | "reminders";
+class SettingsError extends Error {
+  constructor(message: string, readonly code?: string) { super(message); }
+}
 
 async function request<T>(path: string, body?: unknown): Promise<T> {
   const response = await fetch(path, {
-    cache: "no-store",
+    cache: "no-store", signal: AbortSignal.timeout(45_000),
     ...(body === undefined ? {} : { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) }),
   });
-  const result = await response.json() as T & { error?: { message?: string } };
-  if (!response.ok) throw new Error(result.error?.message ?? "Settings could not be loaded. Try again.");
+  const result = await response.json() as T & { error?: { message?: string; code?: string } };
+  if (!response.ok) throw new SettingsError(result.error?.message ?? "Settings could not be loaded. Try again.", result.error?.code);
   return result;
 }
 
@@ -39,6 +43,31 @@ export default function ServiceSettingsPanel() {
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
+  const [checking, setChecking] = useState<Service | null>(null);
+  const [now, setNow] = useState(() => Date.now());
+  const [paused, setPaused] = useState<Partial<Record<Service, boolean>>>({});
+  const readinessRef = useRef<ConnectionReadiness | null>(null);
+  const requestRevision = useRef(0);
+  const actionActive = useRef(false);
+  const mounted = useRef(false);
+  const attempts = useRef({ generation: -1, drive: { count: 0, failures: 0, next: 0 }, reminders: { count: 0, failures: 0, next: 0 } });
+  const acceptReadiness = useCallback((next: ConnectionReadiness | null, announce = false) => {
+    if (!mounted.current) return;
+    const changed = JSON.stringify(readinessRef.current) !== JSON.stringify(next);
+    readinessRef.current = next; setReadiness(next); setNow(Date.now());
+    if (next && attempts.current.generation !== next.generation) {
+      attempts.current = { generation: next.generation, drive: { count: 0, failures: 0, next: 0 }, reminders: { count: 0, failures: 0, next: 0 } };
+      setPaused({});
+    }
+    if (announce && changed) window.dispatchEvent(new Event("icloud-services-changed"));
+  }, []);
+  const refreshReadiness = useCallback(async (announce = false) => {
+    const revision = ++requestRevision.current;
+    const next = await request<ConnectionReadiness>("/api/connection");
+    if (revision !== requestRevision.current) return null;
+    acceptReadiness(next, announce);
+    return next;
+  }, [acceptReadiness]);
 
   const refresh = useCallback(async () => {
     setLoading(true); setError("");
@@ -48,53 +77,102 @@ export default function ServiceSettingsPanel() {
         request<ConnectionReadiness>("/api/connection").catch(() => null),
       ]);
       const parsed = ServiceSettingsSchema.parse(saved.settings);
-      setSnapshot(saved); setDraft(parsed); setReadiness(connection); setNotice("");
+      setSnapshot(saved); setDraft(parsed); acceptReadiness(connection, true); setNotice("");
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "Settings could not be loaded. Try again.");
     } finally { setLoading(false); }
-  }, []);
+  }, [acceptReadiness]);
 
   useEffect(() => {
+    mounted.current = true;
+    const revisionRef = requestRevision;
     const timer = window.setTimeout(() => void refresh(), 0);
-    return () => window.clearTimeout(timer);
+    return () => { mounted.current = false; revisionRef.current++; window.clearTimeout(timer); };
   }, [refresh]);
   useEffect(() => {
-    let active = true;
-    const updateReadiness = () => void request<ConnectionReadiness>("/api/connection")
-      .then(value => { if (active) setReadiness(value); })
-      .catch(() => { if (active) setReadiness(null); });
+    const updateReadiness = () => { if (!actionActive.current) void refreshReadiness().catch(() => {}); };
     window.addEventListener("icloud-services-changed", updateReadiness);
-    return () => { active = false; window.removeEventListener("icloud-services-changed", updateReadiness); };
-  }, []);
+    return () => window.removeEventListener("icloud-services-changed", updateReadiness);
+  }, [refreshReadiness]);
 
   function change(next: ServiceSettings) {
     setDraft(ServiceSettingsSchema.parse(next)); setNotice("");
   }
 
   async function save() {
-    if (!snapshot?.available || saving) return;
+    if (!snapshot?.available || actionActive.current) return;
     const parsed = ServiceSettingsSchema.safeParse(draft);
     if (!parsed.success) { setError("Drive browsing must be enabled before enabling contents, upload, or organize access."); return; }
+    actionActive.current = true; requestRevision.current++;
     setSaving(true); setError(""); setNotice("");
     try {
       const saved = await request<Snapshot>("/api/settings", { expectedRevision: snapshot.revision, settings: parsed.data });
       setSnapshot(saved); setDraft(saved.settings); setNotice("Service preferences saved.");
-      setReadiness(await request<ConnectionReadiness>("/api/connection"));
+      await refreshReadiness();
       window.dispatchEvent(new Event("icloud-services-changed"));
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "Preferences could not be saved. Reload and try again.");
-    } finally { setSaving(false); }
+    } finally { actionActive.current = false; if (mounted.current) setSaving(false); }
   }
 
-  async function approve(service: "drive" | "reminders", restartApproval = false) {
-    if (!readiness) return;
-    setSaving(true); setError("");
+  const approve = useCallback(async (service: Service, restartApproval = false) => {
+    const current = readinessRef.current;
+    if (!current || actionActive.current) return;
+    actionActive.current = true; requestRevision.current++;
+    const budget = attempts.current[service];
+    if (restartApproval) { budget.count = 0; budget.failures = 0; }
+    budget.count++; budget.next = Date.now() + 15_000;
+    setPaused(previous => ({ ...previous, [service]: false }));
+    setSaving(true); setChecking(service); setError("");
     try {
-      setReadiness(await request<ConnectionReadiness>(`/api/${service}/approve`, { expectedGeneration: readiness.generation, restartApproval }));
+      const next = await request<ConnectionReadiness>(`/api/${service}/approve`, { expectedGeneration: current.generation, restartApproval });
+      acceptReadiness(next); budget.failures = 0;
       window.dispatchEvent(new Event("icloud-services-changed"));
-    } catch (cause) { setError(cause instanceof Error ? cause.message : "Apple approval could not be checked."); }
-    finally { setSaving(false); }
-  }
+    } catch (cause) {
+      // An error response may follow a durable approval result. Reconcile it
+      // before deciding whether to continue, without resetting Apple's attempt.
+      const reconciled = await refreshReadiness(true).catch(() => null);
+      if (reconciled?.services[service].ready) { budget.failures = 0; return; }
+      budget.failures++; budget.next = Date.now() + Math.min(60_000, 15_000 * 2 ** budget.failures);
+      const transient = !(cause instanceof SettingsError) || ["CONFLICT", "RATE_LIMITED", "UPSTREAM_UNAVAILABLE"].includes(cause.code ?? "");
+      if (mounted.current) {
+        setPaused(previous => ({ ...previous, [service]: !transient || budget.failures >= 3 }));
+        setError(cause instanceof Error ? cause.message : "Apple approval could not be checked.");
+      }
+    } finally {
+      actionActive.current = false;
+      if (mounted.current) { setSaving(false); setChecking(null); if (budget.count >= 8) setPaused(previous => ({ ...previous, [service]: true })); }
+    }
+  }, [acceptReadiness, refreshReadiness]);
+
+  useEffect(() => {
+    let stopped = false, polling = false;
+    let timer: ReturnType<typeof setTimeout>;
+    const poll = async () => {
+      if (stopped || polling) return;
+      polling = true;
+      try {
+        if (document.visibilityState !== "hidden" && !actionActive.current) {
+          const next = await refreshReadiness(true);
+          if (stopped || !next?.accountConnected || actionActive.current) return;
+          const service = (["reminders", "drive"] as const).find(name => {
+            const access = next.services[name], budget = attempts.current[name];
+            return access.enabled && access.state === "DEVICE_APPROVAL_PENDING" && !paused[name] && budget.count < 8 && Date.now() >= Math.max(access.nextAttemptAt, budget.next);
+          });
+          if (service) await approve(service);
+        }
+      } catch { /* A later visible poll can retry status; never infer consent. */ }
+      finally {
+        polling = false;
+        const pending = Object.values(readinessRef.current?.services ?? {}).some(service => service.state === "DEVICE_APPROVAL_PENDING");
+        if (!stopped) timer = setTimeout(() => void poll(), pending ? 5000 : 30_000);
+      }
+    };
+    const visible = () => { if (document.visibilityState !== "hidden") { clearTimeout(timer); void poll(); } };
+    timer = setTimeout(() => void poll(), 5000);
+    document.addEventListener("visibilitychange", visible);
+    return () => { stopped = true; clearTimeout(timer); document.removeEventListener("visibilitychange", visible); };
+  }, [approve, paused, refreshReadiness]);
   const remindersReadReady = readiness?.services.reminders.read === true;
   const remindersWriteReady = readiness?.services.reminders.write === true;
   const driveReady = readiness?.services.drive.ready === true;
@@ -102,11 +180,11 @@ export default function ServiceSettingsPanel() {
     const current = readiness?.services[service];
     if (!current?.enabled || current.ready) return null;
     return <div className="action-row">
-      <Button variant="outline" disabled={saving || !readiness?.accountConnected} onClick={() => void approve(service)}>
-        {current.state === "DEVICE_APPROVAL_PENDING" ? "Check Apple approval" : `Approve ${service === "drive" ? "Drive" : "Reminders"} access`}
+      <Button variant="outline" disabled={saving || !readiness?.accountConnected || now < current.nextAttemptAt} onClick={() => void approve(service)}>
+        {checking === service ? "Checking approval…" : current.state === "DEVICE_APPROVAL_PENDING" ? "Check Apple approval" : `Approve ${service === "drive" ? "Drive" : "Reminders"} access`}
       </Button>
-      {["ERROR", "DEVICE_APPROVAL_PENDING"].includes(current.state) && <Button variant="ghost" disabled={saving || !readiness?.accountConnected} onClick={() => void approve(service, true)}>Start new approval</Button>}
-      <span className="fine-print">{current.state.replaceAll("_", " ").toLowerCase()}. Approval is checked only when you request it.</span>
+      {["ERROR", "DEVICE_APPROVAL_PENDING"].includes(current.state) && <Button variant="ghost" disabled={saving || !readiness?.accountConnected || now < current.nextAttemptAt} onClick={() => void approve(service, true)}>Start new approval</Button>}
+      <span className="fine-print" role="status">{current.state.replaceAll("_", " ").toLowerCase()}. {current.state === "DEVICE_APPROVAL_PENDING" ? paused[service] ? "Automatic checks are paused. Check manually or start a new approval attempt." : "Approval is checked automatically while this page is visible. Approve the prompt on your trusted device." : "Request approval to begin checking Apple access."}</span>
     </div>;
   };
   const changed = !!snapshot && JSON.stringify(snapshot.settings) !== JSON.stringify(draft);
@@ -149,7 +227,7 @@ export default function ServiceSettingsPanel() {
     </fieldset>
 
     <div className="action-row">
-      <Button className="action-primary" disabled={disabled || !changed} onClick={() => void save()}>{saving ? "Saving preferences…" : "Save service preferences"}</Button>
+      <Button className="action-primary" disabled={disabled || !changed} onClick={() => void save()}>{saving && !checking ? "Saving preferences…" : "Save service preferences"}</Button>
       <Button variant="outline" disabled={loading || saving} onClick={() => void refresh()}>Reload preferences</Button>
     </div>
   </section>;
