@@ -92,12 +92,13 @@ export async function applicationRoute(request: Request, env: RuntimeEnv, creden
         return json(await new DriveService(env, owner)[method](input));
       }
       const jobRoute = /^\/api\/reminder-jobs(?:\/([a-f0-9-]{36})\/(append|preview|start|cancel|resume|continue))?$/i.exec(path);
-      if (jobRoute || path === "/api/reminder-updates/prepare" || path === "/api/reminder-evidence/capture" || path === "/api/reminder-evidence/atomic-protection") {
+      if (jobRoute || path === "/api/reminders/inspect" || path === "/api/reminder-updates/prepare" || path === "/api/reminder-evidence/capture" || path === "/api/reminder-evidence/atomic-protection") {
         const bytes = await limitedBytes(new Response(request.body, { headers: request.headers }), 65_536);
         let value: unknown;
         try { value = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes)); }
         catch { throw new AppError("VALIDATION_ERROR", "Provide a valid reminder-job or update-preparation request.", 400); }
         if (!value || typeof value !== "object" || Array.isArray(value)) throw new AppError("VALIDATION_ERROR", "A JSON object is required.", 400);
+        if (path === "/api/reminders/inspect") return json(await new AppleConnectionService(env, owner).inspectReminder(value));
         if (path === "/api/reminder-evidence/capture") return json(await new AppleConnectionService(env, owner).captureEvidence(value));
         if (path === "/api/reminder-evidence/atomic-protection") return json(await new AppleConnectionService(env, owner).verifyAtomicEvidence(value));
         if (path === "/api/reminder-updates/prepare") return json(await new AppleConnectionService(env, owner).prepareUpdate(value));

@@ -1,5 +1,5 @@
 // Binary application messages inside a WebSocket, not raw TLS/WebSocket frames.
-import { bytesField, fields, getBytes, uint } from "../crypto/protobuf.ts";
+import { bytesField, fields, uint } from "../crypto/protobuf.ts";
 import { concat, utf8 } from "../crypto/bytes.ts";
 import { requireValue } from "../errors.ts";
 export function validatedPushURL(value: string) {

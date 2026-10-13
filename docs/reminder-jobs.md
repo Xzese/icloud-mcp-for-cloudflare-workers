@@ -24,6 +24,19 @@ rescan fails) on the succeeded item. A lost acknowledgement stays `unknown`; rea
 reconciliation reports whether the target is deleted, never replays and never claims who deleted it.
 Linked creation remains unsupported separately.
 
+**Bulk updates and completion:** after migration `0004_bulk_change_jobs.sql`, jobs also accept
+`bulk_update` and `bulk_complete`. Both require exact list/reminder/version inputs and an
+ordinary childless root. Updates accept nonempty title, notes, priority, flagged, dueDate,
+timeZone and allDay changes. Recurrence, alarms, early alerts, start dates, subtasks and parents
+are refused. Date transitions that change linked scheduling fields, including all-day
+conversions, are refused; use an individual prepared update for those transitions. Existing URL/tag relationships are preserved.
+
+Preview and dispatch share the same update planner. Dispatch rechecks childlessness and
+guards the exact List version; completion cannot cascade to a newly discovered family.
+After an uncertain response, recovery compares the encrypted planned write, including
+implicit time-zone/all-day changes. Matching state sets `desiredStateObserved` but never
+turns an uncertain request into a confirmed operation or authorizes replay.
+
 ## Public flow
 
 | MCP tool | Authenticated API |
@@ -45,8 +58,10 @@ Create a draft with `kind`, UUID `idempotencyKey` and required `expectedGenerati
 The normalized job UUID is the job key, so a lost acceptance response has a known recovery ID.
 Append ordered items using a separate UUID `chunkKey` and current `expectedRevision`.
 An item contains `kind`, a unique `clientItemKey`, and strict `input`:
-current creation fields plus its own retained UUID, or exact deletion list/ID/version.
-Defaults and creation UUID/date representations are canonicalized before hashing.
+current creation fields plus its own retained UUID, exact deletion/completion list/ID/version,
+or exact update list/ID/version plus nonempty `changes`. Defaults and creation UUID/date
+representations are canonicalized before hashing. Updates normalize only a supplied non-null
+dueDate; omitted fields and explicit nulls remain distinct.
 Same job/chunk replay returns its existing ledger; changed reuse conflicts. Mutation keys are
 reserved account-wide, including across jobs and session generations. Cross-job key reuse
 must be reviewed through the original known job, never dispatched through another manifest.
@@ -110,7 +125,10 @@ generation reauthorization is not implemented. Status/cancel remain available wi
 
 ## Storage, migration and rollback
 
-`migrations/0001_reminder_jobs.sql` is additive. Fresh installs use the matching `schema.sql`.
+`migrations/0001_reminder_jobs.sql` is the immutable additive job initializer.
+`migrations/0004_bulk_change_jobs.sql` expands the allowed job kinds, rebuilding the jobs
+table and its dependent tables in one migration transaction while retaining encrypted rows,
+leases, chunk receipts and replay reservations. Fresh installs use the current `schema.sql`.
 The tables are jobs, items, chunk receipts, account-scoped replay reservations, account
 leases/cooldowns. The immutable original migration also retains a historical outbox table;
 current execution does not read or write it. Owner-scoped reads always use the authenticated
@@ -118,18 +136,30 @@ deployment owner before database access. Item content, target IDs, generated mut
 detailed results use the existing AES-GCM primitives with a separate job/item/field AAD context.
 The Apple session envelope schema and rows are unchanged.
 
-Apply the additive migration to an existing standalone database, using private operator config:
+Apply missing migrations in order to an existing standalone database, using private operator config.
+Databases with the job tables already installed need `0004` for bulk changes.
+Independent connector filters/create workflows/list duplication additionally need migrations
+`0005`, `0006` and `0007`; service settings (`0002`) and Drive operations (`0003`)
+also belong to the shared migration history. Apply pending migrations in order:
 
 ```bash
 npx wrangler d1 execute icloud-reminders --remote --config wrangler.production.toml --file migrations/0001_reminder_jobs.sql
+npx wrangler d1 execute icloud-reminders --remote --config wrangler.production.toml --file migrations/0002_service_settings.sql
+npx wrangler d1 execute icloud-reminders --remote --config wrangler.production.toml --file migrations/0003_drive_operations.sql
+npx wrangler d1 execute icloud-reminders --remote --config wrangler.production.toml --file migrations/0004_bulk_change_jobs.sql
+npx wrangler d1 execute icloud-reminders --remote --config wrangler.production.toml --file migrations/0005_connector_filters.sql
+npx wrangler d1 execute icloud-reminders --remote --config wrangler.production.toml --file migrations/0006_create_workflows.sql
+npx wrangler d1 execute icloud-reminders --remote --config wrangler.production.toml --file migrations/0007_list_duplication.sql
 ```
 
-For Sites, the build packages the unchanged original `migrations/0000_schema.sql` and
-additive `migrations/0001_reminder_jobs.sql` under `dist/.openai/drizzle`. Later schema changes
-append new migration files; changing an already-applied initializer does not install new
+For Sites, the build packages the complete immutable migration history (`0000`–`0007`)
+under `dist/.openai/drizzle`. Later schema changes append new migration files;
+changing an already-applied initializer does not install new
 tables. Preserve the exact ignored Site binding, use the native source workflow, regenerate
 with `npm run sites:prepare`, and verify application of the pending additive migration to its
-existing D1 before using bulk creation. Never reset D1, overwrite an Apple session,
+existing D1 before using the new kinds. `connection_status` advertises `bulkUpdate` and
+`bulkComplete` only when the expanded schema is present and the session is ready.
+Never reset D1, overwrite an Apple session,
 replace the Site or publish generated private source history.
 
 Resolved encrypted item content/results/mutations are eligible for deletion after seven days,
@@ -143,12 +173,14 @@ For local acceptance with a login already stored in another checkout, the local 
 can use that existing ignored state without copying credentials or replacing its owner/key:
 
 ```bash
-LOCAL_ICLOUD_STATE_DIR=/absolute/checkout/.sites-runtime/local-icloud npm run dev:icloud
+LOCAL_ICLOUD_STATE_DIR=/absolute/checkout/.sites-runtime/local-icloud LOCAL_ICLOUD_PORT=5174 npm run dev:icloud
 ```
 
 The explicit directory must already contain `keys.json`. Stop any other server using the
-same state before launching; build the current checkout first and retain the original
-session generation and fixed expiry. Only separately authorized synthetic test-list
+same state before launching. Verify session-envelope compatibility before selecting another
+checkout's state; an unsupported authenticated schema must fail without invalidating it.
+Prefer isolated test state with its own normal sign-in. Build the current checkout first
+and retain the original session generation and fixed expiry. Only separately authorized synthetic test-list
 reminders may be mutated.
 
 To stop new dispatches, cancel undispatched authorized jobs and stop continuation calls. Preserve all tables, receipts, encryption keys and Apple session state, and keep

@@ -40,7 +40,7 @@ export function nextRecurringDue(due: string, zone: string | null, allDay: boole
   const utc = (year: number, month: number, day: number, hour = 0, minute = 0, second = 0) => {
     const result = new Date(0); result.setUTCFullYear(year, month, day); result.setUTCHours(hour, minute, second, 0); return result;
   };
-  if (kind !== "weekly") {
+  if (kind === "last-day-monthly" || kind === "daily" && allDay) {
     const old = new Date(due);
     if (!allDay || zone !== null || old.getUTCHours() || old.getUTCMinutes() || old.getUTCSeconds() || old.getUTCMilliseconds() ||
       kind === "last-day-monthly" && old.getUTCDate() !== utc(old.getUTCFullYear(), old.getUTCMonth() + 1, 0).getUTCDate()) throw new AppError("UNSUPPORTED_FEATURE", "This completion requires an all-day calendar anchor without a time zone.");
@@ -48,8 +48,9 @@ export function nextRecurringDue(due: string, zone: string | null, allDay: boole
     if (next.getUTCFullYear() < 1 || next.getUTCFullYear() > 9999) throw new AppError("UNSUPPORTED_FEATURE", "The next occurrence is outside the calendar range.");
     return next.toISOString();
   }
-  if (allDay || !zone) throw new AppError("UNSUPPORTED_FEATURE", "Weekly completion requires a timed IANA-zone occurrence.");
-  const old = dateComponents(due, zone), local = utc(old.year, old.month - 1, old.day + 7, old.hour, old.minute, old.second);
+  if (allDay || !zone || kind === "daily" && !RecurrenceCalendarTimeZone.safeParse(zone).success)
+    throw new AppError("UNSUPPORTED_FEATURE", "Timed completion requires a stored IANA-zone occurrence.");
+  const old = dateComponents(due, zone), local = utc(old.year, old.month - 1, old.day + (kind === "daily" ? 1 : 7), old.hour, old.minute, old.second);
   const formatter = new Intl.DateTimeFormat("en-US-u-ca-gregory-nu-latn", { timeZone: zone, year: "numeric", month: "numeric", day: "numeric", hour: "numeric", minute: "numeric", second: "numeric", hourCycle: "h23" });
   const wall = (instant: number) => {
     const parts = formatter.formatToParts(new Date(instant)), get = (key: string) => Number(parts.find(part => part.type === key)?.value);
@@ -148,9 +149,17 @@ export async function verifyRecurringExpected(expected: RecurringIntent["expecte
     const record = records.find(record => record.recordName === entry.id);
     try {
       if (!record || !("recordType" in record) || record.recordType !== entry.type || !record.recordChangeTag || record.deleted ||
-        await recurringRecordHash(record, owner, intrinsicParentGuards) !== entry.hash) throw new WriteOutcomeUnknownError(entry.id);
+        await recurringRecordHash(record, owner, intrinsicParentGuards) !== entry.hash ||
+        entry.presentationHash !== undefined && await recurringPresentationHash(record) !== entry.presentationHash) throw new WriteOutcomeUnknownError(entry.id);
     } catch { throw new WriteOutcomeUnknownError(entry.id); }
   }
+}
+
+function recurringPresentationHash(record: CloudKitRecord) {
+  // Include complete wrappers and metadata, and distinguish absence from any
+  // replacement. Only proven signed download URLs may drift on read-back.
+  return fingerprint(stableNativePresentation(Object.fromEntries(Object.entries(record.fields)
+    .filter(([key]) => ["UrgentPresentationAlarmsAsData", "UrgentPresentationAlarmsChecksum"].includes(key)))));
 }
 
 export async function planRecurringCompletion(graph: SchedulingGraph, list: CloudKitRecord, owner: string,
@@ -177,7 +186,13 @@ export async function planRecurringCompletion(graph: SchedulingGraph, list: Clou
     throw new AppError("UNSUPPORTED_FEATURE", "Recurring completion requires one exact ordinary root and its owned recurrence without subtasks, assignments, tags, attachments or early reminders.");
   }
   const { kind, endDate } = readCompletionRecurrence(rules[0]), alarmed = (reminder.alarmIds?.length ?? 0) !== 0;
-  if (alarmed && (kind !== "weekly" || reminder.alarmIds?.length !== 1) || graph.records.length !== (alarmed ? 4 : 2)) throw new AppError("UNSUPPORTED_FEATURE", "This recurring alarm graph needs another completion recipe.");
+  const timedDaily = kind === "daily" && reminder.allDay !== true;
+  if (timedDaily) {
+    if (endDate !== null || reminder.allDay !== false || !RecurrenceCalendarTimeZone.safeParse(reminder.timeZone).success || !alarmed)
+      throw new AppError("UNSUPPORTED_FEATURE", "Timed daily completion requires a non-ended interval-one root with a stored IANA zone and one absolute date pair.");
+    inspectRootAbsoluteDatePair(graph, owner);
+  }
+  if (alarmed && (kind !== "weekly" && !timedDaily || reminder.alarmIds?.length !== 1) || graph.records.length !== (alarmed ? 4 : 2)) throw new AppError("UNSUPPORTED_FEATURE", "This recurring alarm graph needs another completion recipe.");
   const due = Date.parse(reminder.dueDate);
   if (recurrenceCalendarTimeZone !== undefined && (kind !== "daily" || endDate === null || reminder.allDay !== true || reminder.timeZone !== null || alarmed))
     throw new AppError("UNSUPPORTED_FEATURE", "recurrenceCalendarTimeZone applies only to an ended all-day interval-one daily root without alarms.");
@@ -273,10 +288,10 @@ export async function planRecurringCompletion(graph: SchedulingGraph, list: Clou
     };
     pair(active, next, ids.activeAlarm, ids.activeTrigger); pair(history, reminder.dueDate, ids.historyAlarm, ids.historyTrigger);
   }
-  return finishRecurringPlan({ graph, list, ids, timestamp, mode, ...calendar, active, history, membership, operations, guards: [rules[0]], retired }, owner);
+  return finishRecurringPlan({ graph, list, ids, timestamp, mode, ...calendar, active, history, membership, operations, guards: [rules[0]], retired }, owner, timedDaily);
 }
 
-async function finishRecurringPlan(plan: Omit<RecurringCompletionPlan, "sourceFingerprint" | "expected">, owner: string): Promise<RecurringCompletionPlan> {
+async function finishRecurringPlan(plan: Omit<RecurringCompletionPlan, "sourceFingerprint" | "expected">, owner: string, preserveSourcePresentation = false): Promise<RecurringCompletionPlan> {
   const { graph, list, operations, guards } = plan;
   const expected: RecurringIntent["expected"] = [];
   for (const operation of operations.filter(operation => operation.operationType !== "delete")) {
@@ -284,7 +299,8 @@ async function finishRecurringPlan(plan: Omit<RecurringCompletionPlan, "sourceFi
     const record: CloudKitRecord = { ...operation.record,
       raw: { ...before?.raw, ...(operation.record.parent === undefined ? {} : { parent: operation.record.parent }) },
       fields: { ...before?.fields, ...operation.record.fields } };
-    expected.push({ id: record.recordName, type: record.recordType as RecurringIntent["expected"][number]["type"], hash: await recurringRecordHash(record, owner, plan.intrinsicParentGuards) });
+    expected.push({ id: record.recordName, type: record.recordType as RecurringIntent["expected"][number]["type"], hash: await recurringRecordHash(record, owner, plan.intrinsicParentGuards),
+      ...(preserveSourcePresentation && before?.recordType === "Reminder" && operation.operationType === "update" ? { presentationHash: await recurringPresentationHash(before) } : {}) });
   }
   for (const guard of guards) expected.push({ id: guard.recordName, type: guard.recordType as RecurringIntent["expected"][number]["type"], hash: await recurringRecordHash(guard, owner, plan.intrinsicParentGuards) });
   const guardedOperations = guards.map(guard => ({ operationType: "update", record: { recordName: guard.recordName, recordType: guard.recordType,

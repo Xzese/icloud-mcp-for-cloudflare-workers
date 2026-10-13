@@ -188,6 +188,10 @@ Use your deployment's actual private configuration; use `--local` for local deve
 Sites operators use their platform's database/source deployment flow with the updated schema.
 These migrations add tables and do not reset the existing Apple session or Reminders jobs.
 Migration 0001 for Reminders jobs remains required when upgrading a database without it.
+The integrated Reminders collection and workflow features additionally require pending
+migrations `0004_bulk_change_jobs.sql`, `0005_connector_filters.sql`,
+`0006_create_workflows.sql` and `0007_list_duplication.sql`; apply them in order using the
+[Reminders upgrade guide](reminder-jobs.md#storage-migration-and-rollback).
 
 If the settings table is absent, old Reminders defaults remain and Drive stays disabled;
 saving preferences fails with an explicit migration message. Malformed stored settings fail

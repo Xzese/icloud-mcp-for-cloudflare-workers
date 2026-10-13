@@ -9,7 +9,7 @@ export function stableNativePresentation(fields: Record<string, unknown>): Recor
     if (!field || typeof field !== "object" || Array.isArray(field) || !("type" in field) || field.type !== "ASSETID" || !("value" in field)) continue;
     const value = field.value;
     if (!value || typeof value !== "object" || Array.isArray(value) || !("downloadURL" in value) || typeof value.downloadURL !== "string") continue;
-    const { downloadURL: _url, ...metadata } = value;
+    const metadata = Object.fromEntries(Object.entries(value).filter(([key]) => key !== "downloadURL"));
     stable = { ...stable, [name]: { ...field, value: metadata } };
   }
   return stable;

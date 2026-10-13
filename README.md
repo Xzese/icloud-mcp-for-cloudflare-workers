@@ -147,6 +147,7 @@ native behaviour from connector safeguards and links the supporting live evidenc
 | `get_reminders` | Authorize an exact `listId` live, then fetch one current page without catalogue synchronization; open reminders by default. |
 | `get_all_open_reminders` | Discover selectable lists once per operation, then fetch open reminders with resumable per-list pages. |
 | `get_reminder` | Read one exact ID, including completed or soft-deleted state, for current version tags and recovery. |
+| `inspect_reminder` | Read normalized schedule, URL/tags, Shopping membership and subtask details, plus current action eligibility and missing inputs without modifying Apple. |
 | `search_reminders` | Search one or all selectable private lists by title/notes text, status, flag, priority, due range, literal tags and the separate native URL with bounded continuations. |
 | `get_reminder_list` | Read one exact private list and its current version, including soft-deleted state for reconciliation. |
 | `create_reminder_list`, `rename_reminder_list`, `delete_reminder_list` | Create or rename standard private lists, or soft-delete a fully verified empty list. |
@@ -222,6 +223,25 @@ installed; no feature flag is required. Timed absolute-alarm date updates, inclu
 occurrence of a recurring reminder, are also permanent ready-account capabilities.
 Bulk deletion of simple reminders is permanent too: each item gets the single-delete exact-version and
 subtask checks, and a subtask attached natively during commit is reported, not cascaded.
+`create_reminder_workflow` adds durable partial-outcome handling for ordinary creation,
+one supported prepared scheduling feature, URL and tags. `duplicate_reminder_list` makes
+a bounded plain-content copy of up to 20 eligible open roots. Neither replays a started or
+uncertain Apple write. Existing databases need migrations `0006` and `0007` respectively.
+See [create workflows](docs/create-workflows.md) and [list duplication](docs/list-duplication.md).
+
+Connector conveniences also provide explicit-timezone overdue/today/upcoming/untagged views,
+complete-result sorting and bounded JSON/CSV export. Saved filter definitions are encrypted,
+owner-scoped connector preferences and require migration `0005_connector_filters.sql`.
+They do not create native synced Smart Lists or templates. See
+[the collection contracts](docs/connector-collections.md).
+
+After migration `0004_bulk_change_jobs.sql`, jobs also support simple bulk updates and completion.
+They require exact versions and childless roots without linked schedules; updates preserve omitted
+fields and completion never expands to a family cascade. `inspect_reminder` explains current
+per-reminder action eligibility and missing inputs before constructing a mutation.
+`get_reminder_list_sections` reads materialised Standard-list sections, including empty
+sections, memberships and explicit native ordering. Its version-bound pagination remains
+read-only; absent ordering is reported without inventing the app's default order.
 Only `continue_reminder_job` advances a job; status and start requests do not execute Apple
 writes. No Cloudflare Queue or cron runner is used. See
 [the linked-date recipe and live evidence](docs/linked-record-protocol.md#permanent-in-place-absolute-date-updates)
@@ -250,9 +270,11 @@ detaches the selected reminder from its List and parent; parent deletion soft-de
 children while preserving their native links and completion state. Exact reads of a detached
 deleted reminder return `listId: null`. No hard-delete or restore tool is exposed.
 Root-only recurring completion supports interval-one timed weekly recurrence, optionally with
-one absolute date alarm, all-day daily recurrence and the observed last-day monthly pattern.
+one absolute date alarm, non-ended timed daily recurrence with exactly one absolute-date
+pair in a stored IANA zone, all-day daily recurrence and the observed last-day monthly pattern.
 The active ID remains open at its next calendar due date; `completedOccurrence` returns fresh
-completed history at the old date. Weekly alarm pairs are replaced separately for the active
+completed history at the old date. Supported weekly and timed daily alarm pairs are replaced
+separately for the active
 record and history. Retain the original ID/tag arguments: durable occurrence intents reconcile
 uncertain acknowledgements by exact reads without creating another history. An all-day daily
 interval-one root with an inclusive end calendar date, or a timed interval-one weekly root
@@ -393,9 +415,10 @@ configuration with Wrangler as a substitute for Sites publication.
    including the complete build output. The helper can reuse the main checkout's installed
    dependencies; otherwise install them in the generated checkout. Edit application code in
    the main checkout, and reconcile any unsaved Site-source changes before preparing another copy.
-   The build packages `schema.sql` in Sites'
-   expected SQL initialization layout; Sites provisions the logical D1 binding and applies it.
-   Fresh-install `schema.sql` and the additive SQL migration need no Drizzle installation or migration generation.
+   The build packages the immutable `migrations/0000`–`0007` SQL history in Sites'
+   expected initialization layout; Sites provisions the logical D1 binding and applies pending
+   migrations. New standalone databases use `schema.sql`. Neither path needs Drizzle installation
+   or migration generation.
 3. Obtain the published HTTPS origin. In the Site's runtime settings, set `APP_ORIGIN` to that exact
    origin and `ENCRYPTION_KEY_ID` to `primary`. Generate the key ring locally:
 
@@ -688,9 +711,9 @@ Deployment preparation produces ignored `wrangler.generated.toml`. The minimal
 `dist/server/wrangler.json` internally; that generated file is not an editable source configuration.
 
 The source contains `apple_session_state` and the additive encrypted job ledger. The Worker uses
-native D1 prepared statements. The Sites build derives its platform SQL package from `schema.sql`.
-Fresh databases use that definition; existing databases apply `migrations/0001_reminder_jobs.sql`
-using the [documented upgrade path](docs/reminder-jobs.md), followed by the service settings and
+native D1 prepared statements. The Sites build packages the immutable `migrations/` history.
+Fresh databases use that definition; existing databases apply missing migrations in order, beginning with `migrations/0001_reminder_jobs.sql`
+using the [documented upgrade path](docs/reminder-jobs.md), including the service settings and
 Drive migrations in the [Drive guide](docs/icloud-drive.md#database-upgrade-and-rollback), without
 resetting session data.
 

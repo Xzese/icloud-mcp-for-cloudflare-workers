@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { AppError } from "../errors.ts";
+import { ListId } from "./identifiers.ts";
 
 export const SHOPPING_PROTOCOL_VERSION = 20230430 as const;
 export const SHOPPING_ASSET_MAX_BYTES = 16 * 1024;
@@ -226,8 +227,7 @@ export function encodeSectionOrdering(value: ShoppingSectionOrdering): Uint8Arra
 }
 
 const expectedGeneration = z.number().int().nonnegative().safe().describe("Current Apple session generation from connection_status; binds the request to that session.");
-const canonicalListId = z.string().min(6).max(255).regex(/^List\/[\x21-\x2e\x30-\x7e]+$/,
-  "Expected a canonical List/<ASCII suffix> ID.").describe("Exact ID of an existing owned private Shopping list, never its title.");
+const canonicalListId = ListId.describe("Exact ID of an existing owned private Shopping list, never its title.");
 const canonicalReminderId = z.string().min(10).max(255).regex(/^Reminder\/[\x21-\x2e\x30-\x7e]+$/,
   "Expected a canonical Reminder/<ASCII suffix> ID.").describe("Exact reminder ID returned by a current read of this Shopping list.");
 const canonicalListSectionId = z.string().regex(/^ListSection\/[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$/,

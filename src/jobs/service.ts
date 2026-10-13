@@ -8,7 +8,7 @@ import { ReminderJobRepository, type JobRow } from "../persistence/reminder-jobs
 import type { RuntimeEnv } from "../platform/sites.ts";
 import { buildCreateReminder } from "../reminders/writes.ts";
 import { checkPreparation, createPreparation, preparationContext } from "../reminders/preparation.ts";
-import { AppendJob, CreateJob, GetJob, JobIdentity, JobOutput, JobResult, JOB_LIMITS, PreviewJob, StartJob, type JobItemData } from "./schemas.ts";
+import { AppendJob, CreateJob, GetJob, JobIdentity, JobOutput, JobResult, JOB_LIMITS, PreviewJob, StartJob, type BulkChangeItemData, type JobItemData } from "./schemas.ts";
 import { ServiceSettingsRepository } from "../persistence/service-settings.ts";
 import { requireServicePermission, type ServicePermission } from "../services/settings.ts";
 import { requireServiceReady, requireRemindersConnection } from "../auth/apple/services.ts";
@@ -22,8 +22,13 @@ const parse = <Schema extends z.ZodTypeAny>(schema: Schema, value: unknown): z.o
   return result.data;
 };
 export function canonicalItem(value: JobItemData): JobItemData {
-  if (value.kind === "bulk_delete") return value;
-  return { ...value, input: { ...value.input, idempotencyKey: value.input.idempotencyKey.toLowerCase(), dueDate: value.input.dueDate === undefined || value.input.dueDate === null ? null : new Date(value.input.dueDate).toISOString(), timeZone: value.input.timeZone ?? null } };
+  if (value.kind === "bulk_create") return { ...value, input: { ...value.input, idempotencyKey: value.input.idempotencyKey.toLowerCase(), dueDate: value.input.dueDate === undefined || value.input.dueDate === null ? null : new Date(value.input.dueDate).toISOString(), timeZone: value.input.timeZone ?? null } };
+  if (value.kind === "bulk_update") {
+    const changes = { ...value.input.changes };
+    if (changes.dueDate !== undefined && changes.dueDate !== null) changes.dueDate = new Date(changes.dueDate).toISOString();
+    return { ...value, input: { ...value.input, changes } };
+  }
+  return value;
 }
 export class ReminderJobService {
   readonly repository: ReminderJobRepository;
@@ -69,12 +74,18 @@ export class ReminderJobService {
         "Request-driven execution pauses unless continue_reminder_job is called. Status reads never execute work.",
         "Preview tokens are not authorization. Obtain user approval for the exact sealed manifest.",
         "Cancellation is not rollback; already dispatched operations may still complete.",
-        ...(job.kind === "bulk_delete" ? [BULK_DELETE_NOTICE] : ["Creation execution order does not establish Apple's display order."]),
+        ...(job.kind === "bulk_delete" ? [BULK_DELETE_NOTICE] : job.kind === "bulk_create" ? ["Creation execution order does not establish Apple's display order."] : ["Bulk changes require exact current versions of simple childless reminders; linked schedules and family changes are refused."]),
       ],
     });
   }
   async create(value: unknown) {
     const input = parse(CreateJob, value), binding = await this.binding(undefined, input.expectedGeneration);
+    if (input.kind === "bulk_update" || input.kind === "bulk_complete") {
+      const definition = await this.repository.db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'reminder_jobs'").first<{ sql: string }>();
+      if (!definition || !["'bulk_update'", "'bulk_complete'"].every(kind => definition.sql.includes(kind))) {
+        throw new AppError("CONFIGURATION_REQUIRED", "Apply migrations/0004_bulk_change_jobs.sql before creating bulk update or completion jobs.", 503);
+      }
+    }
     await this.repository.expireUndispatched();
     await this.repository.purgeResolvedContent();
     const job = await this.repository.create(input.kind, input.idempotencyKey.toLowerCase(), binding.account, binding.generation, Math.min(binding.expiresAt, Date.now() + JOB_LIMITS.lifetimeMs));
@@ -112,11 +123,19 @@ export class ReminderJobService {
           const checks = await connection.preflightJobDeletes(job.generation, job.account_scope, deletes.map(item => item.input));
           deletes.forEach((item, position) => deleteChecks.set(item.index, checks[position]));
         }
+        const changes = values.flatMap((item, index): { index: number; input: BulkChangeItemData }[] =>
+          item.kind === "bulk_update" || item.kind === "bulk_complete" ? [{ index, input: item }] : []);
+        const changeChecks = new Map<number, AppError | null>();
+        if (changes.length) {
+          const checks = await connection.preflightJobChanges(job.generation, job.account_scope, changes.map(item => item.input));
+          changes.forEach((item, position) => changeChecks.set(item.index, checks[position]));
+        }
         const now = Date.now();
         for (let index = 0; index < rows.length; index++) {
           let invalid: AppError | null = null;
           const value = values[index];
           if (value.kind === "bulk_delete") invalid = deleteChecks.get(index) ?? null;
+          else if (value.kind === "bulk_update" || value.kind === "bulk_complete") invalid = changeChecks.get(index) ?? null;
           else {
             try { buildCreateReminder(value.input, now); }
             catch (error) {
@@ -127,7 +146,7 @@ export class ReminderJobService {
           if (invalid) {
             const safe = publicError(invalid, crypto.randomUUID());
             await this.repository.setItem(job, lease, rows[index], { status: "failed", code: safe.code, message: safe.message,
-              targetId: value.kind === "bulk_delete" ? value.input.reminderId : `Reminder/${value.input.idempotencyKey.toUpperCase()}`, operationConfirmed: false, desiredStateObserved: false }, "not_submitted");
+              targetId: value.kind === "bulk_create" ? `Reminder/${value.input.idempotencyKey.toUpperCase()}` : value.input.reminderId, operationConfirmed: false, desiredStateObserved: false }, "not_submitted");
           }
         }
         await this.repository.seal(job, lease, await fingerprint({ kind: job.kind, items: values }));

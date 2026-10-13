@@ -50,7 +50,8 @@ export async function runJobSlice(service: ReminderJobService, job: JobRow) {
       let submitted = false;
       let operationReturned = false;
       try {
-        const result = await new AppleConnectionService(service.env, service.owner).mutate({ action: value.kind === "bulk_create" ? "create" : "delete", expectedGeneration: job.generation, ...value.input }, {
+        const action = value.kind === "bulk_create" ? "create" : value.kind === "bulk_delete" ? "delete" : value.kind === "bulk_update" ? "update" : "complete";
+        const result = await new AppleConnectionService(service.env, service.owner).mutate({ action, expectedGeneration: job.generation, ...value.input }, {
           expectedAccount: job.account_scope,
           beforeDispatch: write => repo.dispatchIntent(job, lease, item, write),
           async assertDispatch() { await repo.assertLease(job, lease, true); submitted = true; },
@@ -101,6 +102,20 @@ async function reconcile(service: ReminderJobService, job: JobRow, lease: string
       await repo.setItem(job, lease, item, { ...base, desiredStateObserved: observed.deleted, code: "WRITE_OUTCOME_UNKNOWN",
         message: observed.deleted ? `The reminder is deleted, but this operation has no valid receipt and absence does not prove who deleted it. No replay will occur.${orphanNote(observed.remainingChildren)}` :
           "The reminder is still present; the prior dispatch remains unresolved. No replay will occur. Review it, then delete it individually if intended." }, "intent");
+    } catch (error) {
+      if (!(error instanceof AppError)) throw error;
+      const safe = publicError(error, crypto.randomUUID());
+      await repo.setItem(job, lease, item, { ...base, code: safe.code, message: `Read-only reconciliation paused: ${safe.message}` }, "intent");
+    }
+    return;
+  }
+  if (value.kind === "bulk_update" || value.kind === "bulk_complete") {
+    try {
+      const plannedWrite = await repo.decrypt(job, item.ordinal, "mutation", item.mutation_envelope);
+      const observed = await new AppleConnectionService(service.env, service.owner).observeJobChange(job.generation, job.account_scope, value, plannedWrite);
+      await repo.setItem(job, lease, item, { ...base, desiredStateObserved: observed.desiredStateObserved, code: "WRITE_OUTCOME_UNKNOWN",
+        message: observed.desiredStateObserved ? "The requested state is visible, but this operation has no valid receipt. It remains unknown; no replay will occur." :
+          observed.missing ? "The exact reminder is currently absent; the prior dispatch remains unresolved. No replay will occur." : "The requested state is not visible at the exact reminder version. Manual review is required; no replay will occur." }, "intent");
     } catch (error) {
       if (!(error instanceof AppError)) throw error;
       const safe = publicError(error, crypto.randomUUID());

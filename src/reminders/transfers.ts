@@ -4,9 +4,10 @@ import { normalizeList, normalizeReminder, type CloudKitRecord } from "../icloud
 import { requireMutableList, type ListWrite } from "./list-writes.ts";
 import { ReminderTargetInput, assertOwnedReminder, buildCreateReminder, updateResolutionTokenMap, type CloudKitWriteRecord } from "./writes.ts";
 import { normalizeReminderTag, normalizeURLAttachment, planTagChange, planURLChange, type OrganizationPlan } from "./organization.ts";
+import { ListId } from "./identifiers.ts";
 
 export const MoveReminderInput = ReminderTargetInput.extend({
-  destinationListId: ReminderTargetInput.shape.listId.describe("Exact destination owned private list ID."),
+  destinationListId: ListId.describe("Exact destination owned private list ID."),
   sourceListChangeTag: ReminderTargetInput.shape.recordChangeTag.describe("Current source list tag from get_reminder_list."),
   destinationListChangeTag: ReminderTargetInput.shape.recordChangeTag.describe("Current destination list tag from get_reminder_list."),
 }).strict();
