@@ -1,4 +1,4 @@
-# iCloud for Cloudflare Worker
+# iCloud MCP for Cloudflare Worker
 
 <p align="center">
   <a href="https://github.com/Xzese/icloud-reminders-mcp-for-cloudflare-workers/stargazers"><img src="https://img.shields.io/github/stars/Xzese/icloud-reminders-mcp-for-cloudflare-workers?style=flat-square" alt="Stars"></a>
