@@ -56,7 +56,6 @@ export default function AppleConnection() {
   const statusRequest = useRef<AbortController | null>(null);
   const actionRequest = useRef<AbortController | null>(null);
   const errorSource = useRef<"status" | "action" | null>(null);
-  const [approval, setApproval] = useState({ generation: -1, attempts: 0, failures: 0, lastAttemptAt: 0, paused: false });
   const onReadChange = useCallback((next: ReadSummary) => setReadState(next), []);
   const refresh = useCallback(async (automatic = false) => {
     if (automatic && (statusRequest.current || actionRequest.current)) return;
@@ -96,19 +95,14 @@ export default function AppleConnection() {
   const expired = !!status?.expiresAt && status.expiresAt <= now;
   useEffect(() => { if (!expired || status?.state !== "READY") return; const timer = setTimeout(() => void refresh(), 0); return () => clearTimeout(timer); }, [expired, status?.state, refresh]);
   const onSessionRejected = useCallback((message: string) => { setError(message); void refresh(); }, [refresh]);
-  const action = useCallback(async (path: string, automatic = false) => {
-    if (!status || busyAction || refreshing || actionRequest.current || (automatic && statusRequest.current)) return;
+  const action = useCallback(async (path: string) => {
+    if (!status || busyAction || refreshing || actionRequest.current) return;
     const controller = new AbortController(); actionRequest.current = controller;
     setBusyAction(path); setError(""); errorSource.current = null;
     revision.current++; statusRequest.current?.abort();
-    if (path === "/api/auth/resume") setApproval(previous => ({
-      generation: status.generation, attempts: (previous.generation === status.generation ? previous.attempts : 0) + 1,
-      failures: previous.generation === status.generation ? previous.failures : 0, lastAttemptAt: Date.now(), paused: false,
-    }));
     try {
-      await call(path, { expectedGeneration: status.generation, ...(path === "/api/auth/resume" && !automatic ? { restartApproval: true } : {}) }, controller.signal);
+      await call(path, { expectedGeneration: status.generation }, controller.signal);
       if (controller.signal.aborted) return;
-      if (path === "/api/auth/resume") setApproval(previous => ({ ...previous, failures: 0 }));
       await refresh();
       window.dispatchEvent(new Event("icloud-services-changed"));
     } catch (e) {
@@ -116,11 +110,6 @@ export default function AppleConnection() {
       // A failed request can still have saved a fenced result. Restore status
       // before deciding whether another approval check is appropriate.
       await refresh();
-      if (automatic) setApproval(previous => {
-        const failures = previous.failures + 1;
-        const transient = !(e instanceof ConnectionError) || ["CONFLICT", "RATE_LIMITED", "UPSTREAM_UNAVAILABLE"].includes(e.code ?? "");
-        return { ...previous, failures, paused: !transient || failures >= 3 };
-      });
       errorSource.current = "action";
       setError(e instanceof Error ? e.message : "That action didn’t finish. Please try again.");
     } finally {
@@ -145,16 +134,6 @@ export default function AppleConnection() {
     document.addEventListener("visibilitychange", visible);
     return () => { stopped = true; clearTimeout(timer); document.removeEventListener("visibilitychange", visible); };
   }, [status?.state, refresh]);
-  const approvalPaused = !!status && approval.generation === status.generation && (approval.paused || approval.attempts >= 8);
-  useEffect(() => {
-    if (!status?.services.reminders.enabled || !status?.gates.enabled || status.state !== "DEVICE_APPROVAL_PENDING" || expired || refreshing || busyAction || approvalPaused) return;
-    const previous = approval.generation === status.generation ? approval : null;
-    const nextCheck = Math.max(status.nextAttemptAt, previous ? previous.lastAttemptAt + Math.min(60_000, 15_000 * 2 ** previous.failures) : 0);
-    const timer = setTimeout(() => {
-      if (document.visibilityState !== "hidden") void action("/api/auth/resume", true);
-    }, Math.max(0, nextCheck - Date.now()));
-    return () => clearTimeout(timer);
-  }, [status, expired, refreshing, busyAction, approval, approvalPaused, action]);
   const needsVerification = status?.requiredAction === "verify-device" || status?.requiredAction === "apple-sign-in";
   const termsRequired = status?.requiredAction === "review-terms";
   const coolingDown = !!status?.nextRetryAt && status.nextRetryAt > now;
@@ -179,7 +158,7 @@ export default function AppleConnection() {
         <details className="testing-panel"><summary>Workspace setup</summary><div className="testing-content"><p>Copy this setup identity for the person configuring your workspace.</p><label htmlFor="site-identity">Your Site identity</label><input id="site-identity" value={ownerIdentity} readOnly /><div className="action-row"><Button variant="outline" onClick={() => void navigator.clipboard.writeText(ownerIdentity).then(() => setCopied(true)).catch(() => setError("Copy didn’t work. Select the setup identity and copy it manually."))}><Copy size={16} aria-hidden="true" />{copied ? "Copied" : "Copy Site identity"}</Button><Button variant="ghost" disabled={busy} onClick={() => void refresh()}>Check setup</Button></div></div></details>
       </section> : <section className="dashboard-card" aria-labelledby="connection-title">
         <div className="card-heading"><div className="card-icon"><Cloud size={23} aria-hidden="true" /></div><div><h2 id="connection-title">{title}</h2><p>{description}</p></div></div>
-        {ready ? <div className="account-banner"><ShieldCheck size={20} aria-hidden="true" /><span>Your agent can use the service permissions you save above.</span></div> : termsRequired || coolingDown ? <p className="fine-print" role="status">Your encrypted connection is preserved. {status?.nextRetryAt ? `Retry after ${dateText(status.nextRetryAt)}.` : "Resolve the required action through Apple's official interface."}</p> : pending ? <div className="action-row"><Button className="action-primary" disabled={busy || now < (status?.nextAttemptAt ?? 0)} onClick={() => void action("/api/auth/resume")}><RefreshCw size={17} className={busyAction ? "animate-spin" : undefined} aria-hidden="true" />{busyAction ? "Checking approval…" : "Check Apple approval"}</Button><p className="fine-print" role="status">{approvalPaused ? "Automatic approval checks are paused. Check again manually to start a new bounded attempt; your Apple account is preserved." : "We’re checking Apple approval automatically. You can also check now."}</p></div> : status?.gates.enabled && <><a className="button-link action-primary" href="/connect/apple" target="_top">{status.state === "CONNECTING" ? "Continue Apple sign-in" : "Connect Apple account"}<ArrowRight size={17} aria-hidden="true" /></a><div className="notice"><Info size={17} className="notice-icon" aria-hidden="true" /><p>This uses an unofficial iCloud connection. On the next page, this app processes your Apple password to sign in and Apple verifies your device.</p></div></>}
+        {ready ? <div className="account-banner"><ShieldCheck size={20} aria-hidden="true" /><span>Your agent can use the service permissions you save above.</span></div> : termsRequired || coolingDown ? <p className="fine-print" role="status">Your encrypted connection is preserved. {status?.nextRetryAt ? `Retry after ${dateText(status.nextRetryAt)}.` : "Resolve the required action through Apple's official interface."}</p> : pending ? <p className="fine-print" role="status">Manage device approval in Services above. Pending approval is checked automatically while this page is visible.</p> : status?.gates.enabled && <><a className="button-link action-primary" href="/connect/apple" target="_top">{status.state === "CONNECTING" ? "Continue Apple sign-in" : "Connect Apple account"}<ArrowRight size={17} aria-hidden="true" /></a><div className="notice"><Info size={17} className="notice-icon" aria-hidden="true" /><p>This uses an unofficial iCloud connection. On the next page, this app processes your Apple password to sign in and Apple verifies your device.</p></div></>}
         {status?.retentionSource === "owner-authorised-migration" && <p className="fine-print">Your saved connection now uses a {status.retentionDays}-day session window. No new Apple sign-in was needed for this update.</p>}
         <div className="action-row"><Button variant="outline" disabled={busy || readState.busy} onClick={() => void refresh()}><RefreshCw size={16} className={refreshing ? "animate-spin" : undefined} aria-hidden="true" />{refreshing ? "Checking connection…" : "Refresh connection"}</Button></div>
       </section>}

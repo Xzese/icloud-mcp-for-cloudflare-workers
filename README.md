@@ -100,7 +100,11 @@ Saved preferences and actual Apple readiness are shown separately.
 
 To start: apply migrations `0002_service_settings.sql` and `0003_drive_operations.sql`, save
 Drive permissions, connect Apple, select **Approve Drive access**, approve on your trusted
-device and check approval. For Drive-only use, disable Reminders before connecting. Changing
+device. Pending approval is checked automatically while the dashboard is visible,
+with bounded retries that respect Apple’s retry time. **Check Apple approval** checks
+the current attempt; **Start new approval** explicitly starts a fresh attempt if checks
+pause or the attempt expires. Approval updates Services and the Drive panel without
+a browser refresh. For Drive-only use, disable Reminders before connecting. Changing
 settings or refreshing status never initiates Apple consent. Refresh your MCP client's tool
 list after changing permissions.
 
