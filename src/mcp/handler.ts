@@ -1,5 +1,6 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
+import { LATEST_PROTOCOL_VERSION, JSONRPCRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 import { CreateListInput, RenameListInput, DeleteListInput } from "../reminders/list-writes.ts";
 import { UpdateListAppearanceRequest } from "../reminders/list-appearance.ts";
@@ -402,7 +403,7 @@ export async function handleMCP(request: Request, env: RuntimeEnv, owner: string
     });
   }
   for (const action of ["complete", "reopen", "delete"] as const) {
-    const operation = action === "complete" ? "Mark one open reminder completed" : action === "reopen" ? "Reopen one completed reminder" : "Delete one open or completed reminder using Apple's Deleted marker";
+    const operation = action === "complete" ? "Complete one open occurrence. Ordinary timed monthly recurrence with interval one and no end or explicit day pattern advances one calendar month from the current due date, preserving local time. Requires a childless root, stored IANA zone and one absolute date pair; supports no early alert or one one-day early alert. A day absent from the next month is refused. Also supports the observed explicit monthly [28,29]/[-1] rule with a one-day early alert, which selects day 29 or February 28. Preserves acknowledgement and account metadata; fresh completed history has an independent alert identity" : action === "reopen" ? "Reopen one completed reminder" : "Delete one open or completed reminder using Apple's Deleted marker";
     const family = action === "delete"
       ? "Soft-delete a bounded ordinary one-level family without recurrence. A family may contain zero or one validated timed absolute date pair per member; parent deletion also soft-deletes each exact pair by its Deleted markers, preserving backlinks and date fields. Direct child deletion soft-deletes only that child’s own pair, if present, and touches the root timestamp; root/sibling dates, pairs and states are preserved. Deleting a child detaches that child from its List and root, removes its List membership and touches the root timestamp; siblings keep their state. Deleting a root detaches it and removes its membership, then marks all discovered children deleted while retaining their List/parent links, completion dates and tokens. Exact family and List versions share one atomic group, limited to 32 records and 64 KiB. Unknown, incomplete, deeper or oversized families are refused. Native unreferenced additions are not universally locked. affectedRecords includes the deleted reminders and any touched root. Retain all exact IDs for reconciliation; get_reminder can return a detached deleted root with listId=null. No hard-delete or restore tool is exposed."
       : "Supports bounded ordinary one-level parent/subtask families without recurrence, including mixtures of undated members, simple dates and one validated timed IANA-zone absolute date pair per member. Complete/reopen retains every exact date pair. Scheduled members cannot have early/location alarms, assignments, tags or attachments. Completing a root completes its open children with one shared timestamp; already completed children keep their state and timestamp. Reopening a root reopens only children whose completion timestamp equals the root's previous timestamp. Completing or reopening a child changes only that child. The complete known family, all date pairs and List are exact-version guarded in one atomic group, limited to 32 records and 64 KiB. Unknown, incomplete, deeper or oversized families are refused. Native additions advanced root/List versions in observed samples; universal protection against unreferenced native additions is not established. affectedRecords lists records whose state changed.";
@@ -431,10 +432,36 @@ export async function handleMCP(request: Request, env: RuntimeEnv, owner: string
     if (error instanceof AppError && error.code === "PROTOCOL_CHANGED") throw new AppError("VALIDATION_ERROR", INLINE_UPLOAD_GUIDANCE, 413);
     throw error;
   }
+  let message: unknown;
+  try { message = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes)); } catch { /* SDK handles invalid JSON. */ }
   if (bytes.byteLength > 65_536) {
-    let message;
-    try { message = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes)); } catch { /* SDK handles normal-size invalid JSON. */ }
-    if (!message || Array.isArray(message) || message.method !== "tools/call" || message.params?.name !== "upload_icloud_drive_file") throw new AppError("VALIDATION_ERROR", "This MCP request exceeds the 64 KiB limit.", 413);
+    const upload = message as { method?: unknown; params?: { name?: unknown } } | null;
+    if (!upload || Array.isArray(upload) || upload.method !== "tools/call" || upload.params?.name !== "upload_icloud_drive_file") throw new AppError("VALIDATION_ERROR", "This MCP request exceeds the 64 KiB limit.", 413);
+  }
+  // Sites uses its stateless 2026 discovery/list/call contract. Keep owner,
+  // enabled-tool schemas, callbacks and all byte limits shared with the SDK.
+  // The installed SDK transport supports earlier protocol headers; adapt only
+  // the two tool methods whose JSON-RPC contracts are unchanged.
+  const parsed = JSONRPCRequestSchema.safeParse(message);
+  if (!parsed.success && request.headers.get("mcp-method") === "server/discover") {
+    const object = message && typeof message === "object" && !Array.isArray(message) ? message as Record<string, unknown> : null;
+    console.info({ event: "mcp-discovery-shape", object: object !== null, idType: typeof object?.id,
+      knownEnvelopeKeys: object ? Object.keys(object).filter(key => ["jsonrpc", "id", "method", "params", "_meta"].includes(key)) : [],
+      unknownEnvelopeKeyCount: object ? Object.keys(object).filter(key => !["jsonrpc", "id", "method", "params", "_meta"].includes(key)).length : 0,
+      issueCodes: parsed.error.issues.slice(0, 8).map(issue => issue.code) });
+  }
+  if (parsed.success && parsed.data.method === "server/discover") {
+    return Response.json({ jsonrpc: "2.0", id: parsed.data.id,
+      result: { supportedVersions: ["2026-07-28"], capabilities: { tools: {} } } },
+      { headers: { "Cache-Control": "private, no-store" } });
+  }
+  if (request.headers.get("mcp-protocol-version") === "2026-07-28") {
+    if (!parsed.success || !["tools/list", "tools/call"].includes(parsed.data.method))
+      return Response.json({ jsonrpc: "2.0", id: parsed.success ? parsed.data.id : null,
+        error: { code: -32600, message: "The Sites MCP contract requires one discovery, tool-list or tool-call request." } }, { status: 400 });
+    const headers = new Headers(request.headers);
+    headers.set("mcp-protocol-version", LATEST_PROTOCOL_VERSION);
+    request = new Request(request, { headers, body: Uint8Array.from(bytes).buffer });
   }
   request = new Request(request, { body: Uint8Array.from(bytes).buffer });
   const transport = new WebStandardStreamableHTTPServerTransport({ sessionIdGenerator: undefined, enableJsonResponse: true, maxRequestBodySize: INLINE_REQUEST_BYTES });

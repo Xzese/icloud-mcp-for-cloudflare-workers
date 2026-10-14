@@ -632,6 +632,54 @@ test("existing encrypted sessions discard retired catalogue state without discon
   db.sqlite.close();
 });
 
+test("bounded long read leases keep the write margin, permissions, replacement and disconnect fences", async () => fixedClock(async clock => {
+  const db = new SQLiteD1(), repository = appleRepo(db), session = appleSession();
+  try {
+    const setup = await repository.begin(0); await repository.commit(setup, session, "READY");
+    let saved = await repository.load();
+    const normal = await repository.claimRead(saved.fence.generation, saved.fence.version);
+    assert.equal(normal.expiresAt, clock.now + 30_000);
+    await repository.releaseResume(normal);
+    saved = await repository.load();
+    const start = clock.now, long = await repository.claimRead(saved.fence.generation, saved.fence.version, 60_000);
+    assert.equal(long.expiresAt, start + 60_000);
+    assert.equal((await repository.load()).session.login.expiresAt, session.login.expiresAt);
+    clock.now = start + 49_999;
+    await repository.assertWriteLease(long);
+    await repository.assertRemindersTransport(long, { available: true, revision: 0 }, true);
+    clock.now++;
+    await assert.rejects(repository.assertWriteLease(long), hasCode("CONFLICT"));
+    await assert.rejects(repository.assertRemindersTransport(long, { available: true, revision: 0 }, true), hasCode("CONFLICT"));
+    await repository.assertRemindersTransport(long, { available: true, revision: 0 }, false);
+    db.sqlite.prepare("INSERT INTO owner_service_settings VALUES (?, 1, '{}', ?)").run(owner, clock.now);
+    await assert.rejects(repository.assertRemindersTransport(long, { available: true, revision: 0 }, false), hasCode("CONFLICT"));
+    db.sqlite.prepare("DELETE FROM owner_service_settings").run();
+    clock.now = start + 60_000;
+    await assert.rejects(repository.assertRemindersTransport(long, { available: true, revision: 0 }, false), hasCode("CONFLICT"));
+    const replacement = await repository.claimRead(long.generation, long.version, 60_000);
+    await assert.rejects(repository.commitResume(long, session, "READY"), hasCode("CONFLICT"));
+    await repository.releaseResume(long);
+    await repository.assertRemindersTransport(replacement, { available: true, revision: 0 }, false);
+    await repository.disconnect();
+    await assert.rejects(repository.assertWriteLease(replacement), hasCode("CONFLICT"));
+    await assert.rejects(repository.assertRemindersTransport(replacement, { available: true, revision: 0 }, false), hasCode("CONFLICT"));
+    await assert.rejects(repository.claimRead(replacement.generation, replacement.version, 120_000 as 60_000), hasCode("VALIDATION_ERROR"));
+  } finally { db.sqlite.close(); }
+}));
+
+test("long leases are capped by the unchanged absolute Apple login deadline", async () => fixedClock(async clock => {
+  const db = new SQLiteD1(), repository = appleRepo(db), session = appleSession();
+  session.login = loginAssurance(clock.now - SESSION_RETENTION_MS + 45_000);
+  try {
+    const setup = await repository.begin(0); await repository.commit(setup, session, "READY");
+    const saved = await repository.load(), fence = await repository.claimRead(saved.fence.generation, saved.fence.version, 60_000);
+    assert.equal(fence.expiresAt, session.login.expiresAt);
+    assert.equal(fence.expiresAt, clock.now + 45_000);
+    assert.equal(appleRequestBudget().deadline, clock.now + 40_000);
+    assert.equal(appleRequestBudget(60_000).deadline, clock.now + 60_000);
+  } finally { db.sqlite.close(); }
+}));
+
 test("copy intent checkpoint retains only bound hashes through lease release and rejects stale or changed identity", async () => {
   const db = new SQLiteD1(), repository = appleRepo(db), session = appleSession();
   const setup = await repository.begin(0); await repository.commit(setup, session, "READY");
@@ -779,7 +827,7 @@ test("recurring prepared requests survive local dispatch gates and cannot resume
         if (!sql.startsWith("UPDATE apple_session_state SET envelope = ?")) return;
         db.afterStatement = null;
         if (mode === "lease") db.sqlite.prepare("UPDATE apple_session_state SET resume_id = ?").run("synthetic-replaced-lease");
-        else clock.now += 32_000;
+        else clock.now += 52_000;
       };
       const args = { action: "complete" as const, expectedGeneration: setup.generation, listId, reminderId, recordChangeTag: "active-before" };
       await assert.rejects(new AppleConnectionService(env, owner).mutate(args), hasCode("CONFLICT"));

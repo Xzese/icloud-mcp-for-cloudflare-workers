@@ -505,7 +505,8 @@ export class AppleSessionRepository {
     return { generation: row.generation, version: row.version, resumeId, expiresAt };
   }
 
-  async claimRead(expectedGeneration: number, expectedVersion?: number): Promise<ResumeFence> {
+  async claimRead(expectedGeneration: number, expectedVersion?: number, leaseMs: 30_000 | 60_000 = RESUME_LEASE_MS): Promise<ResumeFence> {
+    if (![30_000, 60_000].includes(leaseMs)) throw new AppError("VALIDATION_ERROR", "The read lease allowance is invalid.", 400);
     if (!Number.isSafeInteger(expectedGeneration) || expectedGeneration < 0 || (expectedVersion !== undefined && (!Number.isSafeInteger(expectedVersion) || expectedVersion < 0))) {
       throw new AppError("VALIDATION_ERROR", "The expected Apple session fence is invalid.", 400);
     }
@@ -515,7 +516,7 @@ export class AppleSessionRepository {
     const now = Date.now();
     requireCurrentLogin(saved.session.login, now);
     const resumeId = crypto.randomUUID();
-    const expiresAt = Math.min(now + RESUME_LEASE_MS, saved.session.login.expiresAt);
+    const expiresAt = Math.min(now + leaseMs, saved.session.login.expiresAt);
     const versionPredicate = expectedVersion === undefined ? "" : " AND version = ?";
     const values: (string | number)[] = [resumeId, expiresAt, now, this.owner, ACCOUNT, expectedGeneration];
     if (expectedVersion !== undefined) values.push(expectedVersion);

@@ -111,7 +111,7 @@ export function readPreservedRecurrence(record: CloudKitRecord): RecurrenceState
 }
 
 /** Separate completion recipe: never relax the ordinary recurrence-edit reader. */
-export function readCompletionRecurrence(record: CloudKitRecord): { kind: "weekly" | "last-day-monthly" | "daily"; endDate: number | null } {
+export function readCompletionRecurrence(record: CloudKitRecord): { kind: "weekly" | "last-day-monthly" | "monthly-29" | "monthly" | "daily"; endDate: number | null } {
   const positions = record.fields.SetPositions;
   const base = { ...record, fields: Object.fromEntries(Object.entries(record.fields).filter(([key]) => key !== "SetPositions")) };
   const recurrence = readRecurrence(base);
@@ -121,13 +121,17 @@ export function readCompletionRecurrence(record: CloudKitRecord): { kind: "weekl
   const endDate = recurrence.endDate === null ? null : Date.parse(recurrence.endDate);
   if (recurrence.frequency === "weekly" && !recurrence.monthDays && positions === undefined) return { kind: "weekly", endDate };
   if (recurrence.frequency === "daily" && !recurrence.monthDays && positions === undefined) return { kind: "daily", endDate };
-  if (recurrence.frequency === "monthly" && endDate === null && canonicalJSON(recurrence.monthDays) === canonicalJSON([28, 29, 30, 31]) &&
+  // Ordinary Monthly has no explicit day selection: the current due date is
+  // its calendar anchor, including after a native date edit.
+  if (recurrence.frequency === "monthly" && endDate === null && !recurrence.monthDays && positions === undefined) return { kind: "monthly", endDate };
+  if (recurrence.frequency === "monthly" && endDate === null && ["[28,29]", "[28,29,30,31]"].includes(canonicalJSON(recurrence.monthDays)) &&
     positions && typeof positions === "object" && "type" in positions && positions.type === "BYTES" && "value" in positions && typeof positions.value === "string") {
     try {
-      if (canonicalJSON(JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(unb64(positions.value, 8192)))) === "[-1]") return { kind: "last-day-monthly", endDate };
+      if (canonicalJSON(JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(unb64(positions.value, 8192)))) === "[-1]")
+        return { kind: canonicalJSON(recurrence.monthDays) === "[28,29]" ? "monthly-29" : "last-day-monthly", endDate };
     } catch { /* reject an unknown pattern below */ }
   }
-  throw new AppError("UNSUPPORTED_FEATURE", "Supported completion patterns are interval-one weekly, all-day daily, non-ended timed daily with one absolute alarm, and the observed last-day monthly rule.");
+  throw new AppError("UNSUPPORTED_FEATURE", "Supported completion patterns are interval-one weekly, all-day daily, non-ended timed daily or ordinary monthly with one absolute alarm, and the observed last-day monthly rule.");
 }
 export function recurrenceEdit(record: CloudKitRecord, input: RecurrenceInput) {
   const before = readRecurrence(record), parsed = RecurrenceChanges.parse(input);
