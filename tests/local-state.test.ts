@@ -7,6 +7,8 @@ import { randomBytes, randomUUID } from "node:crypto";
 import { execFileSync, spawn } from "node:child_process";
 import { once } from "node:events";
 import { DatabaseSync } from "node:sqlite";
+import filesystem from "node:fs/promises";
+import { syncBuiltinESMExports } from "node:module";
 import { localStateDirectory, localKeys, openLocalState, lockLocalState, resolveLocalStateRedirect } from "../scripts/dev/local-icloud-state.mjs";
 import { centralizeLocalState } from "../scripts/dev/centralize-local-icloud.mjs";
 
@@ -56,6 +58,33 @@ test("shared-state locks cover symlink aliases and are released on process failu
     const exited = once(child, "exit"); child.kill("SIGKILL"); await exited;
     const restored = lockLocalState(alias); restored.release();
   } finally { child.kill(); }
+});
+
+test("startup uses the locked store when centralization installs a redirect during initialization", async t => {
+  const temp = await temporary(t), legacy = join(temp, "legacy"), shared = join(temp, "shared");
+  await mkdir(legacy); await mkdir(shared);
+  const keys = () => ({ owner: `local-${Buffer.from(randomBytes(16)).toString("hex")}`, key: Buffer.from(randomBytes(32)).toString("base64") });
+  const original = keys(), selected = keys();
+  await writeFile(join(legacy, "keys.json"), JSON.stringify(original));
+  await writeFile(join(shared, "keys.json"), JSON.stringify(selected));
+  const chmod = filesystem.chmod;
+  filesystem.chmod = async (path, mode) => {
+    await chmod(path, mode);
+    if (path === legacy) {
+      await writeFile(join(legacy, "keys.json"), JSON.stringify({ sharedStateVersion: 1, upgradeLocalLauncher: true }));
+      await writeFile(join(legacy, "shared-state.json"), JSON.stringify({ version: 1, directory: shared }));
+    }
+  };
+  syncBuiltinESMExports();
+  let opened: Awaited<ReturnType<typeof openLocalState>> | undefined;
+  try {
+    opened = await openLocalState(temp, { LOCAL_ICLOUD_STATE_DIR: legacy });
+    assert.equal(opened.directory, shared);
+    assert.deepEqual(opened.keys, selected);
+    assert.throws(() => lockLocalState(shared), /already in use/);
+  } finally {
+    opened?.release(); filesystem.chmod = chmod; syncBuiltinESMExports();
+  }
 });
 
 test("malformed or looping legacy redirects cannot create replacement credentials", async t => {

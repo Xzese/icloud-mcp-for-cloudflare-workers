@@ -278,8 +278,9 @@ or authorization headers are sent to the content server. Package archive sizes m
 from their unpacked metadata sizes, so archive downloads omit the metadata `Content-Length`
 and enforce the actual streamed-byte cap.
 
-The new paths have synthetic protocol and Worker coverage. Live verification of shared
-`docws` reads, package archives, ranges and 330 redirects remains pending.
+The new paths have synthetic protocol and Worker coverage. Ordinary file ranges also passed
+the live acceptance run below. Live verification of shared `docws` reads, package archives
+and 330 redirects remains pending.
 
 ## Interrupted operations and boundaries
 

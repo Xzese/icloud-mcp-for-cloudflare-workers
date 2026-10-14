@@ -100,9 +100,10 @@ export async function openLocalState(root, environment = process.env) {
     }
   }
   await mkdir(requested, { recursive: true, mode: 0o700 });
-  const directory = await realpath(requested);
-  await chmod(directory, 0o700);
-  const lock = lockLocalState(directory);
+  const existingDirectory = await realpath(requested);
+  await chmod(existingDirectory, 0o700);
+  const lock = lockLocalState(existingDirectory);
+  const directory = lock.directory;
   try {
     const config = join(directory, "keys.json");
     try { await writeFile(config, JSON.stringify({ owner: `local-${randomBytes(16).toString("hex")}`, key: randomBytes(32).toString("base64") }), { flag: "wx", mode: 0o600 }); }
