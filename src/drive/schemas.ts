@@ -6,7 +6,7 @@ export { INLINE_FILE_BYTES, TEXT_PREVIEW_BYTES, INLINE_REQUEST_BYTES, DRIVE_FILE
 export const INLINE_UPLOAD_GUIDANCE = `Inline uploads allow at most 64 KiB of file bytes. Use dashboard Upload or /api/drive/prepare-upload followed by its authenticated binary uploadPath for files up to ${DRIVE_FILE_LIMIT_LABEL}.`;
 export const OwnedDriveId = z.string().max(512).regex(/^(?:FOLDER|FILE)::com\.apple\.CloudDocs::[A-Za-z0-9._-]{1,256}$/)
   .describe("Exact owned item ID returned by Drive listing; never a local path or URL.");
-export const DriveId = z.string().max(512).regex(/^(?:FOLDER|FILE)(?:_IN_SHARED_FOLDER)?::com\.apple\.CloudDocs::[A-Za-z0-9._-]{1,256}$/)
+export const DriveId = z.string().max(512).regex(/^(?:(?:FOLDER|FILE)(?:_IN_SHARED_FOLDER)?|SHARED_FOLDER)::com\.apple\.CloudDocs::[A-Za-z0-9._-]{1,256}$/)
   .describe("Exact Drive item ID returned by listing; pass its shareContext too when present.");
 export const DriveName = z.string().min(1).max(255).refine(value => value.trim() === value && value !== "." && value !== ".." && !/[\u0000-\u001f\u007f/\\]/.test(value), "Use a simple filename without path separators or control characters.");
 export const Generation = z.number().int().nonnegative().safe().optional();

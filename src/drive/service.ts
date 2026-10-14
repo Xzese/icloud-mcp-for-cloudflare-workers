@@ -12,7 +12,7 @@ import { ServiceSettingsRepository } from "../persistence/service-settings.ts";
 import { requireServicePermission, type ServicePermission } from "../services/settings.ts";
 import { DriveOperationRepository, type DriveOperation, type DriveOperationData, type DriveScope } from "../persistence/drive-operations.ts";
 import { DriveClient, DRIVE_ROOT, DriveItemSchema, UploadReceiptSchema, type DriveItem } from "../icloud/drive.ts";
-import { DriveHTTP } from "../transport/drive-http.ts";
+import { DriveHTTP, type DriveByteRange } from "../transport/drive-http.ts";
 import { DriveSharedContext } from "./shared.ts";
 import { resolveDriveFolderPath } from "./folder-path.ts";
 import { DriveFolderListingDiagnostics, type DriveSearchReason } from "./listing.ts";
@@ -42,7 +42,16 @@ function mutable(item: DriveItem) {
 function ordinaryFile(item: DriveItem, limit: number) {
   if (item.type !== "file" || item.size === null || item.size > limit) throw new AppError("UNSUPPORTED_FEATURE", `Select an ordinary file within the ${limit} byte content limit.`, 409);
 }
-function exact(a: DriveItem, b: DriveItem) { return a.id === b.id && a.documentId === b.documentId && a.etag === b.etag && a.type === b.type && a.size === b.size && a.parentId === b.parentId && a.name === b.name && a.shareContext === b.shareContext; }
+function exact(a: DriveItem, b: DriveItem) { return a.id === b.id && a.documentId === b.documentId && a.etag === b.etag && a.type === b.type && a.size === b.size && a.parentId === b.parentId && a.name === b.name && a.shareContext === b.shareContext && a.package === b.package; }
+
+function byteRange(header: string | null, size: number): DriveByteRange | undefined {
+  if (header === null) return undefined;
+  const match = /^bytes=(\d*)-(\d*)$/.exec(header);
+  if (!match || !match[1] && !match[2]) throw new AppError("VALIDATION_ERROR", "Use one bytes=start-end or suffix byte range.", 416);
+  const first = match[1] ? Number(match[1]) : null, last = match[2] ? Number(match[2]) : null;
+  if (first !== null && !Number.isSafeInteger(first) || last !== null && !Number.isSafeInteger(last) || size === 0 || first !== null && (first >= size || last !== null && last < first) || first === null && last === 0) throw new AppError("VALIDATION_ERROR", "The Drive byte range is outside this file.", 416);
+  return first === null ? { start: Math.max(0, size - last!), end: size - 1, total: size } : { start: first, end: Math.min(last ?? size - 1, size - 1), total: size };
+}
 
 export class DriveService {
   private readonly env: RuntimeEnv;
@@ -91,7 +100,7 @@ export class DriveService {
         await this.guard(scope, permission);
         await this.sessions.assertAccountLease(fence);
         const response = await fetch(input, init);
-        if ([401, 403, 421, 450].includes(response.status)) access.rejected = true;
+        if ([401, 403, 421, 423, 450].includes(response.status)) access.rejected = true;
         return response;
       };
       const http = AppleAuthHTTP.restore(saved.session.auth, send);
@@ -194,7 +203,7 @@ export class DriveService {
     const send: typeof fetch = async (input, init) => { await this.guard(scope, permission); return fetch(input, init); };
     return AppleAuthHTTP.restore(auth, send);
   }
-  private checkedStream(source: ReadableStream<Uint8Array>, scope: DriveScope, permission: ServicePermission, size: number, signal?: AbortSignal, hash?: string) {
+  private checkedStream(source: ReadableStream<Uint8Array>, scope: DriveScope, permission: ServicePermission, size: number | null, signal?: AbortSignal, hash?: string) {
     const reader = source.getReader(), digest = sha256.create();
     let count = 0;
     const guard = () => this.guard(scope, permission);
@@ -208,11 +217,11 @@ export class DriveService {
           if (signal?.aborted) throw signal.reason ?? new AppError("CONFLICT", "The Drive transfer was cancelled.", 409);
           await guard();
           if (next.done) {
-            if (count !== size || hash !== undefined && hex(digest.digest()) !== hash) throw new AppError("VALIDATION_ERROR", "The Drive content length or SHA-256 digest did not match its metadata.", 400);
+            if (size !== null && count !== size || hash !== undefined && hex(digest.digest()) !== hash) throw new AppError("VALIDATION_ERROR", "The Drive content length or SHA-256 digest did not match its metadata.", 400);
             verified = true; reader.releaseLock(); controller.close(); return;
           }
           count += next.value.byteLength;
-          if (count > size || count > DRIVE_FILE_BYTES) throw new AppError("VALIDATION_ERROR", "The Drive content exceeded its declared size.", 400);
+          if (size !== null && count > size || count > DRIVE_FILE_BYTES) throw new AppError("VALIDATION_ERROR", "The Drive content exceeded its declared size.", 400);
           if (hash !== undefined) digest.update(next.value);
           controller.enqueue(next.value);
         } catch (error) { await reader.cancel(error).catch(() => {}); controller.error(error); }
@@ -221,23 +230,27 @@ export class DriveService {
     }, { highWaterMark: 0 });
     return { stream, verified: () => verified, cancel: (reason?: unknown) => reader.cancel(reason).catch(() => {}) };
   }
-  private async content(item: DriveItem, c: Context, signal?: AbortSignal) {
+  private async content(item: DriveItem, c: Context, signal?: AbortSignal, range?: DriveByteRange, inline = false) {
     ordinaryFile(item, DRIVE_FILE_BYTES);
-    const url = item.size === 0 ? null : (await c.client.prepareDownload(item)).url;
+    const prepared = item.size === 0 && !item.package ? null : await c.client.prepareDownload(item);
+    const packaged = item.package || prepared?.package;
+    if (packaged && (inline || range)) throw new AppError("UNSUPPORTED_FEATURE", "Download this iCloud package as a complete archive. Text reads and byte ranges are unavailable for packages.", 409);
     await this.finish(c);
     const http = await this.transferClient(c.scope, "drive.contents", c.http.snapshot());
     await this.guard(c.scope, "drive.contents");
-    const response = url ? await new DriveHTTP(http.http).download(url, signal) : new Response(new Uint8Array());
+    const response = prepared ? await new DriveHTTP(http.http).download(prepared.url, signal, range) : new Response(new Uint8Array());
     try { await this.guard(c.scope, "drive.contents"); }
     catch (error) { await response.body?.cancel(error).catch(() => {}); throw error; }
     const source = response.body ?? new ReadableStream<Uint8Array>({ start(controller) { controller.close(); } });
-    const checked = this.checkedStream(source, c.scope, "drive.contents", item.size!, signal);
+    const size = range ? range.end - range.start + 1 : item.size!;
+    const checked = this.checkedStream(source, c.scope, "drive.contents", packaged ? null : size, signal);
     const headers = new Headers({ "Content-Type": response.headers.get("content-type") ?? "application/octet-stream", "Cache-Control": "private, no-store", "X-Content-Type-Options": "nosniff" });
-    headers.set("Content-Length", String(item.size));
-    const encodedName = encodeURIComponent(new TextDecoder().decode(new TextEncoder().encode(item.name))).replace(/['()*]/g, character => `%${character.charCodeAt(0).toString(16).toUpperCase()}`);
+    if (!packaged) { headers.set("Content-Length", String(size)); headers.set("Accept-Ranges", "bytes"); }
+    if (range) headers.set("Content-Range", `bytes ${range.start}-${range.end}/${item.size}`);
+    const encodedName = encodeURIComponent(new TextDecoder().decode(new TextEncoder().encode(packaged ? `${item.name}.zip` : item.name))).replace(/['()*]/g, character => `%${character.charCodeAt(0).toString(16).toUpperCase()}`);
     headers.set("Content-Disposition", `attachment; filename="download"; filename*=UTF-8''${encodedName}`);
     // Never forward CDN headers, signed addresses, or Apple receipt fields.
-    return new Response(checked.stream, { headers });
+    return new Response(checked.stream, { status: range ? 206 : 200, headers });
   }
   async read(input: unknown) {
     const request = parse(ReadDrive, input);
@@ -246,8 +259,9 @@ export class DriveService {
     try {
       const item = await c.client.getItem(request.itemId, request.shareContext);
       ordinaryFile(item, DRIVE_FILE_BYTES);
+      if (item.package) throw new AppError("UNSUPPORTED_FEATURE", "Use an authenticated download for iCloud package archives.", 409);
       if (request.previewBytes === undefined && item.size! > INLINE_FILE_BYTES) throw new AppError("UNSUPPORTED_FEATURE", `This file exceeds the 64 KiB inline read limit. Request a UTF-8 preview with previewBytes (up to 8192), or use download_icloud_drive_file / dashboard Download for full contents up to ${DRIVE_FILE_LIMIT_LABEL}.`, 409);
-      const response = await this.content(item, c);
+      const response = await this.content(item, c, undefined, undefined, true);
       let bytes: Uint8Array;
       if (request.previewBytes === undefined) bytes = new Uint8Array(await response.arrayBuffer());
       else {
@@ -284,14 +298,14 @@ export class DriveService {
       return { handleId: handle.id, url: `/api/drive/downloads/${handle.id}`, expiresAt: handle.expiresAt, item, generation: c.scope.generation };
     });
   }
-  async downloadContent(handleId: string, signal?: AbortSignal): Promise<Response> {
+  async downloadContent(handleId: string, signal?: AbortSignal, rangeHeader: string | null = null): Promise<Response> {
     parse(z.string().uuid(), handleId);
     const c = await this.open("drive.contents");
     try {
       const saved = parse(z.object({ item: DriveItemSchema }).strict(), await this.operations.consumeHandle(handleId, "download", c.scope));
       const current = await c.client.getItem(saved.item.id, saved.item.shareContext);
       if (!exact(current, saved.item)) conflict("The Drive file changed after its download handle was created. Request a fresh download.");
-      return await this.content(current, c, signal);
+      return await this.content(current, c, signal, byteRange(rangeHeader, current.size!));
     } finally { await this.close(c); }
   }
   private async destination(c: Context, parentId: string, name: string, excludedId?: string) {

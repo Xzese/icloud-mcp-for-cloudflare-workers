@@ -48,8 +48,9 @@ export class AppleSignInFlow {
       if (!input.success) throw new AppError("VALIDATION_ERROR", "Use the secure connection form and confirm encrypted session storage.");
       const a = integer(unb64(input.data.publicA, 256));
       if (a <= 0n || a >= SRP_N) throw new AppError("VALIDATION_ERROR", "Invalid Apple sign-in public value.");
-      this.accountName = input.data.accountName;
+      this.accountName = input.data.accountName.toLowerCase();
       await this.http.bootstrap(); this.alive(revision);
+      await this.http.federate(this.accountName); this.alive(revision);
       const reply = await this.http.auth("/signin/init", "POST", { accountName: this.accountName, a: input.data.publicA, protocols: ["s2k", "s2k_fo"] });
       this.http.expect(reply, [200]); this.alive(revision);
       this.challenge = parseChallenge(reply.body); this.phase = "srp";

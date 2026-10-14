@@ -10,13 +10,16 @@ import { isDeepStrictEqual } from "node:util";
 import { Envelopes } from "../../src/crypto/envelopes.ts";
 import { AppleSessionSchema } from "../../src/persistence/apple-sessions.ts";
 import { SESSION_RETENTION_MS } from "../../src/auth/apple/policy.ts";
+import { localStateDirectory, localPort, lockLocalState } from "./local-icloud-state.mjs";
 
 const apply = process.argv.length === 3 && process.argv[2] === "--apply-owner-approval";
 if (process.argv.length !== 2 && !apply) throw new Error("Use session:retention:local [--apply-owner-approval].");
 const root = resolve(new URL("../..", import.meta.url).pathname);
-const state = process.env.LOCAL_ICLOUD_STATE_DIR ? resolve(process.env.LOCAL_ICLOUD_STATE_DIR) : join(root, ".sites-runtime/local-icloud");
-const port = Number(process.env.LOCAL_ICLOUD_PORT ?? "5173");
-if (!Number.isInteger(port) || port < 1024 || port > 65535) throw new Error("LOCAL_ICLOUD_PORT must be an unprivileged TCP port.");
+const state = localStateDirectory(root);
+const port = localPort();
+await stat(join(state, "keys.json"));
+const localLock = lockLocalState(state);
+process.once("exit", localLock.release);
 // Refuse to run beside an incompatible development reader. Do not query its
 // status endpoint: an old loader could delete a retained eligible envelope.
 await new Promise((resolve, reject) => {

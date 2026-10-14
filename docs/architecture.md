@@ -30,6 +30,21 @@ Worker handles bounded Apple HTTP/WebSocket exchanges, trusted-device verificati
 consent. It stores encrypted session credentials with an absolute local lifetime rather than
 storing the password. The cryptography and protocol are unofficial and need independent review.
 
+Fresh sign-in opens Apple's authorization context, performs the remembered-account federation
+preflight, and only then requests the SRP challenge. The Apple-facing origin, current device-context
+header, frame ID, cookies and evolving session headers are maintained across those steps; the
+dashboard's localhost or LAN origin is not forwarded to Apple. Rejected or federated preflight
+stops before SRP initialization. Account security-lock code `-20209` is recognized as either a
+JSON number or string and never treated as a reason to repeat password-proof submission.
+
+Local development resolves private Apple state from the main Git checkout, including when launched
+inside a linked worktree. A separate SQLite transaction locks that state across processes and
+legacy redirects and symlink aliases; it releases on normal shutdown or process failure. Explicit state-directory
+overrides remain available for isolated experiments. The centralization command takes consistent
+encrypted database snapshots, preserves existing directories as private backups, and can link
+legacy worktree state paths with credential-free redirect markers. Old launchers fail before
+opening the shared database, preventing incompatible readers from clearing retained credentials.
+
 The envelope and associated-data schema stay at version 1. Inside it, strict login assurance accepts
 legacy version 2 (exactly 24 hours from verification) and version 3 (`absolute-30d-v1`, exactly 30 days).
 The authentication policy remains `device-only-v2`; retention is not another Apple verification.

@@ -141,6 +141,7 @@ try {
   const fixtures = JSON.parse(await readFile(join(root, "tests/fixtures/protocol.json"), "utf8")); const f = fixtures.srp[0];
   const apple = fetchMock.get("https://idmsa.apple.com");
   apple.intercept({ path: /\/appleauth\/auth\/authorize\/signin\?/, method: "GET" }).reply(200, "synthetic authorization");
+  apple.intercept({ path: "/appleauth/auth/federate?isRememberMeEnabled=true", method: "POST", headers: { origin: "https://idmsa.apple.com", referer: "https://idmsa.apple.com/", "x-requested-with": "XMLHttpRequest" } }).reply(200, { federated: false });
   apple.intercept({ path: "/appleauth/auth/signin/init", method: "POST" }).reply(200, { salt: Buffer.from(f.salt, "hex").toString("base64"), b: Buffer.from(f.B, "hex").toString("base64"), c: "synthetic-challenge", iteration: f.iterations, protocol: f.protocol });
   apple.intercept({ path: "/appleauth/auth/signin/complete?isRememberMeEnabled=true", method: "POST" }).reply(200, {}, { headers: { "X-Apple-Session-Token": "synthetic-apple-token", "X-Apple-ID-Account-Country": "GB" } });
   const ck = fetchMock.get("https://p01-ckdatabasews.icloud.com");

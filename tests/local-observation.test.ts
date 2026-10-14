@@ -1,10 +1,12 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { classifyDriveRelayURL, localAppleContentHeaders, summarizeAppleResponse } from "../scripts/dev/local-icloud-observation.mjs";
+import { classifyDriveRelayURL, localAppleContentHeaders, localAppleDownloadHeaders, summarizeAppleResponse, summarizeAppleFailure } from "../scripts/dev/local-icloud-observation.mjs";
 
 test("local Drive relay accepts only the existing metadata and signed content URL shapes", () => {
   assert.equal(classifyDriveRelayURL(new URL("https://p01-drivews.icloud.com/retrieveItemDetailsInFolders?dsid=123")), "metadata");
   assert.equal(classifyDriveRelayURL(new URL("https://p01-docws.icloud.com/ws/com.apple.CloudDocs/download/by_id?dsid=123")), "metadata");
+  assert.equal(classifyDriveRelayURL(new URL("https://p01-docws.icloud.com/v1/item/synthetic-item")), "metadata");
+  assert.equal(classifyDriveRelayURL(new URL("https://p01-docws.icloud.com/v1/enumerate/synthetic-folder")), "metadata");
   assert.equal(classifyDriveRelayURL(new URL("https://p01-drivews.icloud.com/unlisted")), null);
   assert.equal(classifyDriveRelayURL(new URL("https://p01-docws.icloud.com/retrieveItemDetailsInFolders")), null);
   const download = new URL("/B/invented-signature/test.bin", "https://cvws.icloud-content.com");
@@ -34,6 +36,45 @@ test("signed content headers preserve multipart framing without forwarding Apple
   assert.equal(headers.has("authorization"), false);
   assert.equal(headers.has("proxy-authorization"), false);
   assert.equal(headers.has("x-apple-session-id"), false);
+});
+
+test("local content relay preserves validated range framing and 330 destinations", () => {
+  const first = new URL("/B/invented-signature/file", "https://cvws.icloud-content.com");
+  first.searchParams.set("token", crypto.randomUUID());
+  const destination = new URL(first); destination.pathname += "-redirected";
+  const request = localAppleContentHeaders({ range: "bytes=1-2", cookie: "private", authorization: "private" });
+  assert.deepEqual([...request], [["range", "bytes=1-2"]]);
+  assert.equal(localAppleContentHeaders({ range: "bytes=1-2,3-4" }).has("range"), false);
+  const response = localAppleDownloadHeaders({ location: destination.href, "retry-after": "1", "content-range": "bytes 1-2/4", "set-cookie": "private", authorization: "private" }, 330, first);
+  assert.equal(response.get("location"), destination.href);
+  assert.equal(response.get("retry-after"), "1");
+  assert.equal(response.get("content-range"), "bytes 1-2/4");
+  assert.equal(response.has("set-cookie"), false);
+  assert.equal(response.has("authorization"), false);
+  assert.equal(localAppleDownloadHeaders({ location: destination.href }, 302, first).has("location"), false);
+  assert.throws(() => localAppleDownloadHeaders({ location: "https://attacker.example/collect" }, 330, first), { code: "PROTOCOL_CHANGED" });
+});
+
+test("shared docws diagnostics redact item identifiers on success and failure", () => {
+  for (const kind of ["item", "enumerate"]) {
+    const url = new URL(`https://p01-docws.icloud.com/v1/${kind}/private-document-identifier`);
+    const response = summarizeAppleResponse(url, 200, {});
+    const failure = summarizeAppleFailure(url, { stage: "headers", status: 503, bytesRead: 0, elapsedMs: 1, timeout: false, aborted: false, error: {} });
+    assert.equal(response.path, `/v1/${kind}/[redacted]`);
+    assert.equal(failure.path, response.path);
+    assert.equal(JSON.stringify([response, failure]).includes("private-document-identifier"), false);
+  }
+});
+
+test("authentication diagnostics retain only known error codes without account details", () => {
+  const summary = summarizeAppleResponse(new URL("https://idmsa.apple.com/appleauth/auth/signin/complete"), 403, {
+    accountName: "private@example.invalid", serviceErrors: [{ code: "-20101", message: "private detail" },
+      { code: -22406, message: "private detail" }, { code: "private identifier", message: "private detail" }],
+    token: "private token",
+  });
+  assert.deepEqual(JSON.parse(JSON.stringify(summary)).authenticationErrorCodes, [-20101, -22406, "other"]);
+  assert.equal(JSON.stringify(summary).includes("private"), false);
+  assert.equal(Object.hasOwn(summarizeAppleResponse(new URL("https://idmsa.apple.com/appleauth/auth/signin/init"), 200, {}), "authenticationErrorCodes"), false);
 });
 
 test("upload allocation diagnostics retain structure without signed URLs or document identities", () => {

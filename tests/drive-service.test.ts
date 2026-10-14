@@ -616,3 +616,104 @@ test("denied Drive access requires explicit approval, preserves Reminders, and n
   assert.equal(writes, 1);
   assert.equal(approvalRequests, 2);
 });
+
+test("docws shared identities survive cold clients, remain encrypted and keep enumeration completeness explicit", async t => {
+  const shared = { ...root, drivewsid: "SHARED_FOLDER::com.apple.CloudDocs::participant", docwsid: "participant", name: "Shared", type: "SHARED_FOLDER", parentId: DRIVE_ROOT, shareID: { recordName: "synthetic-share", ownerRecordName: "synthetic-owner" } };
+  const nested = { ...root, drivewsid: "FOLDER_IN_SHARED_FOLDER::com.apple.CloudDocs::nested", docwsid: "nested", item_id: "private-docws-nested", name: "Nested", parentId: shared.drivewsid };
+  const raw = (item_id: string, name: string, type: string, version = "v1") => ({ item_id, item_info: { name, type, version, size: "3", modified_at: "0", urls: { url_download: syntheticDownloadURL() } } });
+  let wrongIdentity = false;
+  const f = await fixture(t, (url, init) => {
+    if (url.hostname === "cvws.icloud-content.com") return new Response("abc");
+    if (url.pathname === "/v1/item/private-docws-nested") return json(raw(wrongIdentity ? "wrong-document" : "private-docws-nested", "Nested", "FOLDER"));
+    if (url.pathname === "/v1/item/private-docws-file") return json(raw("private-docws-file", "report.txt", "FILE"));
+    if (url.pathname === "/v1/item/private-docws-deeper") return json(raw("private-docws-deeper", "Deeper", "FOLDER"));
+    if (url.pathname === "/v1/enumerate/private-docws-nested") {
+      assert.equal(url.searchParams.get("limit"), "1001");
+      return json({ drive_item: [raw("private-docws-deeper", "Deeper", "FOLDER"), raw("private-docws-file", "report.txt", "FILE")] });
+    }
+    if (url.pathname === "/v1/enumerate/private-docws-deeper") return json({ drive_item: [] });
+    const [entry] = JSON.parse(String(init.body));
+    if (entry.drivewsid === DRIVE_ROOT) return json([{ ...root, items: [shared], directChildrenCount: 1 }]);
+    assert.equal(entry.drivewsid, shared.drivewsid);
+    return json([{ ...shared, items: [nested], directChildrenCount: 1 }]);
+  });
+  const first = await f.service.list({});
+  const context = first.items[0]!.shareContext;
+  const children = await f.service.list({ folderId: shared.drivewsid, shareContext: context });
+  const cold = new DriveService(f.env, owner);
+  const listed = await cold.list({ folderId: children.items[0]!.id, shareContext: context });
+  assert.equal(listed.complete, false);
+  assert.deepEqual(listed.reasons, ["missing_direct_children_count"]);
+  assert.equal(listed.items.length, 2);
+  assert.equal(listed.folder.shareContext, context);
+  const report = listed.items.find(item => item.name === "report.txt")!;
+  assert.equal(JSON.stringify(report).includes("private-docws"), false);
+  assert.equal((await cold.read({ itemId: report.id, shareContext: context })).content, "abc");
+  const deeper = listed.items.find(item => item.type === "folder")!;
+  assert.equal((await cold.list({ folderId: deeper.id, shareContext: context })).items.length, 0);
+  const rows = f.db.sqlite.prepare("SELECT envelope FROM drive_handles WHERE kind = 'share'").all();
+  assert.equal(rows.length, 1, "All mapped descendants reuse one share context.");
+  assert.equal(JSON.stringify(rows).includes("private-docws"), false);
+  await assert.rejects(cold.get({ itemId: report.id }), { code: "VALIDATION_ERROR" });
+  wrongIdentity = true;
+  await assert.rejects(cold.list({ folderId: nested.drivewsid, shareContext: context }), { code: "PROTOCOL_CHANGED" });
+});
+
+test("Drive 423 requires explicit approval without prompting or changing Reminders", async t => {
+  let calls = 0;
+  const f = await fixture(t, () => { calls++; return new Response(null, { status: 423 }); });
+  const before = await f.sessions.load();
+  await assert.rejects(f.service.list({}), { code: "DEVICE_APPROVAL_PENDING" });
+  assert.equal(calls, 1);
+  const after = await f.sessions.load();
+  assert.equal(after.session.services?.drive.state, "DEVICE_APPROVAL_PENDING");
+  assert.deepEqual(after.session.services?.reminders, before.session.services?.reminders);
+  await assert.rejects(f.service.list({}), { code: "DEVICE_APPROVAL_PENDING" });
+  assert.equal(calls, 1, "Another read cannot prompt Apple or replay the rejected request.");
+});
+
+test("private download ranges use single-use handles and validate the exact file size", async t => {
+  const current = file("range.txt", "range", DRIVE_ROOT, 6); let contentRequests = 0;
+  const f = await fixture(t, (url, init) => {
+    if (url.pathname.endsWith("/download/by_id")) return json({ data_token: { url: syntheticDownloadURL() } });
+    if (url.hostname === "cvws.icloud-content.com") {
+      contentRequests++;
+      assert.equal(new Headers(init.headers).get("range"), "bytes=2-5");
+      return new Response("cdef", { status: 206, headers: { "Content-Range": "bytes 2-5/6", "Content-Length": "4" } });
+    }
+    return json({ items: [current] });
+  });
+  for (const range of ["bytes=2-", "bytes=-4", "bytes=2-99"]) {
+    const prepared = await f.service.download({ itemId: current.drivewsid });
+    const response = await f.service.downloadContent(prepared.handleId, undefined, range);
+    assert.equal(response.status, 206);
+    assert.equal(response.headers.get("content-range"), "bytes 2-5/6");
+    assert.equal(response.headers.get("content-length"), "4");
+    assert.equal(await response.text(), "cdef");
+    await assert.rejects(f.service.downloadContent(prepared.handleId, undefined, range), { code: "CONFLICT" });
+  }
+  for (const range of ["bytes=9-", "bytes=0-1,3-4", "bytes=-0", "invalid", "bytes=4-2"]) {
+    const prepared = await f.service.download({ itemId: current.drivewsid });
+    await assert.rejects(f.service.downloadContent(prepared.handleId, undefined, range), { status: 416 });
+  }
+  assert.equal(contentRequests, 3);
+});
+
+test("package tokens download bounded archives without using unpacked sizes as Content-Length", async t => {
+  const current = { ...file("slides.key", "package", DRIVE_ROOT, 1), type: "PACKAGE" }; let contentRequests = 0;
+  const f = await fixture(t, url => {
+    if (url.hostname === "cvws.icloud-content.com") { contentRequests++; return new Response("synthetic archive", { headers: { "Content-Type": "application/zip" } }); }
+    if (url.pathname.endsWith("/download/by_id")) return json({ package_token: { url: syntheticDownloadURL() } });
+    return json({ items: [current] });
+  });
+  await assert.rejects(f.service.read({ itemId: current.drivewsid }), { code: "UNSUPPORTED_FEATURE" });
+  const prepared = await f.service.download({ itemId: current.drivewsid });
+  assert.equal(prepared.item.package, true);
+  const response = await f.service.downloadContent(prepared.handleId);
+  assert.equal(response.headers.has("content-length"), false);
+  assert.ok(response.headers.get("content-disposition")!.includes("slides.key.zip"));
+  assert.equal(await response.text(), "synthetic archive");
+  const ranged = await f.service.download({ itemId: current.drivewsid });
+  await assert.rejects(f.service.downloadContent(ranged.handleId, undefined, "bytes=0-0"), { code: "UNSUPPORTED_FEATURE" });
+  assert.equal(contentRequests, 1);
+});

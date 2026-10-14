@@ -119,7 +119,7 @@ test("Drive approval uses the common cookie jar and lease while Reminders is pen
       assert.ok(path.endsWith("requestPCS"));
       assert.deepEqual(JSON.parse(String(init?.body)), { appName: "iclouddrive", derivedFromUserAction: pcsCalls !== 1 });
       if (pcsCalls++ === 0) return Response.json({ message: "Cookies not available yet on server." });
-      return Response.json({ status: "success" }, { headers: { "set-cookie": "synthetic-drive-pcs=synthetic-pcs; Domain=icloud.com; Secure; Path=/" } });
+      return Response.json({ status: "success" }, { headers: { "set-cookie": "X-APPLE-WEBAUTH-PCS-Documents=synthetic-pcs; Domain=icloud.com; Secure; Path=/" } });
     };
     const local = await f.service.status();
     assert.equal(local.accountConnected, true);
@@ -318,6 +318,28 @@ test("revoking write access or changing its revision during the final session co
       assert.equal(saved.fence.generation, before.fence.generation);
       assert.equal(saved.fence.version, before.fence.version + 2, "The completed session commit remains durable.");
       assert.deepEqual(saved.session.login, before.session.login);
+    } finally { globalThis.fetch = nativeFetch; f.db.sqlite.close(); }
+  }
+});
+
+test("Drive approval success without a usable scoped Documents cookie remains pending", async () => {
+  for (const cookie of [undefined, "X-APPLE-WEBAUTH-PCS-Photos=synthetic; Domain=icloud.com; Path=/; Secure", "X-APPLE-WEBAUTH-PCS-Documents=synthetic; Path=/; Secure", "X-APPLE-WEBAUTH-PCS-Documents=synthetic; Domain=icloud.com; Path=/other; Secure", "X-APPLE-WEBAUTH-PCS-Documents=synthetic; Domain=icloud.com; Path=/; Secure; Max-Age=0"]) {
+    const original = session();
+    original.services = { version: 1, reminders: { state: "READY" }, drive: { state: "CONSENT_REQUIRED", connection: drive() } };
+    const f = await fixture(original), nativeFetch = globalThis.fetch;
+    try {
+      await settingsWithDrive(f);
+      let calls = 0;
+      globalThis.fetch = async url => {
+        calls++;
+        return String(url).includes("requestWebAccessState") ? Response.json({ isICDRSDisabled: true, isDeviceConsentedForPCS: true }) :
+          Response.json({ status: "success" }, cookie ? { headers: { "set-cookie": cookie } } : undefined);
+      };
+      const status = await f.service.approveDrive(f.generation);
+      assert.equal(status.services.drive.ready, false);
+      assert.equal(status.services.drive.action, "wait-for-drive-keys");
+      assert.equal(calls, 2);
+      assert.deepEqual((await f.repository.load()).session.services?.reminders, original.services.reminders);
     } finally { globalThis.fetch = nativeFetch; f.db.sqlite.close(); }
   }
 });

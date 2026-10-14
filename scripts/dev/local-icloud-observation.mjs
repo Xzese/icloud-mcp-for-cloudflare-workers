@@ -18,6 +18,21 @@ export function localAppleContentHeaders(input) {
     const value = incoming.get(name);
     if (value !== null) headers.set(name, value);
   }
+  const range = incoming.get("range");
+  if (range !== null && /^bytes=\d+-\d+$/.test(range)) headers.set("range", range);
+  return headers;
+}
+
+export function localAppleDownloadHeaders(input, status, requestURL) {
+  const incoming = new Headers(input), headers = new Headers();
+  for (const name of ["content-type", "content-length", "content-range", "etag", "last-modified", "retry-after"]) {
+    const value = incoming.get(name);
+    if (value !== null) headers.set(name, value);
+  }
+  if (status === 330 && incoming.has("location")) {
+    const destination = driveContentURL(new URL(incoming.get("location"), requestURL).href, "download");
+    headers.set("location", destination.href);
+  }
   return headers;
 }
 
@@ -35,9 +50,12 @@ export function classifyDriveRelayURL(url) {
 }
 
 export { DRIVE_MAX_METADATA_BYTES, DRIVE_MAX_TRANSFER_BYTES, DRIVE_TRANSFER_TIMEOUT_MS };
+function observationPath(url) {
+  return url.pathname.replace(/^\/v1\/(item|enumerate)\/[^/]+$/, "/v1/$1/[redacted]");
+}
 export function summarizeAppleFailure(url, { stage, status, bytesRead, elapsedMs, timeout, aborted, error }) {
   return {
-    at: new Date().toISOString(), host: url.hostname, path: url.pathname, event: "local-apple-request-failed",
+    at: new Date().toISOString(), host: url.hostname, path: observationPath(url), event: "local-apple-request-failed",
     stage: ["headers", "body", "observation"].includes(stage) ? stage : "unknown",
     status: Number.isInteger(status) && status >= 100 && status <= 599 ? status : null,
     bytesRead: Number.isSafeInteger(bytesRead) && bytesRead >= 0 ? bytesRead : null,
@@ -46,7 +64,15 @@ export function summarizeAppleFailure(url, { stage, status, bytesRead, elapsedMs
   };
 }
 export function summarizeAppleResponse(url, status, body) {
-  const result = { at: new Date().toISOString(), host: url.hostname, path: url.pathname, status };
+  const result = { at: new Date().toISOString(), host: url.hostname, path: observationPath(url), status };
+  if (url.hostname === "idmsa.apple.com" && url.pathname.startsWith("/appleauth/auth/") && status >= 400) {
+    const errors = Array.isArray(body?.serviceErrors) ? body.serviceErrors.slice(0, 8) : [];
+    const known = new Set([-20101, -20209, -22406, -21668, -21669]);
+    result.authenticationErrorCodes = errors.map(error => {
+      const code = typeof error?.code === "string" && /^-\d{5}$/.test(error.code) ? Number(error.code) : error?.code;
+      return known.has(code) ? code : "other";
+    });
+  }
   if (/^p\d{1,3}-docws\.icloud\.com$/.test(url.hostname) && url.pathname === "/ws/com.apple.CloudDocs/upload/web") {
     result.allocationShape = Array.isArray(body) ? "array" : body === null ? "null" : typeof body;
     const entries = Array.isArray(body) ? body.slice(0, 2) : [body];

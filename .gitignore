@@ -46,6 +46,7 @@ next-env.d.ts
 /.sites-runtime/
 /.agents/
 /.codex/
+.repowise/
 /outputs/
 /work/
 /release/

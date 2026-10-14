@@ -162,6 +162,66 @@
           "role": "Request and owner-resolution test reference"
         }
       ]
+    },
+    {
+      "repository": "https://github.com/rclone/rclone",
+      "revision": "cf7cdbc49f902ba0e979de31f8c7d24ed1d52faf",
+      "license": "MIT",
+      "copyright": "Copyright (C) 2012 by Nick Craig-Wood",
+      "role": "Fresh sign-in context and account preflight, Drive PCS cookie verification, read pacing/retry and package/range/330 download protocol reference; no Go runtime",
+      "files": [
+        {
+          "path": "backend/iclouddrive/api/session.go",
+          "sha256": "5d47500aff4300f9381f9123676c7f59caf33c8c1ea1adce55e6fc58ed5dc580",
+          "destinations": [
+            "src/auth/apple/http.ts",
+            "src/auth/apple/flow.ts",
+            "src/auth/apple/pcs.ts"
+          ]
+        },
+        {
+          "path": "backend/iclouddrive/api/client.go",
+          "destinations": [
+            "src/icloud/drive.ts",
+            "src/drive/service.ts"
+          ]
+        },
+        {
+          "path": "backend/iclouddrive/api/drive.go",
+          "destinations": [
+            "src/transport/drive-http.ts",
+            "src/icloud/drive.ts"
+          ]
+        },
+        {
+          "path": "backend/iclouddrive/iclouddrive.go",
+          "destinations": [
+            "src/transport/drive-http.ts"
+          ]
+        }
+      ]
+    },
+    {
+      "repository": "https://github.com/shadow-enthusiast/rclone",
+      "revision": "c0024a411a983937948db4e4b594c7550cd7a1bc",
+      "license": "MIT",
+      "copyright": "Copyright (C) 2012 by Nick Craig-Wood",
+      "role": "Unmerged upstream PR #9487 read-only docws shared enumeration/item identity reference; shared writes and CloudDocs record mutations not ported",
+      "files": [
+        {
+          "path": "backend/iclouddrive/api/drive.go",
+          "destinations": [
+            "src/icloud/drive.ts"
+          ]
+        },
+        {
+          "path": "backend/iclouddrive/iclouddrive.go",
+          "destinations": [
+            "src/icloud/drive.ts",
+            "src/drive/shared.ts"
+          ]
+        }
+      ]
     }
   ],
   "fixtureGenerator": "tests/fixtures/generate.py",

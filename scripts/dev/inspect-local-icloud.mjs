@@ -1,7 +1,8 @@
 // Agent-side read-only diagnostics through the normal local HTTP boundary.
 // Cookies stay in memory; tool summaries contain no Apple content or tokens.
 import http from "node:http";
-const origin = "http://127.0.0.1:5173";
+import { localPort } from "./local-icloud-state.mjs";
+const origin = `http://127.0.0.1:${localPort()}`;
 const [command = "status", option] = process.argv.slice(2);
 if (!["status", "discover", "read-test", "write-shapes", "current-lists", "lookup-lists", "shared-lists", "saved-lists", "batch-read", "mcp-open-reminders", "mcp-all-open-reminders"].includes(command)) throw new Error("Use status, discover, current-lists, saved-lists, lookup-lists <List/id ...>, or read-test.");
 if (command === "read-test" && option !== undefined && option !== "open") throw new Error("Use read-test [open].");

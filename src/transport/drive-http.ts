@@ -27,10 +27,11 @@ const DRIVE_METADATA_PATHS = new Set([
 
 export function validateDriveMetadataURL(value: URL): URL {
   const supportedHost = /^p\d+-drivews\.icloud\.com$/.test(value.hostname) || /^p\d+-docws\.icloud\.com$/.test(value.hostname);
+  const docwsRead = /^\/v1\/(?:item|enumerate)\/[A-Za-z0-9._:-]{1,512}$/.test(value.pathname);
   const sharedDownload = /^\/ws\/com\.apple\.CloudDocs\/download\/by_id\/[A-Za-z0-9._-]{1,256}$/.test(value.pathname);
-  if (value.protocol !== "https:" || !supportedHost || value.username || value.password || value.port || value.hash || !DRIVE_METADATA_PATHS.has(value.pathname) && !sharedDownload) return protocol("The iCloud Drive metadata address is outside the supported service endpoints.");
-  if (value.hostname.endsWith("-drivews.icloud.com") && value.pathname.startsWith("/ws/")) return protocol("The iCloud Drive operation used an endpoint on the wrong service host.");
-  if (value.hostname.endsWith("-docws.icloud.com") && !value.pathname.startsWith("/ws/com.apple.CloudDocs/")) return protocol("The iCloud Drive operation used an endpoint on the wrong service host.");
+  if (value.protocol !== "https:" || !supportedHost || value.username || value.password || value.port || value.hash || !DRIVE_METADATA_PATHS.has(value.pathname) && !sharedDownload && !docwsRead) return protocol("The iCloud Drive metadata address is outside the supported service endpoints.");
+  if (value.hostname.endsWith("-drivews.icloud.com") && (value.pathname.startsWith("/ws/") || docwsRead)) return protocol("The iCloud Drive operation used an endpoint on the wrong service host.");
+  if (value.hostname.endsWith("-docws.icloud.com") && !value.pathname.startsWith("/ws/com.apple.CloudDocs/") && !docwsRead) return protocol("The iCloud Drive operation used an endpoint on the wrong service host.");
   return value;
 }
 
@@ -60,22 +61,29 @@ function timeoutSignal(signal?: AbortSignal): { signal: AbortSignal; dispose: ()
   return { signal: controller.signal, dispose: () => { clearTimeout(timer); signal?.removeEventListener("abort", cancel); } };
 }
 
-async function readBounded(response: Response, limit: number): Promise<Uint8Array> {
+async function readBounded(response: Response, limit: number, signal?: AbortSignal): Promise<Uint8Array> {
   const length = response.headers.get("content-length");
-  if (length !== null && (!/^\d+$/.test(length) || Number(length) > limit)) protocol("The Apple metadata response exceeded its byte budget.");
+  if (length !== null && (!/^\d+$/.test(length) || Number(length) > limit)) {
+    await response.body?.cancel(); protocol("The Apple metadata response exceeded its byte budget.");
+  }
   if (!response.body) return new Uint8Array();
   const reader = response.body.getReader();
+  const abort = () => { void reader.cancel(signal?.reason).catch(() => {}); };
+  signal?.addEventListener("abort", abort, { once: true });
+  if (signal?.aborted) abort();
   const chunks: Uint8Array[] = [];
   let size = 0;
   try {
     for (;;) {
       const part = await reader.read();
+      if (signal?.aborted) throw signal.reason;
       if (part.done) break;
       size += part.value.byteLength;
       if (size > limit) protocol("The Apple metadata response exceeded its byte budget.");
       chunks.push(part.value);
     }
   } finally {
+    signal?.removeEventListener("abort", abort);
     try { await reader.cancel(); } catch { /* Body already closed. */ }
     reader.releaseLock();
   }
@@ -85,62 +93,134 @@ async function readBounded(response: Response, limit: number): Promise<Uint8Arra
   return bytes;
 }
 
+export interface DriveByteRange { start: number; end: number; total?: number; }
+const READ_RETRY_STATUSES = new Set([408, 429, 500, 502, 503, 504]);
+const METADATA_BUDGET_MS = 8000;
+
+function delayFor(headers: Headers, attempt: number): number {
+  const raw = headers.get("retry-after");
+  if (raw !== null) {
+    const ms = /^\d+(?:\.\d+)?$/.test(raw) ? Number(raw) * 1000 : Date.parse(raw) - Date.now();
+    if (Number.isFinite(ms)) return Math.max(0, ms);
+  }
+  return 250 * 2 ** attempt;
+}
+function pause(ms: number, signal: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal.aborted) { reject(signal.reason); return; }
+    const abort = () => { clearTimeout(timer); reject(signal.reason); };
+    const timer = setTimeout(() => { signal.removeEventListener("abort", abort); resolve(); }, ms);
+    signal.addEventListener("abort", abort, { once: true });
+  });
+}
+function readMetadata(url: URL, method: string): boolean {
+  return method === "POST" && ["/retrieveItemDetails", "/retrieveItemDetailsInFolders"].includes(url.pathname) ||
+    method === "GET" && (/^\/v1\/(?:item|enumerate)\//.test(url.pathname) || /^\/ws\/com\.apple\.CloudDocs\/download\/by_id(?:\/|$)/.test(url.pathname));
+}
+
 export class DriveHTTP {
   private readonly http: AppleHTTP;
   constructor(http: AppleHTTP) { this.http = http; }
 
+  private nextReadAt = 0;
   async metadata(url: URL, init: { method: "GET" | "POST"; body?: string; signal?: AbortSignal }): Promise<{ status: number; bytes: Uint8Array }> {
     url = validateDriveMetadataURL(url);
-    const headers = new Headers({ Accept: "application/json", Origin: "https://www.icloud.com", Referer: "https://www.icloud.com/", "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.3.1 Safari/605.1.15" });
-    if (init.body !== undefined) headers.set("Content-Type", "application/json");
-    headers.delete("authorization");
-    headers.delete("cookie");
-    const cookie = this.http.jar.header(url);
-    if (cookie) headers.set("cookie", cookie);
+    const readonly = readMetadata(url, init.method);
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 8000);
+    const deadline = Date.now() + METADATA_BUDGET_MS;
+    const timer = setTimeout(() => controller.abort(), METADATA_BUDGET_MS);
     const cancel = () => controller.abort(init.signal?.reason);
     if (init.signal?.aborted) cancel();
     else init.signal?.addEventListener("abort", cancel, { once: true });
     try {
-      const response = await this.http.send(url, { method: init.method, headers, ...(init.body === undefined ? {} : { body: init.body }), redirect: "manual", signal: controller.signal });
-      if (response.headers.has("set-cookie") && typeof response.headers.getSetCookie !== "function") throw new AppError("UNSUPPORTED_FEATURE", "This runtime cannot preserve separate Apple cookies.");
-      for (const line of response.headers.getSetCookie?.() ?? []) this.http.jar.set(line, url);
-      if ([301, 302, 303, 307, 308].includes(response.status)) {
-        await response.body?.cancel();
-        throw new AppError("PROTOCOL_CHANGED", "iCloud Drive requested a redirect; the operation was stopped.");
+      for (let attempt = 0; ; attempt++) {
+        if (controller.signal.aborted) throw controller.signal.reason;
+        if (readonly) {
+          await pause(Math.max(0, this.nextReadAt - Date.now()), controller.signal);
+          this.nextReadAt = Date.now() + 100;
+        }
+        const headers = new Headers({ Accept: "application/json", Origin: "https://www.icloud.com", Referer: "https://www.icloud.com/", "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.3.1 Safari/605.1.15" });
+        if (init.body !== undefined) headers.set("Content-Type", "application/json");
+        const cookie = this.http.jar.header(url);
+        if (cookie) headers.set("cookie", cookie);
+        let response: Response;
+        try { response = await this.http.send(url, { method: init.method, headers, ...(init.body === undefined ? {} : { body: init.body }), redirect: "manual", signal: controller.signal }); }
+        catch (error) {
+          // Permission/lease failures and aborts are never replayed. Only reads
+          // may retry a transport failure, within the original request deadline.
+          if (!readonly || error instanceof AppError || controller.signal.aborted || attempt >= 2) throw error;
+          await pause(250 * 2 ** attempt, controller.signal); continue;
+        }
+        if (response.headers.has("set-cookie") && typeof response.headers.getSetCookie !== "function") throw new AppError("UNSUPPORTED_FEATURE", "This runtime cannot preserve separate Apple cookies.");
+        for (const line of response.headers.getSetCookie?.() ?? []) this.http.jar.set(line, url);
+        if ([301, 302, 303, 307, 308].includes(response.status)) {
+          await response.body?.cancel();
+          throw new AppError("PROTOCOL_CHANGED", "iCloud Drive requested a redirect; the operation was stopped.");
+        }
+        const delay = delayFor(response.headers, attempt);
+        if (readonly && attempt < 2 && READ_RETRY_STATUSES.has(response.status) && Date.now() + delay < deadline) {
+          await response.body?.cancel(); await pause(delay, controller.signal); continue;
+        }
+        return { status: response.status, bytes: await readBounded(response, DRIVE_MAX_METADATA_BYTES, controller.signal) };
       }
-      return { status: response.status, bytes: await readBounded(response, DRIVE_MAX_METADATA_BYTES) };
     } catch (error) {
       if (error instanceof AppError) throw error;
       throw new AppError("UPSTREAM_UNAVAILABLE", "The iCloud Drive request could not complete within its request budget.", 503, true);
-    } finally {
-      clearTimeout(timer);
-      init.signal?.removeEventListener("abort", cancel);
-    }
+    } finally { clearTimeout(timer); init.signal?.removeEventListener("abort", cancel); }
   }
 
-  async download(urlValue: string, signal?: AbortSignal): Promise<Response> {
-    const url = driveContentURL(urlValue, "download");
-    const budget = timeoutSignal(signal);
+  async download(urlValue: string, signal?: AbortSignal, range?: DriveByteRange): Promise<Response> {
+    let url = driveContentURL(urlValue, "download");
+    if (range && (!Number.isSafeInteger(range.start) || !Number.isSafeInteger(range.end) || range.start < 0 || range.end < range.start || range.end >= DRIVE_MAX_TRANSFER_BYTES)) throw new AppError("VALIDATION_ERROR", "The Drive byte range is invalid.", 400);
+    const budget = timeoutSignal(signal), deadline = Date.now() + METADATA_BUDGET_MS;
+    const visited = new Set([url.href]);
+    let attempt = 0, redirects = 0;
     try {
-      const response = await this.http.send(url, { method: "GET", headers: { Accept: "*/*" }, redirect: "manual", signal: budget.signal });
-      if ([301, 302, 303, 307, 308].includes(response.status)) {
-        await response.body?.cancel();
-        throw new AppError("PROTOCOL_CHANGED", "The iCloud Drive content server requested a redirect.");
+      let response: Response;
+      for (;;) {
+        if (budget.signal.aborted) throw budget.signal.reason;
+        const headers = new Headers({ Accept: "*/*", ...(range ? { Range: `bytes=${range.start}-${range.end}` } : {}) });
+        try { response = await this.http.send(url, { method: "GET", headers, redirect: "manual", signal: budget.signal }); }
+        catch (error) {
+          if (error instanceof AppError || budget.signal.aborted || attempt >= 2 || Date.now() + 250 * 2 ** attempt >= deadline) throw error;
+          await pause(250 * 2 ** attempt++, budget.signal); continue;
+        }
+        // Apple's nonstandard 330 is the only supported redirect. Validate each
+        // destination, bound the chain, and send neither cookies nor auth headers.
+        if (response.status === 330) {
+          const location = response.headers.get("location");
+          await response.body?.cancel();
+          if (!location || ++redirects > 3) protocol("The Apple download redirect chain is invalid.");
+          let destination: URL;
+          try { destination = new URL(location, url); } catch { return protocol("Apple returned an invalid download redirect address."); }
+          url = driveContentURL(destination.href, "download");
+          if (visited.has(url.href)) protocol("The Apple download redirect chain repeated an address.");
+          visited.add(url.href); continue;
+        }
+        if ([301, 302, 303, 307, 308].includes(response.status)) {
+          await response.body?.cancel(); protocol("The iCloud Drive content server requested an unsupported redirect.");
+        }
+        const delay = delayFor(response.headers, attempt);
+        if (attempt < 2 && READ_RETRY_STATUSES.has(response.status) && Date.now() + delay < deadline) {
+          await response.body?.cancel(); await pause(delay, budget.signal); attempt++; continue;
+        }
+        break;
       }
-      if (response.status < 200 || response.status >= 300) {
+      if (response.status !== 200 && response.status !== 206) {
         await response.body?.cancel();
-        throw new AppError("UPSTREAM_UNAVAILABLE", "The iCloud Drive file content could not be downloaded.", 502, false);
+        throw new AppError(response.status === 429 ? "RATE_LIMITED" : "UPSTREAM_UNAVAILABLE", "The iCloud Drive file content could not be downloaded.", response.status === 429 ? 429 : 502, READ_RETRY_STATUSES.has(response.status));
       }
+      const limit = range ? range.end - range.start + 1 : DRIVE_MAX_TRANSFER_BYTES;
       const length = response.headers.get("content-length");
-      if (length !== null && (!/^\d+$/.test(length) || Number(length) > DRIVE_MAX_TRANSFER_BYTES)) {
-        await response.body?.cancel();
-        protocol("The iCloud Drive file exceeded the transfer byte budget.");
-      }
-      if (!response.body) { budget.dispose(); return new Response(null, { status: 200, headers: safeContentHeaders(response.headers) }); }
-      const body = boundedStream(response.body, DRIVE_MAX_TRANSFER_BYTES, budget.signal, budget.dispose);
-      return new Response(body, { status: 200, headers: safeContentHeaders(response.headers) });
+      try {
+        if (range) {
+          const match = /^bytes (\d+)-(\d+)\/(\d+)$/.exec(response.headers.get("content-range") ?? "");
+          if (response.status !== 206 || !match || Number(match[1]) !== range.start || Number(match[2]) !== range.end || !Number.isSafeInteger(Number(match[3])) || Number(match[3]) <= range.end || Number(match[3]) > DRIVE_MAX_TRANSFER_BYTES || range.total !== undefined && Number(match[3]) !== range.total) protocol("Apple returned a different or unsupported download byte range.");
+        } else if (response.status === 206 || response.headers.has("content-range")) protocol("Apple returned an unsolicited partial download.");
+        if (length !== null && (!/^\d+$/.test(length) || Number(length) > limit || range && Number(length) !== limit)) protocol("The iCloud Drive file exceeded its transfer byte budget or range.");
+      } catch (error) { await response.body?.cancel(); throw error; }
+      if (!response.body) { budget.dispose(); return new Response(null, { status: response.status, headers: safeContentHeaders(response.headers) }); }
+      return new Response(boundedStream(response.body, limit, budget.signal, budget.dispose), { status: response.status, headers: safeContentHeaders(response.headers) });
     } catch (error) {
       budget.dispose();
       if (error instanceof AppError) throw error;
@@ -190,7 +270,7 @@ export class DriveHTTP {
         await response.body?.cancel();
         throw new AppError("UPSTREAM_UNAVAILABLE", "The iCloud Drive upload server rejected the content transfer.", 502, false);
       }
-      return await readBounded(response, DRIVE_MAX_METADATA_BYTES);
+      return await readBounded(response, DRIVE_MAX_METADATA_BYTES, budget.signal);
     } catch (error) {
       await reader.cancel(error).catch(() => {});
       if (error instanceof AppError) throw error;

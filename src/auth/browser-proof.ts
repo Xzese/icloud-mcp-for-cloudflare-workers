@@ -13,8 +13,8 @@ export class BrowserSrpProof {
   private used = false;
   readonly accountName: string;
   constructor(accountName: string) {
-    this.accountName = accountName;
-    if (!ACCOUNT.safeParse(accountName).success) { this.clear(); throw new AppError("VALIDATION_ERROR", "Enter a supported Apple account identifier."); }
+    this.accountName = accountName.toLowerCase();
+    if (!ACCOUNT.safeParse(accountName).success || !ACCOUNT.safeParse(this.accountName).success) { this.clear(); throw new AppError("VALIDATION_ERROR", "Enter a supported Apple account identifier."); }
   }
   publicA() {
     if (!this.ephemeral || this.used) throw new AppError("AUTH_EXPIRED", "Restart Apple sign-in.", 409);
