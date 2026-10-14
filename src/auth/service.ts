@@ -7,7 +7,7 @@ import { enabledToolNames } from "../services/tool-registry.ts";
 import { effectiveServiceStatus, requireDriveConnection, requireRemindersConnection, requireServiceReady, sessionServices, type AppleServices } from "./apple/services.ts";
 import { CreateListInput, RenameListInput, DeleteListInput, buildCreateList, buildRenameList, buildDeleteList, buildUpdateListAppearance, requireMutableList, type ListOperation, type ListWrite } from "../reminders/list-writes.ts";
 import { canonicalNativeJSONField, readListAppearance, UpdateListAppearanceRequest } from "../reminders/list-appearance.ts";
-import { AppError, WriteOutcomeUnknownError } from "../errors.ts";
+import { AppError, InspectionReadError, WriteOutcomeUnknownError } from "../errors.ts";
 import { omitField } from "../lib/omit-field.ts";
 import { stableNativePresentation } from "../lib/native-presentation.ts";
 import type { RuntimeEnv } from "../platform/sites.ts";
@@ -21,6 +21,7 @@ import { AppleSessionRenewal, appleRequestBudget, appleSuccess, renewalCheckpoin
 import { appleDisabledMessage, appleGates, requireAppleEnabled } from "./gates.ts";
 import { accountScope, canonicalJSON, fingerprint, jsonBytes } from "../lib/canonical.ts";
 import { attachEarlyReminderWitness, loadSchedulingGraph, type SchedulingGraph } from "../reminders/linked-records.ts";
+import { absoluteDatePairShape } from "../reminders/linked-date.ts";
 import { earlyReminderPayload } from "../reminders/early-reminder.ts";
 import { planReminderUpdate } from "../reminders/mutation-plan.ts";
 import { PrepareUpdateInput, PreparedUpdateInput, createPreparation, checkPreparation, preparationContext } from "../reminders/preparation.ts";
@@ -523,12 +524,21 @@ export class AppleConnectionService {
       const record = omitField(normalizeReminder(current, client.remindersZoneOwner, true), "raw");
       if (record.listId !== input.listId) throw new AppError("FORBIDDEN", "The reminder does not belong to the requested list. Use get_reminder for detached deletion recovery.", 403);
       if (!record.recordChangeTag || record.deleted !== false) throw new AppError("CONFLICT", "Inspection requires a current nondeleted reminder. Use get_reminder for deletion recovery.", 409);
-      const details = await inspectReminder(client, current, list, client.remindersZoneOwner!, input);
-      const result = { generation: fence.generation, record, ...details };
-      if (jsonBytes(result) > 262_144) throw new AppError("UNSUPPORTED_FEATURE", "The expanded reminder exceeds the inspection response budget.");
-      await repository.commitResume(fence, appleSuccess({ ...saved.session, connection: { ...saved.session.connection, remindersZoneOwner: client.remindersZoneOwner }, auth: http.snapshot() }), "READY");
-      return result;
-    });
+      const started = Date.now();
+      try {
+        const details = await inspectReminder(client, current, list, client.remindersZoneOwner!, input);
+        const result = { generation: fence.generation, record, ...details };
+        if (jsonBytes(result) > 262_144) throw new AppError("UNSUPPORTED_FEATURE", "The expanded reminder exceeds the inspection response budget.");
+        await repository.commitResume(fence, appleSuccess({ ...saved.session, connection: { ...saved.session.connection, remindersZoneOwner: client.remindersZoneOwner }, auth: http.snapshot() }), "READY");
+        return result;
+      } catch (error) {
+        if (!(error instanceof AppError) || !["CONFLICT", "PROTOCOL_CHANGED", "UNSUPPORTED_FEATURE"].includes(error.code)) throw error;
+        throw new InspectionReadError(error, { elapsedMs: Date.now() - started,
+          requests: client.readTrace.slice(0, 40).map(trace => ({ path: trace.path, elapsedMs: trace.elapsedMs,
+            records: trace.response.returnedRecords, recordTypes: trace.response.recordTypes,
+            continuation: trace.response.continuationPresent })) });
+      }
+    }, appleRequestBudget(60_000), 60_000);
   }
   async prepareUpdate(value: unknown) {
     const parsed = PrepareUpdateInput.safeParse(value);
@@ -551,6 +561,7 @@ export class AppleConnectionService {
       const reminder = normalizeReminder(current, client.remindersZoneOwner);
       return { generation: input.expectedGeneration, supported: plan.supported, classification: plan.classification, before: plan.before, after: plan.after,
         linkedFeatures: { alarms: reminder.alarmIds?.length ?? 0, recurrenceRules: reminder.recurrenceRuleIds?.length ?? 0, graphComplete: graph.complete },
+        datePairShape: absoluteDatePairShape(graph, client.remindersZoneOwner!),
         unsupportedReason: plan.unsupportedReason, preparationToken: token, expiresAt: token ? expiresAt : null, operationCount: plan.operationCount,
         message: "Preparation is not user authorization. No reminder was modified. Supported scheduling recipes are validated against the exact current linked graph; unknown recipes are explicitly unsupported." };
     });
@@ -993,7 +1004,7 @@ export class AppleConnectionService {
         return { generation: fence.generation, operation: input.action, replayed, record, writesEnabled: true,
           ...(affectedRecords ? { affectedRecords: affectedRecords.map(record => omitField(normalizeReminder(record, owner, true), "raw")) } : {}),
           ...(input.action === "create" ? { idempotencyKey: input.idempotencyKey } : {}) };
-      });
+      }, appleRequestBudget(input.action === "complete" && !hooks ? 60_000 : 40_000), input.action === "complete" && !hooks ? 60_000 : 30_000);
     } catch (error) {
       if (applied || error instanceof WriteOutcomeUnknownError) throw new WriteOutcomeUnknownError(targetId, input.action === "create" ? input.idempotencyKey : undefined);
       throw error;
@@ -1552,7 +1563,7 @@ export class AppleConnectionService {
     }
   }
 
-  private async operation<T>(expectedGeneration: number, mode: OperationMode, run: (http: AppleAuthHTTP, saved: Awaited<ReturnType<AppleSessionRepository["load"]>>, repository: AppleSessionRepository, fence: ResumeFence, stage: OperationStage) => Promise<T>, budget = appleRequestBudget()) {
+  private async operation<T>(expectedGeneration: number, mode: OperationMode, run: (http: AppleAuthHTTP, saved: Awaited<ReturnType<AppleSessionRepository["load"]>>, repository: AppleSessionRepository, fence: ResumeFence, stage: OperationStage) => Promise<T>, budget = appleRequestBudget(), readLeaseMs: 30_000 | 60_000 = 30_000) {
     requireAppleEnabled(this.env);
     const permission = mode === "mutation-preparation" ? "reminders.write" : "reminders.read";
     const preferences = mode === "pcs" ? null : await this.requirePermission(permission);
@@ -1566,7 +1577,7 @@ export class AppleConnectionService {
       if (mode === "pcs" && sessionServices(saved.session, saved.state, saved.action).reminders.state === "DEVICE_APPROVAL_PENDING" && Date.now() < saved.session.pcs.nextAttemptAt) throw new AppError("RATE_LIMITED", "Wait until the displayed retry time before checking approval.", 429, true);
       requireRemindersConnection(saved.session);
       if (mode !== "pcs") requireServiceReady(saved.session, saved.state, "reminders", saved.action);
-      const fence = mode === "pcs" ? await repository.claimRenewal(expectedGeneration, saved.fence.version) : await repository.claimRead(expectedGeneration, saved.fence.version);
+      const fence = mode === "pcs" ? await repository.claimRenewal(expectedGeneration, saved.fence.version) : await repository.claimRead(expectedGeneration, saved.fence.version, readLeaseMs);
       // Each upstream read is checked again, including multi-page preparation.
       const send: typeof fetch = async (input, init) => {
         if (mode !== "pcs") {

@@ -115,9 +115,10 @@ test("relationship inventory query and lookup project parent links without remin
   const reply = (request: CapturedRequest) => {
     assert.deepEqual(request.body.desiredKeys, ["List", "ParentReminder", "Deleted"]);
     if (request.url.pathname.endsWith("/records/query")) {
-      const query = request.body.query as { recordType: string; filterBy: { fieldName: string }[] };
-      assert.equal(query.recordType, "Reminder");
-      assert.deepEqual(query.filterBy.map(field => field.fieldName), ["List"]);
+      const query = request.body.query as { recordType: string; filterBy: { fieldName: string; fieldValue: { value: unknown } }[] };
+      assert.equal(query.recordType, "reminderList");
+      assert.equal(query.filterBy.find(field => field.fieldName === "includeCompleted")?.fieldValue.value, 1);
+      assert.equal(query.filterBy.find(field => field.fieldName === "LookupValidatingReference")?.fieldValue.value, 0);
     }
     return { records: [{ ...projected, fields: { List: projected.fields.List, Deleted: { type: "INT64", value: 0 },
       ParentReminder: { type: "REFERENCE", value: { recordName: "Reminder/PARENT", action: "VALIDATE" } } } }] };

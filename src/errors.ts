@@ -35,6 +35,20 @@ export class ListMembershipError extends AppError {
   }
 }
 
+export interface InspectionReadDiagnostics {
+  elapsedMs: number;
+  requests: { path: string; elapsedMs: number; records: number; recordTypes: Record<string, number>; continuation: boolean }[];
+}
+
+/** Bounded timing and counts from an already-authorized read, never trace bodies. */
+export class InspectionReadError extends AppError {
+  readonly inspectionDiagnostics: InspectionReadDiagnostics;
+  constructor(error: AppError, diagnostics: InspectionReadDiagnostics) {
+    super(error.code, error.message, error.status, error.retryable);
+    this.inspectionDiagnostics = diagnostics;
+  }
+}
+
 export class WriteOutcomeUnknownError extends AppError {
   readonly reminderId: string;
   readonly listId?: string;
@@ -55,6 +69,7 @@ export function publicError(error: unknown, requestId: string) {
   );
   return { code: e.code, message: e.message, retryable: e.retryable, requestId,
     ...(e instanceof ListMembershipError ? { membershipDiagnostics: e.membershipDiagnostics } : {}),
+    ...(e instanceof InspectionReadError ? { inspectionDiagnostics: e.inspectionDiagnostics } : {}),
     ...(e instanceof WriteOutcomeUnknownError ? { ...(e.listId ? { listId: e.listId } : { reminderId: e.reminderId }), ...(e.idempotencyKey ? { idempotencyKey: e.idempotencyKey } : {}) } : {}) };
 }
 

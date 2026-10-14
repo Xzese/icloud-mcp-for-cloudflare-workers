@@ -36,7 +36,7 @@ const RECORD_TYPES = new Set(["List", "Reminder", "Alarm", "AlarmTrigger", "Atta
 const LIST_SUMMARY_KEYS = ["Name", "Color", "Count", "IsGroup", "Deleted"];
 const SEARCH_REMINDER_KEYS = ["List", "ParentReminder", "TitleDocument", "NotesDocument", "Completed", "CompletionDate", "DueDate", "StartDate", "Priority", "Flagged", "AllDay", "Deleted", "TimeZone", "AlarmIDs", "AttachmentIDs", "HashtagIDs", "RecurrenceRuleIDs"] as const;
 const RELATIONSHIP_KEYS = ["List", "ParentReminder", "Deleted"];
-export interface CloudKitReadTrace { path: string; url: string; request: Record<string, unknown>; response: { status: number; returnedRecords: number; recordTypes: Record<string, number>; zones: number; continuationPresent: boolean; recordErrors: number }; }
+export interface CloudKitReadTrace { elapsedMs: number; path: string; url: string; request: Record<string, unknown>; response: { status: number; returnedRecords: number; recordTypes: Record<string, number>; zones: number; continuationPresent: boolean; recordErrors: number }; }
 
 function requireValue(condition: unknown, message: string): asserts condition {
   if (!condition) throw new AppError("PROTOCOL_CHANGED", message);
@@ -603,6 +603,7 @@ export class CloudKitRemindersClient {
     url.pathname = `${url.pathname.replace(/\/$/, "")}${path}`;
     url.search = this.params.toString();
     const hasSessionCookie = this.http.jar.header(url).length > 0;
+    const started = Date.now();
     const response = await this.http.request(url.href, {
       method: "POST",
       headers: appleWebHeaders(),
@@ -658,7 +659,7 @@ export class CloudKitRemindersClient {
     if (path !== "/records/modify") {
       const redactedRequest = JSON.parse(JSON.stringify(payload, (key, value) => ["recordName", "ownerRecordName", "continuationMarker", "syncToken"].includes(key) ? "[redacted]" : key === "zoneName" && value !== "Reminders" ? "[other authorized zone]" : value)) as Record<string, unknown>;
       const redactedURL = new URL(url); redactedURL.searchParams.set("dsid", "[redacted]"); redactedURL.searchParams.set("clientId", "[redacted]");
-      this.readTrace.push({ path, url: redactedURL.href, request: redactedRequest, response: { status: response.status, returnedRecords: records.length, recordTypes, zones: zones.length, continuationPresent: typeof result.continuationMarker === "string", recordErrors: records.filter(record => record && typeof record.serverErrorCode === "string").length } });
+      this.readTrace.push({ elapsedMs: Date.now() - started, path, url: redactedURL.href, request: redactedRequest, response: { status: response.status, returnedRecords: records.length, recordTypes, zones: zones.length, continuationPresent: typeof result.continuationMarker === "string", recordErrors: records.filter(record => record && typeof record.serverErrorCode === "string").length } });
     }
     parseTopLevelError(result, { path, upstreamStatus: response.status, hasSessionCookie });
     return result;
@@ -1230,7 +1231,11 @@ export class CloudKitRemindersClient {
     requireInput(canonicalJSON(plan.operations) === canonicalJSON(rebuilt.operations) && canonicalJSON(plan.guards) === canonicalJSON(rebuilt.guards) && canonicalJSON(plan.expected) === canonicalJSON(rebuilt.expected) &&
       plan.mode === rebuilt.mode && plan.intrinsicParentGuards === rebuilt.intrinsicParentGuards && plan.sourceFingerprint === rebuilt.sourceFingerprint, "Recurring completion must match the validated native occurrence recipe.");
     this.validateWrite("update", { ...plan.active, fields: Object.fromEntries(Object.entries(plan.active.fields).filter(([key]) => key !== "AlarmIDs")) });
-    if (plan.history) this.validateWrite("create", { ...plan.history, fields: Object.fromEntries(Object.entries(plan.history.fields).filter(([key]) => !["AlarmIDs", "RecurrenceRuleIDs", "AttachmentIDs", "HashtagIDs", "AssignmentIDs"].includes(key))) });
+    if (plan.history) {
+      if (plan.history.fields.DueDateDeltaAlertsData) earlyReminderPayload({ ...plan.history, raw: {} });
+      this.validateWrite("create", { ...plan.history, fields: Object.fromEntries(Object.entries(plan.history.fields).filter(([key]) =>
+        !["AlarmIDs", "RecurrenceRuleIDs", "AttachmentIDs", "HashtagIDs", "AssignmentIDs", "DueDateDeltaAlertsData"].includes(key))) });
+    }
     const result = plan.intrinsicParentGuards ? await this.executeRecords([...plan.operations, ...plan.guards.map(record => ({ operationType: "update" as const,
       record: { recordName: record.recordName, recordType: record.recordType, recordChangeTag: record.recordChangeTag, fields: { Deleted: { type: "INT64", value: 0 } } } }))], beforeDispatch) :
       await this.executeRecords(plan.operations, beforeDispatch, plan.guards, ["List"], plan.mode === "advance" ? [] : [plan.list.recordName]);
@@ -1953,13 +1958,11 @@ export class CloudKitRemindersClient {
     const continuation = requestedToken(options.continuation, "The CloudKit continuation marker is invalid.");
     const payload: Record<string, unknown> = {
       query: {
-        recordType: options.projection === "relationships" ? "Reminder" : "reminderList",
+        recordType: "reminderList",
         filterBy: [
           { comparator: "EQUALS", fieldName: "List", fieldValue: { type: "REFERENCE", value: { recordName: listId, action: "VALIDATE" } } },
-          ...(options.projection === "relationships" ? [] : [
-            { comparator: "EQUALS", fieldName: "includeCompleted", fieldValue: { type: "INT64", value: options.includeCompleted ? 1 : 0 } },
-            { comparator: "EQUALS", fieldName: "LookupValidatingReference", fieldValue: { type: "INT64", value: 1 } },
-          ]),
+          { comparator: "EQUALS", fieldName: "includeCompleted", fieldValue: { type: "INT64", value: options.includeCompleted ? 1 : 0 } },
+          { comparator: "EQUALS", fieldName: "LookupValidatingReference", fieldValue: { type: "INT64", value: options.projection === "relationships" ? 0 : 1 } },
         ],
       },
       zoneID: this.requestZone,

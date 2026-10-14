@@ -58,3 +58,6 @@ next-env.d.ts
 /docs/artifact-manifest.json
 /docs/release-check.json
 /keys*.json
+
+# Local Repowise state
+.repowise/
