@@ -197,8 +197,9 @@ export async function verifyReminderWrites(options) {
       }
       if (url.pathname.endsWith("/records/query")) {
         if (body.query.recordType === "Lists") return jsonResponse({ records: [...state.records.values()].filter(record => record.recordType === "List") });
-        const relationshipsOnly = body.query.recordType === "Reminder" && body.desiredKeys?.length === 3 && body.desiredKeys.includes("ParentReminder");
-        assert.ok(relationshipsOnly || body.query.recordType === "reminderList");
+        const relationshipsOnly = body.desiredKeys?.length === 3 && body.desiredKeys.includes("ParentReminder");
+        assert.equal(body.query.recordType, "reminderList");
+        if (relationshipsOnly) assert.equal(body.query.filterBy.find(filter => filter.fieldName === "LookupValidatingReference").fieldValue.value, 0);
         const requestedList = body.query.filterBy.find(filter => filter.fieldName === "List").fieldValue.value.recordName;
         if (state.nextListQuery) { const response = state.nextListQuery; state.nextListQuery = null; return jsonResponse(response); }
         assert.ok(state.records.get(requestedList)?.recordType === "List");

@@ -179,6 +179,70 @@ test("large exact inspection bounds concurrency and drains reads before propagat
   assert.equal(started, 4); assert.equal(settled, true);
 });
 
+test("large scans overlap exact native inventory, then resolve query-only children", async () => {
+  const ids = Array.from({ length: 1001 }, () => `Reminder/${crypto.randomUUID()}`);
+  const root = record(ids[0]), extra = record(`Reminder/${crypto.randomUUID()}`, root.recordName);
+  const records = [...ids.map(id => record(id)), extra];
+  const inventory = { ...list, fields: { ...list.fields, ReminderIDs: { type: "STRING", value: JSON.stringify(ids) } } };
+  let releaseQuery!: () => void;
+  const queryGate = new Promise<void>(resolve => { releaseQuery = resolve; });
+  const lookedUp = new Set<string>(), base = clientFor(records);
+  const client = {
+    ...base,
+    queryRemindersPage: async () => { await queryGate; return page([root, extra]); },
+    lookupRelationshipRecords: async (names: string[]) => {
+      names.forEach(id => { assert.equal(lookedUp.has(id), false); lookedUp.add(id); });
+      releaseQuery(); // Sequential query-before-lookup would deadlock here.
+      return base.lookup(names);
+    },
+  };
+  await assert.rejects(requireNoChildren(client, owner, inventory, root.recordName), hasCode("UNSUPPORTED_FEATURE"));
+  assert.equal(lookedUp.size, ids.length + 1);
+  assert.ok(lookedUp.has(extra.recordName));
+});
+
+test("overlapped scans drain both branches and prioritize authentication failures", async () => {
+  for (const failQuery of [false, true]) {
+    const ids = Array.from({ length: 1001 }, () => `Reminder/${crypto.randomUUID()}`);
+    const inventory = { ...list, fields: { ...list.fields, ReminderIDs: { type: "STRING", value: JSON.stringify(ids) } } };
+    let release!: () => void, queryStarted!: () => void, settled = false;
+    const pending = new Promise<void>(resolve => { release = resolve; });
+    const started = new Promise<void>(resolve => { queryStarted = resolve; });
+    const client = {
+      ...clientFor([]),
+      queryRemindersPage: async () => {
+        queryStarted();
+        if (!failQuery) await pending;
+        throw new AppError(failQuery ? "UPSTREAM_UNAVAILABLE" : "REAUTH_REQUIRED", "Synthetic query failure.");
+      },
+      lookupRelationshipRecords: async (): Promise<CloudKitLookupResult> => {
+        if (failQuery) await pending;
+        throw new AppError(failQuery ? "REAUTH_REQUIRED" : "UPSTREAM_UNAVAILABLE", "Synthetic inventory failure.");
+      },
+    };
+    const result = requireNoChildren(client, owner, inventory, parent.recordName)
+      .then(() => { settled = true; }, error => { settled = true; throw error; });
+    await started; await Promise.resolve();
+    assert.equal(settled, false);
+    release();
+    await assert.rejects(result, hasCode("REAUTH_REQUIRED"));
+    assert.equal(settled, true);
+  }
+});
+
+test("overlapped inventory absence remains a conflict when the fresh query returns that identity", async () => {
+  const ids = Array.from({ length: 1001 }, () => `Reminder/${crypto.randomUUID()}`);
+  const missing = ids[0], inventory = { ...list, fields: { ...list.fields, ReminderIDs: { type: "STRING", value: JSON.stringify(ids) } } };
+  const client = {
+    ...clientFor([], [page([record(missing)])]),
+    lookupRelationshipRecords: async (names: string[]): Promise<CloudKitLookupResult> => ({
+      requestedRecordNames: names, records: [], unresolvedRecordNames: [], complete: false,
+      recordErrors: names.map(recordName => ({ recordName, serverErrorCode: "NOT_FOUND", reason: null, raw: {} })),
+    }),
+  };
+  await assert.rejects(requireNoChildren(client, owner, inventory, missing), hasCode("CONFLICT"));
+});
+
 test("child inspection covers completed descendants and refuses incomplete, cycling, erroneous and oversized pages", async () => {
   const completeChild = { ...child, fields: { ...child.fields, Completed: { type: "INT64", value: 1 } } };
   await assert.rejects(requireNoChildren(clientFor([parent, completeChild], [page([parent], "next"), page([completeChild])]), owner, list, parent.recordName), hasCode("UNSUPPORTED_FEATURE"));

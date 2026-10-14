@@ -10,7 +10,7 @@ import { canonicalJSON, fingerprint } from "../src/lib/canonical.ts";
 import { buildCreateReminder, CreateReminderInput, UpdateReminderInput } from "../src/reminders/writes.ts";
 import { loadSchedulingGraph, attachEarlyReminderWitness } from "../src/reminders/linked-records.ts";
 import { planReminderUpdate } from "../src/reminders/mutation-plan.ts";
-import { dateComponents, decodeDateComponents, dueDateNonce } from "../src/reminders/linked-date.ts";
+import { absoluteDatePairShape, dateComponents, decodeDateComponents, dueDateNonce } from "../src/reminders/linked-date.ts";
 
 import { RecurrenceChanges, readRecurrence } from "../src/reminders/recurrence.ts";
 import { verifySchedulingWrite } from "../src/reminders/scheduling-plan.ts";
@@ -19,6 +19,7 @@ import { RecurringIntentSchema } from "../src/persistence/apple-sessions.ts";
 import { planRecurringDeletion } from "../src/reminders/recurring-deletion.ts";
 import { planDateAlarmLifecycle } from "../src/reminders/date-alarm-lifecycle.ts";
 import { RecurrenceCalendarTimeZone, recurrenceEndCalendarLabel } from "../src/reminders/recurrence-calendar.ts";
+import { earlyReminderPayload } from "../src/reminders/early-reminder.ts";
 
 const owner = "synthetic-owner", listId = "List/LINKED-DATE", now = 1_800_000_000_000;
 const zoneID = { zoneName: "Reminders", ownerRecordName: owner };
@@ -54,6 +55,207 @@ const lookup = (values: CloudKitRecord[]) => async (ids: string[]): Promise<Clou
 });
 const request = (root: CloudKitRecord) => ({ listId, reminderId: root.recordName, recordChangeTag: root.recordChangeTag!,
   changes: { dueDate: "2027-07-11T09:00:00+01:00" } });
+
+test("date-pair diagnostics report bounded shape and equality without native identities or payloads", async () => {
+  const values = records(), graph = await loadSchedulingGraph(values[0], owner, lookup(values));
+  const identity = crypto.randomUUID();
+  graph.records.find(record => record.recordType === "Alarm")!.fields.AlarmUID = { type: "STRING", value: identity };
+  graph.records.find(record => record.recordType === "Alarm")!.fields["not a native field"] = { type: "STRING", value: "private synthetic contents" };
+  const shape = absoluteDatePairShape(graph, owner)!;
+  assert.equal(shape.alarmUIDMatchesRecord, false);
+  assert.equal(shape.alarmUIDMatchesIgnoringCase, false);
+  assert.equal(shape.reminderBacklinkMatches, true);
+  assert.equal(shape.alarmBacklinkMatches, true);
+  assert.ok(shape.alarmFields.includes("unrecognized"));
+  assert.ok(!JSON.stringify(shape).includes(identity));
+  assert.ok(!JSON.stringify(shape).includes("private synthetic contents"));
+  assert.ok(!JSON.stringify(shape).includes(values[0].recordName));
+});
+
+test("observed timed monthly completion preserves the active early alert and creates independent old-date history", async () => {
+  for (const [before, after] of [
+    ["2026-10-14T08:00:00Z", "2026-10-29T09:00:00.000Z"],
+    ["2027-01-29T09:00:00Z", "2027-02-28T09:00:00.000Z"],
+    ["2028-01-29T09:00:00Z", "2028-02-29T09:00:00.000Z"],
+    ["2028-02-29T09:00:00Z", "2028-03-29T08:00:00.000Z"],
+    ["2027-12-29T09:00:00Z", "2028-01-29T09:00:00.000Z"],
+  ]) assert.equal(nextRecurringDue(before, "Europe/London", false, "monthly-29"), after);
+  for (const due of ["2026-03-14T01:30:00Z", "9999-12-29T09:00:00Z"])
+    assert.throws(() => nextRecurringDue(due, "Europe/London", false, "monthly-29"));
+  const values = records(), due = "2026-10-14T08:00:00Z", timestamp = Date.parse("2026-10-14T12:00:00Z");
+  values[0].fields.DueDate = { type: "TIMESTAMP", value: Date.parse(due) };
+  values[2].fields.DateComponentsData = { type: "BYTES", value: b64(utf8(JSON.stringify(dateComponents(due, "Europe/London", true)))) };
+  Object.assign(values[3].fields, { Frequency: { type: "INT64", value: 2 },
+    DaysOfTheMonth: { type: "BYTES", value: b64(utf8("[28,29]")) }, SetPositions: { type: "BYTES", value: b64(utf8("[-1]")) } });
+  values[0].fields.DueDateDeltaAlertsData = { type: "ENCRYPTED_BYTES", value: b64(utf8(JSON.stringify({
+    reminderIdentifier: values[0].recordName.slice(9), accountIdentifier: crypto.randomUUID(), minimumSupportedVersion: 20230430,
+    dueDateDeltaAlerts: [{ creationDate: 800000000.12345, identifier: crypto.randomUUID(), dueDateDeltaUnit: 2,
+      dueDateDeltaCount: -1, minimumSupportedAppVersion: 0 }],
+  }))) };
+  const before = structuredClone(values), ids = recurringIdentities();
+  const list: CloudKitRecord = { recordName: listId, recordType: "List", recordChangeTag: "list-before", zoneID, raw: {}, fields: {
+    Deleted: { type: "INT64", value: 0 }, IsGroup: { type: "INT64", value: 0 },
+    ReminderIDs: { type: "STRING", value: JSON.stringify([values[0].recordName.slice(9)]) },
+    ResolutionTokenMap: { type: "STRING", value: JSON.stringify({ map: {} }) },
+  } };
+  const graph = await loadSchedulingGraph(values[0], owner, lookup(values));
+  const plan = await planRecurringCompletion(graph, list, owner, ids, timestamp);
+  assert.equal(plan.active.fields.DueDate.value, Date.parse("2026-10-29T09:00:00Z"));
+  assert.equal(plan.active.fields.DueDateDeltaAlertsData, undefined);
+  assert.equal(plan.active.fields.CreationDate, undefined);
+  assert.equal(plan.history!.fields.CreationDate.value, timestamp);
+  assert.equal(plan.history!.fields.DueDate.value, Date.parse(due));
+  assert.equal(plan.history!.fields.Completed.value, 1);
+  assert.deepEqual(plan.history!.fields.RecurrenceRuleIDs.value, []);
+  const historical = earlyReminderPayload({ ...plan.history!, raw: {} }), original = earlyReminderPayload(values[0]);
+  assert.equal(historical.reminderIdentifier, ids.history);
+  assert.equal(historical.accountIdentifier, original.accountIdentifier);
+  assert.deepEqual(historical.dueDateDeltaAlerts[0], { ...original.dueDateDeltaAlerts[0], identifier: ids.replicas[22] });
+  assert.notEqual(historical.dueDateDeltaAlerts[0].identifier, original.dueDateDeltaAlerts[0].identifier);
+  assert.equal(JSON.parse(String(plan.history!.fields.ResolutionTokenMap.value)).map.dueDateDeltaAlertsData.replicaID, ids.replicas[13]);
+  const replay = await planRecurringCompletion(graph, list, owner, ids, timestamp);
+  assert.deepEqual(replay.operations, plan.operations);
+  assert.deepEqual(replay.expected, plan.expected);
+  assert.deepEqual(values, before);
+  const committed = plan.operations.filter(op => op.operationType !== "delete").map(op => {
+    const source = [...values, list].find(record => record.recordName === op.record.recordName);
+    return { ...op.record, raw: { ...source?.raw, ...(op.record.parent ? { parent: op.record.parent } : {}) },
+      recordChangeTag: "after", fields: { ...source?.fields, ...op.record.fields } };
+  });
+  await verifyRecurringExpected(plan.expected, [...committed, values[3]], owner);
+  let dispatched = 0;
+  const client = new CloudKitRemindersClient(new AppleHTTP(new CookieJar(), async (_, init) => {
+    dispatched++;
+    const payload = JSON.parse(String(init?.body));
+    assert.equal(payload.atomic, true);
+    return Response.json({ records: payload.operations.map((op: { operationType: string; record: CloudKitRecord }) => {
+      if (op.operationType === "delete") return { recordName: op.record.recordName, deleted: true };
+      const source = [...values, list].find(record => record.recordName === op.record.recordName);
+      return { ...op.record, fields: { ...source?.fields, ...op.record.fields }, recordChangeTag: "after", zoneID };
+    }) });
+  }), { dsid: "123", clientId: "synthetic", clientBuildNumber: "synthetic", clientMasteringNumber: "synthetic",
+    cloudKitURL: "https://p01-ckdatabasews.icloud.com/database/1/com.apple.reminders/production/private", remindersZoneOwner: owner });
+  await client.modifyRecurringCompletion(plan, async () => {});
+  assert.equal(dispatched, 1);
+  const forged = structuredClone(plan);
+  forged.history!.fields.DueDateDeltaAlertsData = values[0].fields.DueDateDeltaAlertsData as { type: string; value: unknown };
+  await assert.rejects(client.modifyRecurringCompletion(forged, async () => {}), hasCode("VALIDATION_ERROR"));
+  assert.equal(dispatched, 1);
+  const changed = structuredClone(committed);
+  changed.find(record => record.recordName === plan.history!.recordName)!.fields.DueDateDeltaAlertsData = values[0].fields.DueDateDeltaAlertsData;
+  await assert.rejects(verifyRecurringExpected(plan.expected, [...changed, values[3]], owner), hasCode("WRITE_OUTCOME_UNKNOWN"));
+  assert.equal(RecurringIntentSchema.safeParse({ requestFingerprint: "a".repeat(64), sourceFingerprint: plan.sourceFingerprint,
+    phase: "prepared", timestamp, ids, expected: plan.expected, retired: plan.retired }).success, true);
+  const acknowledged = structuredClone(values), acknowledgedPayload = earlyReminderPayload(acknowledged[0]);
+  acknowledgedPayload.dueDateDeltaAlerts[0].acknowledgedDate = 800000100.98765;
+  acknowledged[0].fields.DueDateDeltaAlertsData = { type: "ENCRYPTED_BYTES", value: b64(utf8(JSON.stringify(acknowledgedPayload))) };
+  const acknowledgedGraph = await loadSchedulingGraph(acknowledged[0], owner, lookup(acknowledged));
+  const acknowledgedPlan = await planRecurringCompletion(acknowledgedGraph, list, owner, ids, timestamp);
+  assert.equal(acknowledgedPlan.active.fields.DueDateDeltaAlertsData, undefined);
+  assert.deepEqual(earlyReminderPayload({ ...acknowledgedPlan.history!, raw: {} }).dueDateDeltaAlerts[0],
+    { ...acknowledgedPayload.dueDateDeltaAlerts[0], identifier: ids.replicas[22] });
+  assert.deepEqual((await planRecurringCompletion(acknowledgedGraph, list, owner, ids, timestamp)).operations, acknowledgedPlan.operations);
+  assert.notEqual(acknowledgedPlan.sourceFingerprint, plan.sourceFingerprint);
+  const acknowledgedCommitted = acknowledgedPlan.operations.filter(op => op.operationType !== "delete").map(op => {
+    const source = [...acknowledged, list].find(record => record.recordName === op.record.recordName);
+    return { ...op.record, raw: { ...source?.raw, ...(op.record.parent ? { parent: op.record.parent } : {}) },
+      recordChangeTag: "after", fields: { ...source?.fields, ...op.record.fields } };
+  });
+  await verifyRecurringExpected(acknowledgedPlan.expected, [...acknowledgedCommitted, acknowledged[3]], owner);
+  const acknowledgedAlarm = structuredClone(acknowledged);
+  acknowledgedAlarm[1].fields.AcknowledgedDate = { type: "TIMESTAMP", value: timestamp - 1000 };
+  acknowledgedAlarm[1].fields.AlarmUID = { type: "STRING", value: crypto.randomUUID().toUpperCase() };
+  const acknowledgedAlarmGraph = await loadSchedulingGraph(acknowledgedAlarm[0], owner, lookup(acknowledgedAlarm));
+  const acknowledgedAlarmPlan = await planRecurringCompletion(acknowledgedAlarmGraph, list, owner, ids, timestamp);
+  assert.deepEqual(acknowledgedAlarmPlan.active.fields, acknowledgedPlan.active.fields);
+  assert.deepEqual(acknowledgedAlarmPlan.history!.fields, acknowledgedPlan.history!.fields);
+  assert.ok(acknowledgedAlarmPlan.operations.filter(op => op.operationType === "create" && op.record.recordType === "Alarm")
+    .every(op => !Object.hasOwn(op.record.fields, "AcknowledgedDate") && op.record.fields.AlarmUID.value === op.record.recordName.slice(6)));
+  assert.deepEqual(acknowledgedAlarmPlan.retired, acknowledgedPlan.retired);
+  assert.notEqual(acknowledgedAlarmPlan.sourceFingerprint, acknowledgedPlan.sourceFingerprint);
+  for (const field of [{ type: "DOUBLE", value: timestamp - 1000 }, { type: "TIMESTAMP", value: timestamp + 1000 },
+    { type: "TIMESTAMP", value: "private synthetic value" }, { type: "TIMESTAMP", value: timestamp - 1000, unknown: true }]) {
+    const invalid = structuredClone(acknowledgedAlarm);
+    invalid[1].fields.AcknowledgedDate = field;
+    await assert.rejects(planRecurringCompletion(await loadSchedulingGraph(invalid[0], owner, lookup(invalid)), list, owner, ids, timestamp), hasCode("UNSUPPORTED_FEATURE"));
+  }
+  const missingAck = structuredClone(acknowledgedAlarm); delete missingAck[1].fields.AcknowledgedDate;
+  await assert.rejects(planRecurringCompletion(await loadSchedulingGraph(missingAck[0], owner, lookup(missingAck)), list, owner, ids, timestamp), hasCode("UNSUPPORTED_FEATURE"));
+  const nullAck = structuredClone(acknowledgedAlarm); nullAck[1].fields.AcknowledgedDate = { type: "TIMESTAMP", value: null };
+  assert.equal((await planRecurringCompletion(await loadSchedulingGraph(nullAck[0], owner, lookup(nullAck)), list, owner, ids, timestamp)).active.fields.DueDate.value,
+    acknowledgedPlan.active.fields.DueDate.value);
+  for (const variant of ["daily", "no-early", "two-days", "all-day", "ended", "wrong-pattern", "location"]) {
+    const altered = structuredClone(values);
+    if (variant === "daily") { altered[3].fields.Frequency = { type: "INT64", value: 0 }; delete altered[3].fields.DaysOfTheMonth; delete altered[3].fields.SetPositions; }
+    if (variant === "no-early") delete altered[0].fields.DueDateDeltaAlertsData;
+    if (variant === "two-days") {
+      const payload = earlyReminderPayload(altered[0]);
+      payload.dueDateDeltaAlerts[0].dueDateDeltaCount = -2;
+      altered[0].fields.DueDateDeltaAlertsData = { type: "ENCRYPTED_BYTES", value: b64(utf8(JSON.stringify(payload))) };
+    }
+    if (variant === "all-day") altered[0].fields.AllDay = { type: "INT64", value: 1 };
+    if (variant === "ended") altered[3].fields.EndDate = { type: "TIMESTAMP", value: Date.parse("2026-11-29T09:00:00Z") };
+    if (variant === "wrong-pattern") altered[3].fields.DaysOfTheMonth = { type: "BYTES", value: b64(utf8("[27,28]")) };
+    if (variant === "location") altered[2].fields.Type = { type: "STRING", value: "Location" };
+    await assert.rejects(planRecurringCompletion(await loadSchedulingGraph(altered[0], owner, lookup(altered)), list, owner, ids, timestamp));
+  }
+});
+
+test("ordinary monthly completion follows a moved due date, retaining the rule and independent completed history", async () => {
+  for (const [before, after] of [
+    ["2026-10-14T08:00:00Z", "2026-11-14T09:00:00.000Z"],
+    ["2026-11-14T09:00:00Z", "2026-12-14T09:00:00.000Z"],
+    ["2026-10-18T08:00:00Z", "2026-11-18T09:00:00.000Z"],
+    ["2026-12-18T09:00:00Z", "2027-01-18T09:00:00.000Z"],
+    ["2028-02-18T09:00:00Z", "2028-03-18T09:00:00.000Z"],
+  ]) assert.equal(nextRecurringDue(before, "Europe/London", false, "monthly"), after);
+  for (const due of ["2026-01-31T09:00:00Z", "2027-02-28T01:30:00Z", "2026-09-25T00:30:00Z", "9999-12-18T09:00:00Z"])
+    assert.throws(() => nextRecurringDue(due, "Europe/London", false, "monthly"), hasCode("UNSUPPORTED_FEATURE"));
+  for (const withEarly of [false, true]) {
+    const values = records(), due = "2026-10-13T08:00:00Z", timestamp = Date.parse("2026-10-14T12:00:00Z");
+    values[0].fields.DueDate = { type: "TIMESTAMP", value: Date.parse(due) };
+    values[2].fields.DateComponentsData = { type: "BYTES", value: b64(utf8(JSON.stringify(dateComponents(due, "Europe/London", true)))) };
+    values[3].fields.Frequency = { type: "INT64", value: 2 };
+    if (withEarly) values[0].fields.DueDateDeltaAlertsData = { type: "ENCRYPTED_BYTES", value: b64(utf8(JSON.stringify({
+      reminderIdentifier: values[0].recordName.slice(9), accountIdentifier: crypto.randomUUID(), minimumSupportedVersion: 20230430,
+      dueDateDeltaAlerts: [{ creationDate: 800000000.12345, identifier: crypto.randomUUID(), dueDateDeltaUnit: 2,
+        dueDateDeltaCount: -1, minimumSupportedAppVersion: 0 }],
+    }))) };
+    const original = structuredClone(values), graph = await loadSchedulingGraph(values[0], owner, lookup(values));
+    const moved = planReminderUpdate(graph, { ...request(values[0]), changes: { dueDate: "2026-10-18T09:00:00+01:00" } }, owner, timestamp);
+    assert.ok(moved.supported);
+    assert.deepEqual(moved.after.recurrence, { frequency: "monthly", interval: 1, endDate: null });
+    const changed: CloudKitRecord[] = values.map(record => {
+      const update = record.recordType === "Reminder" ? moved.write : moved.dependencies.find(write => write.recordName === record.recordName);
+      return { ...record, fields: { ...record.fields, ...update?.fields } };
+    });
+    const list: CloudKitRecord = { recordName: listId, recordType: "List", recordChangeTag: "list-before", zoneID, raw: {}, fields: {
+      Deleted: { type: "INT64", value: 0 }, IsGroup: { type: "INT64", value: 0 },
+      ReminderIDs: { type: "STRING", value: JSON.stringify([values[0].recordName.slice(9)]) },
+      ResolutionTokenMap: { type: "STRING", value: JSON.stringify({ map: {} }) },
+    } };
+    const changedGraph = await loadSchedulingGraph(changed[0], owner, lookup(changed)), ids = recurringIdentities();
+    const plan = await planRecurringCompletion(changedGraph, list, owner, ids, timestamp);
+    assert.equal(plan.active.fields.DueDate.value, Date.parse("2026-11-18T09:00:00Z"));
+    assert.equal(plan.history!.fields.DueDate.value, Date.parse("2026-10-18T08:00:00Z"));
+    assert.equal(plan.history!.fields.Completed.value, 1);
+    assert.deepEqual(plan.history!.fields.RecurrenceRuleIDs.value, []);
+    assert.ok(plan.guards.some(record => record.recordName === ruleId));
+    assert.equal(plan.active.fields.DueDateDeltaAlertsData, undefined);
+    if (withEarly) assert.notEqual(earlyReminderPayload({ ...plan.history!, raw: {} }).dueDateDeltaAlerts[0].identifier,
+      earlyReminderPayload(changed[0]).dueDateDeltaAlerts[0].identifier);
+    assert.deepEqual((await planRecurringCompletion(changedGraph, list, owner, ids, timestamp)).operations, plan.operations);
+    assert.deepEqual(values, original);
+    const committed = plan.operations.filter(op => op.operationType !== "delete").map(op => {
+      const source = [...changed, list].find(record => record.recordName === op.record.recordName);
+      return { ...op.record, raw: { ...source?.raw, ...(op.record.parent ? { parent: op.record.parent } : {}) },
+        recordChangeTag: "after", fields: { ...source?.fields, ...op.record.fields } };
+    });
+    await verifyRecurringExpected(plan.expected, [...committed, changed[3]], owner);
+    const ended = structuredClone(changed); ended[3].fields.EndDate = { type: "TIMESTAMP", value: Date.parse("2027-01-18T09:00:00Z") };
+    await assert.rejects(planRecurringCompletion(await loadSchedulingGraph(ended[0], owner, lookup(ended)), list, owner, ids, timestamp), hasCode("UNSUPPORTED_FEATURE"));
+  }
+});
 
 test("timed recurring date plan updates exact existing identities and protects every unchanged recurrence", async () => {
   const values = records();

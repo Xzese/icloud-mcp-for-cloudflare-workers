@@ -107,56 +107,86 @@ export async function inspectListChildren(client: RelationshipClient,
     throw new AppError("UNSUPPORTED_FEATURE", "Relationship inspection requires an exact live List with explicit, unambiguous membership.");
   }
   const largeInventory = snapshot.reminderIds.length > 1000;
-  const queried = await scanListReminders(client, owner, list.recordName, largeInventory);
-  const queryIds = new Set(queried.map(record => record.recordName));
-  const ids = [...new Set([...queryIds, ...snapshot.reminderIds])];
-  if (ids.length > (largeInventory ? MAX_LIST_MEMBERS : 1000)) throw new AppError("UNSUPPORTED_FEATURE", "The exact membership check exceeds its inspection budget.");
-  const exact: CloudKitRecord[] = [];
   let bytes = 0;
   const batchSize = 200;
   const concurrency = largeInventory ? 4 : 1;
-  for (let start = 0; start < ids.length; start += batchSize * concurrency) {
-    const batches = Array.from({ length: Math.min(concurrency, Math.ceil((ids.length - start) / batchSize)) },
-      (_, index) => ids.slice(start + index * batchSize, start + (index + 1) * batchSize));
-    // Drain every read before raising any failure or releasing the session lease.
-    const results = await Promise.allSettled(batches.map(batch => largeInventory && client.lookupRelationshipRecords
-      ? client.lookupRelationshipRecords(batch) : client.lookup(batch)));
+  const lookupExact = async (ids: string[]) => {
+    const exact: CloudKitRecord[] = [], absent = new Set<string>();
+    for (let start = 0; start < ids.length; start += batchSize * concurrency) {
+      const batches = Array.from({ length: Math.min(concurrency, Math.ceil((ids.length - start) / batchSize)) },
+        (_, index) => ids.slice(start + index * batchSize, start + (index + 1) * batchSize));
+      // Drain every read before raising any failure or releasing the session lease.
+      const results = await Promise.allSettled(batches.map(batch => largeInventory && client.lookupRelationshipRecords
+        ? client.lookupRelationshipRecords(batch) : client.lookup(batch)));
+      const failures = results.filter((result): result is PromiseRejectedResult => result.status === "rejected");
+      if (failures.length) throw (failures.find(result => result.reason instanceof AppError &&
+        ["REAUTH_REQUIRED", "FORBIDDEN"].includes(result.reason.code)) ?? failures[0]).reason;
+      for (const [index, result] of results.entries()) {
+        if (result.status !== "fulfilled") throw new AppError("PROTOCOL_CHANGED", "An exact membership read did not settle.");
+        const batch = batches[index], found = result.value;
+        const missing = found.recordErrors.filter(error => error.serverErrorCode.toUpperCase() === "NOT_FOUND" &&
+          error.recordName !== null && batch.includes(error.recordName));
+        requireNoReadErrors(found.recordErrors.filter(error => !missing.includes(error)));
+        const answers = [...found.records.map(record => record.recordName), ...missing.map(error => error.recordName!)];
+        if (found.unresolvedRecordNames.length || answers.length !== batch.length || new Set(answers).size !== batch.length ||
+          answers.some(id => !batch.includes(id)) || !found.complete && missing.length === 0) {
+          throw new AppError("CONFLICT", "Every membership identity must resolve before relationship planning.", 409);
+        }
+        // Native ordering can retain retired IDs; definite absence is safe only for those entries.
+        for (const error of missing) absent.add(error.recordName!);
+        for (const record of found.records) {
+          bytes += jsonBytes(record);
+          if (bytes > (largeInventory ? 8_388_608 : 262_144)) throw new AppError("UNSUPPORTED_FEATURE", "The exact membership check exceeds its inspection budget.");
+          if (record.deleted) continue;
+          if (!("recordType" in record) || record.recordType !== "Reminder") throw new AppError("PROTOCOL_CHANGED", "The membership lookup returned an unexpected record type.");
+          assertOwnedReminder(record, owner);
+          const reminder = normalizeReminderRelationships(record, owner);
+          if (reminder.deleted === true) continue;
+          if (reminder.deleted !== false || reminder.listId !== list.recordName || !record.recordChangeTag) {
+            throw new AppError("CONFLICT", "The exact live membership changed or could not be established.", 409);
+          }
+          if (Object.keys(record.fields).some(field => /parent|child|subtask/i.test(field) && field !== "ParentReminder")) {
+            throw new AppError("UNSUPPORTED_FEATURE", "Unknown relationship fields prevent complete membership inspection.");
+          }
+          exact.push(record);
+        }
+      }
+    }
+    return { exact, absent };
+  };
+  let queried: CloudKitRecord[], native: Awaited<ReturnType<typeof lookupExact>>;
+  if (largeInventory) {
+    // Query freshness and exact native inventory are independent. Drain both
+    // branches before propagating a failure so the cookie jar/lease stays owned.
+    const results = await Promise.allSettled([
+      scanListReminders(client, owner, list.recordName, true), lookupExact(snapshot.reminderIds),
+    ] as const);
     const failures = results.filter((result): result is PromiseRejectedResult => result.status === "rejected");
     if (failures.length) throw (failures.find(result => result.reason instanceof AppError &&
       ["REAUTH_REQUIRED", "FORBIDDEN"].includes(result.reason.code)) ?? failures[0]).reason;
-    for (const [index, result] of results.entries()) {
-      if (result.status !== "fulfilled") throw new AppError("PROTOCOL_CHANGED", "An exact membership read did not settle.");
-      const batch = batches[index], found = result.value;
-      const missing = found.recordErrors.filter(error => error.serverErrorCode.toUpperCase() === "NOT_FOUND" &&
-        error.recordName !== null && batch.includes(error.recordName));
-      requireNoReadErrors(found.recordErrors.filter(error => !missing.includes(error)));
-      const answers = [...found.records.map(record => record.recordName), ...missing.map(error => error.recordName!)];
-      if (found.unresolvedRecordNames.length || answers.length !== batch.length || new Set(answers).size !== batch.length ||
-        answers.some(id => !batch.includes(id)) || !found.complete && missing.length === 0) {
-        throw new AppError("CONFLICT", "Every membership identity must resolve before relationship planning.", 409);
-      }
-      // Native ordering can retain retired IDs; definite absence is safe only for those entries.
-      if (missing.some(error => queryIds.has(error.recordName!))) {
-        throw new AppError("CONFLICT", "A queried reminder disappeared during relationship inspection.", 409);
-      }
-      for (const record of found.records) {
-        bytes += jsonBytes(record);
-        if (bytes > (largeInventory ? 8_388_608 : 262_144)) throw new AppError("UNSUPPORTED_FEATURE", "The exact membership check exceeds its inspection budget.");
-        if (record.deleted) continue;
-        if (!("recordType" in record) || record.recordType !== "Reminder") throw new AppError("PROTOCOL_CHANGED", "The membership lookup returned an unexpected record type.");
-        assertOwnedReminder(record, owner);
-        const reminder = normalizeReminderRelationships(record, owner);
-        if (reminder.deleted === true) continue;
-        if (reminder.deleted !== false || reminder.listId !== list.recordName || !record.recordChangeTag) {
-          throw new AppError("CONFLICT", "The exact live membership changed or could not be established.", 409);
-        }
-        if (Object.keys(record.fields).some(field => /parent|child|subtask/i.test(field) && field !== "ParentReminder")) {
-          throw new AppError("UNSUPPORTED_FEATURE", "Unknown relationship fields prevent complete membership inspection.");
-        }
-        exact.push(record);
-      }
-    }
+    if (results[0].status !== "fulfilled" || results[1].status !== "fulfilled")
+      throw new AppError("PROTOCOL_CHANGED", "The relationship reads did not settle.");
+    queried = results[0].value; native = results[1].value;
+  } else {
+    queried = await scanListReminders(client, owner, list.recordName);
+    const ids = [...new Set([...queried.map(record => record.recordName), ...snapshot.reminderIds])];
+    if (ids.length > 1000) throw new AppError("UNSUPPORTED_FEATURE", "The exact membership check exceeds its inspection budget.");
+    native = await lookupExact(ids);
   }
+  const queryIds = new Set(queried.map(record => record.recordName));
+  const ids = [...new Set([...queryIds, ...snapshot.reminderIds])];
+  if (ids.length > (largeInventory ? MAX_LIST_MEMBERS : 1000)) throw new AppError("UNSUPPORTED_FEATURE", "The exact membership check exceeds its inspection budget.");
+  const exact = native.exact;
+  if (largeInventory) {
+    const nativeIds = new Set(snapshot.reminderIds);
+    const extra = await lookupExact([...queryIds].filter(id => !nativeIds.has(id)));
+    exact.push(...extra.exact);
+    for (const id of extra.absent) native.absent.add(id);
+  }
+  // A missing ordering-only identity can be retired; a queried one disappearing
+  // remains a conflict even when the two read branches overlap.
+  if ([...native.absent].some(id => queryIds.has(id)))
+    throw new AppError("CONFLICT", "A queried reminder disappeared during relationship inspection.", 409);
   return childRelationships(exact, owner);
 }
 

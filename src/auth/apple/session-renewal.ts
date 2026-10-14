@@ -21,7 +21,7 @@ export const renewalCheckpoint = (): RenewalCheckpoint => ({
   failures: 0, requiredAction: null, lastErrorCode: null,
 });
 export interface AppleRequestBudget { deadline: number; recoveryUsed: boolean; }
-export const appleRequestBudget = (): AppleRequestBudget => ({ deadline: Date.now() + 40_000, recoveryUsed: false });
+export const appleRequestBudget = (allowanceMs: 40_000 | 60_000 = 40_000): AppleRequestBudget => ({ deadline: Date.now() + allowanceMs, recoveryUsed: false });
 export function appleSuccess(session: AppleSession): AppleSession {
   return { ...session, renewal: { ...(session.renewal ?? renewalCheckpoint()), lastAppleSuccessAt: Date.now() } };
 }
