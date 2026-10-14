@@ -19,6 +19,36 @@ export class AppError extends Error {
   }
 }
 
+export interface ListMembershipDiagnostics {
+  fieldType: "STRING" | "OTHER";
+  stringLength: number | null;
+  jsonShape: "not_inspected" | "invalid" | "array" | "object" | "scalar";
+  arrayLength: number | null;
+}
+
+/** Shape and size only: never retain the field value, IDs or parser exceptions. */
+export class ListMembershipError extends AppError {
+  readonly membershipDiagnostics: ListMembershipDiagnostics;
+  constructor(code: "PROTOCOL_CHANGED" | "UNSUPPORTED_FEATURE", message: string, diagnostics: ListMembershipDiagnostics) {
+    super(code, message);
+    this.membershipDiagnostics = diagnostics;
+  }
+}
+
+export interface InspectionReadDiagnostics {
+  elapsedMs: number;
+  requests: { path: string; elapsedMs: number; records: number; recordTypes: Record<string, number>; continuation: boolean }[];
+}
+
+/** Bounded timing and counts from an already-authorized read, never trace bodies. */
+export class InspectionReadError extends AppError {
+  readonly inspectionDiagnostics: InspectionReadDiagnostics;
+  constructor(error: AppError, diagnostics: InspectionReadDiagnostics) {
+    super(error.code, error.message, error.status, error.retryable);
+    this.inspectionDiagnostics = diagnostics;
+  }
+}
+
 export class WriteOutcomeUnknownError extends AppError {
   readonly reminderId: string;
   readonly listId?: string;
@@ -37,7 +67,10 @@ export function publicError(error: unknown, requestId: string) {
   const e = error instanceof AppError ? error : new AppError(
     "UPSTREAM_UNAVAILABLE", "This operation could not be completed. Try the connection again.", 503, true,
   );
-  return { code: e.code, message: e.message, retryable: e.retryable, requestId, ...(e instanceof WriteOutcomeUnknownError ? { ...(e.listId ? { listId: e.listId } : { reminderId: e.reminderId }), ...(e.idempotencyKey ? { idempotencyKey: e.idempotencyKey } : {}) } : {}) };
+  return { code: e.code, message: e.message, retryable: e.retryable, requestId,
+    ...(e instanceof ListMembershipError ? { membershipDiagnostics: e.membershipDiagnostics } : {}),
+    ...(e instanceof InspectionReadError ? { inspectionDiagnostics: e.inspectionDiagnostics } : {}),
+    ...(e instanceof WriteOutcomeUnknownError ? { ...(e.listId ? { listId: e.listId } : { reminderId: e.reminderId }), ...(e.idempotencyKey ? { idempotencyKey: e.idempotencyKey } : {}) } : {}) };
 }
 
 export function requireValue(condition: unknown, message: string): asserts condition {

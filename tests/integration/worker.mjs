@@ -32,8 +32,9 @@ const options = {
   assets: { directory: join(root, "dist/client"), routerConfig: { has_user_worker: true } }, log: new Log(LogLevel.ERROR),
 };
 let worker;
-const request = async (path, { user = owner, method = "GET", body, requestOrigin = origin, host = origin } = {}) => {
-  const headers = { ...(user ? { "oai-authenticated-user-id": user, "oai-authenticated-user-email": "synthetic@example.invalid" } : {}) };
+const request = async (path, { user = owner, method = "GET", body, requestOrigin = origin, host = origin, protocolVersion } = {}) => {
+  const headers = { ...(user ? { "oai-authenticated-user-id": user, "oai-authenticated-user-email": "synthetic@example.invalid" } : {}),
+    ...(protocolVersion ? { "mcp-protocol-version": protocolVersion } : {}) };
   if (method === "POST") Object.assign(headers, { "content-type": "application/json", origin: requestOrigin, accept: "application/json, text/event-stream" });
   return worker.dispatchFetch(host + path, { method, headers, ...(body === undefined ? {} : { body: JSON.stringify(body) }) });
 };
@@ -94,6 +95,22 @@ try {
   const init = await mcp("initialize", { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "synthetic-acceptance", version: "1" } });
   assert.equal(init.result.serverInfo.name, "hosted-icloud-reminders");
   const tools = await mcp("tools/list", {}); assert.deepEqual(tools.result.tools.map((t) => t.name).sort(), ["complete_reminder", "connection_status", "create_reminder", "create_reminder_workflow", "duplicate_reminder_list", "create_subtask", "set_reminder_parent", "delete_reminder", "get_all_open_reminders", "get_reminder", "inspect_reminder", "get_reminder_organization", "set_reminder_url", "set_reminder_tags", "move_reminder", "copy_reminder", "get_reminder_lists", "get_reminder_list", "get_reminder_list_appearance", "update_reminder_list_appearance", "get_shopping_categories", "get_reminder_list_sections", "set_reminder_category", "create_reminder_list", "rename_reminder_list", "delete_reminder_list", "get_reminders", "search_reminders", "get_reminder_view", "export_reminders", "save_reminder_filter", "get_reminder_filters", "delete_reminder_filter", "run_reminder_filter", "reopen_reminder", "update_reminder", "prepare_reminder_update", ...JOB_TOOLS].sort());
+  const sitesMCP = (method, params = {}, user = owner) => request("/mcp", { method: "POST", user,
+    protocolVersion: "2026-07-28", body: { jsonrpc: "2.0", id: "sites-synthetic", method, params } });
+  const discovery = await sitesMCP("server/discover");
+  assert.equal(discovery.status, 200);
+  assert.deepEqual((await discovery.json()).result, { supportedVersions: ["2026-07-28"], capabilities: { tools: {} } });
+  const sitesTools = await sitesMCP("tools/list"); assert.equal(sitesTools.status, 200);
+  assert.deepEqual((await sitesTools.json()).result.tools, tools.result.tools);
+  const sitesStatus = await sitesMCP("tools/call", { name: "connection_status", arguments: {} });
+  assert.equal(sitesStatus.status, 200); assert.equal((await sitesStatus.json()).result.structuredContent.connected, false);
+  assert.equal((await sitesMCP("server/discover", {}, "wrong-owner")).status, 403);
+  const sitesInvalid = await sitesMCP("tools/call", { name: "complete_reminder", arguments: { unexpected: true } });
+  assert.equal(sitesInvalid.status, 200); assert.equal((await sitesInvalid.json()).result.isError, true);
+  assert.equal((await sitesMCP("initialize")).status, 400);
+  assert.equal((await request("/mcp", { method: "POST", protocolVersion: "2026-07-28", body: [
+    { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "connection_status", arguments: {} } },
+  ] })).status, 400);
   const listReadTool = tools.result.tools.find(tool => tool.name === "get_reminders");
   // Client adapters can require a full pattern match. A generated prefix-only
   // pattern rejected valid List IDs before the live server could read them.

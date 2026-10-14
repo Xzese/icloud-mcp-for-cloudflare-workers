@@ -93,20 +93,61 @@ export function dueDateNonce(encoded: unknown) {
   if (!Number.isFinite(nonce) || Math.abs(nonce) > Number.MAX_SAFE_INTEGER) throw new AppError("UNSUPPORTED_FEATURE", "The due-date nonce exceeds supported numeric precision.");
   return nonce;
 }
+/** Shape/equality diagnostics only: no UUID, date component or payload values. */
+export function absoluteDatePairShape(graph: SchedulingGraph, owner: string) {
+  const alarm = graph.records.find(record => record.recordType === "Alarm");
+  const trigger = graph.records.find(record => record.recordType === "AlarmTrigger");
+  if (!alarm || !trigger) return undefined;
+  const get = (record: CloudKitRecord, key: string) => (record.fields[key] as { value?: unknown } | undefined)?.value;
+  const names = (record: CloudKitRecord) => Object.keys(record.fields).map(key => /^[A-Za-z][A-Za-z0-9_]{0,63}$/.test(key) ? key : "unrecognized").sort().slice(0, 32);
+  const equalReference = (record: CloudKitRecord, key: string, type: string, expected: string) => {
+    try { return referenceField(record, key, type, owner) === expected; } catch { return false; }
+  };
+  const uid = get(alarm, "AlarmUID");
+  return {
+    alarmFields: names(alarm), triggerFields: names(trigger),
+    alarmUIDMatchesRecord: uid === alarm.recordName.slice(6),
+    alarmUIDMatchesIgnoringCase: typeof uid === "string" && uid.toUpperCase() === alarm.recordName.slice(6).toUpperCase(),
+    alarmUIDIsUuid: typeof uid === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(uid),
+    acknowledgementFieldType: (() => {
+      const type = (alarm.fields.AcknowledgedDate as { type?: unknown } | undefined)?.type;
+      return type === undefined ? null : typeof type === "string" && /^[A-Z_]{1,32}$/.test(type) ? type : "unrecognized";
+    })(),
+    triggerIDMatchesRecord: [trigger.recordName, trigger.recordName.slice(13)].includes(String(get(alarm, "TriggerID"))),
+    reminderBacklinkMatches: equalReference(alarm, "Reminder", "Reminder", graph.reminder.recordName),
+    alarmBacklinkMatches: equalReference(trigger, "Alarm", "Alarm", alarm.recordName),
+    absoluteTrigger: get(trigger, "Type") === "Date",
+  };
+}
 /** Inspect retained root pairs independently of completion state or mutations. */
-export function inspectRootAbsoluteDatePair(graph: SchedulingGraph, owner: string) {
+export function inspectRootAbsoluteDatePair(graph: SchedulingGraph, owner: string, options: { acknowledgedCompletionAt?: number } = {}) {
   const reminder = normalizeReminder(graph.reminder, owner);
   const alarm = graph.records.find(record => record.recordName === reminder.alarmIds?.[0]);
   const trigger = graph.records.find(record => record.recordType === "AlarmTrigger");
   const rules = graph.records.filter(record => record.recordType === "RecurrenceRule");
+  const acknowledgement = alarm?.fields.AcknowledgedDate as { type?: unknown; value?: unknown } | undefined;
+  const acknowledged = acknowledgement !== undefined && options.acknowledgedCompletionAt !== undefined;
+  if (acknowledged && (acknowledgement.type !== "TIMESTAMP" || acknowledgement.value !== null &&
+    (typeof acknowledgement.value !== "number" || !Number.isSafeInteger(acknowledgement.value) ||
+      !Number.isFinite(new Date(acknowledgement.value).getTime()) || acknowledgement.value > options.acknowledgedCompletionAt!) ||
+    !Number.isSafeInteger(options.acknowledgedCompletionAt) ||
+    Object.keys(acknowledgement).some(key => !["type", "value"].includes(key))))
+    throw new AppError("UNSUPPORTED_FEATURE", "The acknowledged absolute alarm requires its exact typed past timestamp.");
+  const uid = alarm ? field(alarm, "AlarmUID", "STRING") : undefined;
+  // The acknowledged native pair may have a retained logical UUID distinct
+  // from its CloudKit identity. Ownership still comes from both exact backlinks,
+  // trigger identity, private-zone versions, due components and resolution nonce.
+  // Only the monthly completion caller admits this audit field on a retired pair.
+  const validUID = acknowledged ? typeof uid === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(uid) :
+    uid === alarm?.recordName.slice(6);
   if (!graph.complete || reminder.deleted !== false || reminder.completed === null || reminder.parentReminderId !== null || reminder.startDate !== null ||
     reminder.allDay !== false || !reminder.dueDate || !reminder.timeZone || reminder.alarmIds?.length !== 1 || rules.length > 1 ||
     graph.records.length !== 3 + rules.length || !alarm || alarm.recordType !== "Alarm" || !trigger ||
-    Object.keys(alarm.fields).some(key => !["AlarmUID", "DueDateResolutionTokenAsNonce", "Reminder", "TriggerID", "Imported", "Deleted"].includes(key)) ||
+    Object.keys(alarm.fields).some(key => !["AlarmUID", "DueDateResolutionTokenAsNonce", "Reminder", "TriggerID", "Imported", "Deleted", ...(acknowledged ? ["AcknowledgedDate"] : [])].includes(key)) ||
     Object.keys(trigger.fields).some(key => !["DateComponentsData", "Type", "Alarm", "Imported", "Deleted"].includes(key)) ||
     referenceField(alarm, "Reminder", "Reminder", owner) !== reminder.id || referenceField(trigger, "Alarm", "Alarm", owner) !== alarm.recordName ||
     ![trigger.recordName, trigger.recordName.slice(13)].includes(String(field(alarm, "TriggerID", "STRING"))) ||
-    field(trigger, "Type", "STRING") !== "Date" || field(alarm, "AlarmUID", "STRING") !== alarm.recordName.slice(6))
+    field(trigger, "Type", "STRING") !== "Date" || !validUID)
     throw new AppError("UNSUPPORTED_FEATURE", "The retained graph is not one ordinary bidirectional timed root date pair.");
   for (const record of [alarm, trigger]) if (!record.recordChangeTag || record.deleted || field(record, "Deleted", "INT64") !== 0 || field(record, "Imported", "INT64") !== 0)
     throw new AppError("CONFLICT", "A retained absolute-date participant changed or was deleted.", 409);

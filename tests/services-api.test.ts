@@ -33,6 +33,7 @@ test("owner dashboard settings change MCP discovery and direct permission enforc
     const list = async () => (await request("/mcp", { jsonrpc: "2.0", id: 1, method: "tools/list", params: {} })).data.result.tools.map((tool: { name: string }) => tool.name) as string[];
     assert.ok((await list()).includes("get_reminders"));
     assert.ok(!(await list()).includes("list_icloud_drive_items"));
+    assert.ok(!(await list()).includes("resolve_icloud_drive_folder_path"));
     const newReadTools = ["get_reminder_view", "export_reminders", "get_reminder_filters", "run_reminder_filter", "inspect_reminder", "get_reminder_list_sections"];
     const newWriteTools = ["save_reminder_filter", "delete_reminder_filter", "create_reminder_workflow", "duplicate_reminder_list"];
     const initialTools = await list();
@@ -46,6 +47,7 @@ test("owner dashboard settings change MCP discovery and direct permission enforc
     assert.equal((await request("/api/settings", { expectedRevision: 0, settings })).status, 409);
     const tools = await list();
     assert.ok(tools.includes("list_icloud_drive_items"));
+    assert.ok(tools.includes("resolve_icloud_drive_folder_path"));
     assert.ok(tools.includes("upload_icloud_drive_file"));
     assert.ok(!tools.includes("get_reminders"));
     assert.ok(!tools.includes("read_icloud_drive_file"));

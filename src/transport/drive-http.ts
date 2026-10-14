@@ -27,7 +27,8 @@ const DRIVE_METADATA_PATHS = new Set([
 
 export function validateDriveMetadataURL(value: URL): URL {
   const supportedHost = /^p\d+-drivews\.icloud\.com$/.test(value.hostname) || /^p\d+-docws\.icloud\.com$/.test(value.hostname);
-  if (value.protocol !== "https:" || !supportedHost || value.username || value.password || value.port || value.hash || !DRIVE_METADATA_PATHS.has(value.pathname)) return protocol("The iCloud Drive metadata address is outside the supported service endpoints.");
+  const sharedDownload = /^\/ws\/com\.apple\.CloudDocs\/download\/by_id\/[A-Za-z0-9._-]{1,256}$/.test(value.pathname);
+  if (value.protocol !== "https:" || !supportedHost || value.username || value.password || value.port || value.hash || !DRIVE_METADATA_PATHS.has(value.pathname) && !sharedDownload) return protocol("The iCloud Drive metadata address is outside the supported service endpoints.");
   if (value.hostname.endsWith("-drivews.icloud.com") && value.pathname.startsWith("/ws/")) return protocol("The iCloud Drive operation used an endpoint on the wrong service host.");
   if (value.hostname.endsWith("-docws.icloud.com") && !value.pathname.startsWith("/ws/com.apple.CloudDocs/")) return protocol("The iCloud Drive operation used an endpoint on the wrong service host.");
   return value;

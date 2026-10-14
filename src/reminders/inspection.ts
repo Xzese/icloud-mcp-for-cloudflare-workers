@@ -1,7 +1,7 @@
 import { z } from "zod";
 import { AppError } from "../errors.ts";
 import { normalizeList, normalizeReminder, referenceField, type CloudKitRecord, type CloudKitRemindersClient } from "../icloud/cloudkit.ts";
-import { jsonBytes } from "../lib/canonical.ts";
+import { jsonBytes, fingerprint } from "../lib/canonical.ts";
 import { CreateReminderInput, ReminderTargetInput, updateResolutionTokenMap } from "./writes.ts";
 import { RecurrenceCalendarTimeZone } from "./recurrence-calendar.ts";
 import { loadSchedulingGraph, type SchedulingGraph } from "./linked-records.ts";
@@ -9,6 +9,7 @@ import { readPreservedRecurrence, type RecurrenceState } from "./recurrence.ts";
 import { earlyReminderPayload, EARLY_UNITS } from "./early-reminder.ts";
 import { inspectLocationAlarms, locationSummary } from "./location-alarm.ts";
 import { validateAbsoluteDatePair } from "./date-alarm-lifecycle.ts";
+import { inspectRootAbsoluteDatePair } from "./linked-date.ts";
 import { readReminderOrganization, readReminderOrganizationSelection, reminderOrganizationIds, normalizeURLAttachment, normalizeReminderTag } from "./organization.ts";
 import { inspectListChildren, requireNoReadErrors } from "./subtasks.ts";
 import { inspectLifecycleFamily, planLifecycle } from "./lifecycle.ts";
@@ -38,8 +39,21 @@ const check = (status: ReminderActionCheck["status"], reason: string, affectedRe
 // Only fixed messages leave this boundary. Native error messages can mention
 // private field names or opaque payload paths, so they are not response data.
 function reason(error: unknown, fallback: string): string {
+  if (error instanceof AppError && error.code === "UNSUPPORTED_FEATURE" && [
+    "Recurring completion found unreviewed native parent/child metadata.",
+    "Recurring completion found unreviewed native relationship fields.",
+    "Recurring completion found native assignment metadata.",
+    "Recurring completion requires the observed monthly one-day early alert.",
+  ].includes(error.message)) return error.message;
   if (error instanceof AppError && error.code === "CONFLICT") return "The exact participants changed or could not be resolved. Read the reminder and list again before a new request.";
-  if (error instanceof AppError && error.code === "PROTOCOL_CHANGED") return "Apple returned an unrecognized relationship or field shape. This inspection cannot establish support.";
+  if (error instanceof AppError && error.code === "PROTOCOL_CHANGED") {
+    if (error.message === "Apple rejected the Reminders read request.") return "Apple rejected the native relationship read request. This inspection cannot establish support.";
+    if (/response.*byte budget|more data than.*response budget/i.test(error.message)) return "Apple's relationship response exceeded the bounded transport size. This inspection cannot establish support.";
+    if (/without its source-proven List relationship/.test(error.message)) return "Apple returned a reminder without its expected List relationship. This inspection cannot establish support.";
+    if (/ParentReminder/.test(error.message)) return "Apple returned an unrecognized ParentReminder relationship. This inspection cannot establish support.";
+    if (/List relationship|linked to a different list|reminder from another list/.test(error.message)) return "Apple returned a reminder outside the selected List. This inspection cannot establish support.";
+    return "Apple returned an unrecognized relationship or field shape. This inspection cannot establish support.";
+  }
   return fallback;
 }
 function propagateReadFailure(error: unknown) {
@@ -81,8 +95,15 @@ export async function inspectReminder(client: CloudKitRemindersClient, current: 
     }
     const locations = inspectLocationAlarms(graph, owner);
     if (locations.locations.length) schedule.locationAlarm = locationSummary(locations.locations[0].trigger);
-    if (normalizeReminder(locations.dateGraph.reminder, owner).alarmIds?.length)
-      validateAbsoluteDatePair(locations.dateGraph.reminder, locations.dateGraph.records.filter(record => ["Alarm", "AlarmTrigger"].includes(record.recordType)), owner);
+    if (normalizeReminder(locations.dateGraph.reminder, owner).alarmIds?.length) {
+      if (reminder.parentReminderId === null && !locations.dateGraph.schedulingParent && schedule.recurrence?.frequency === "monthly" && schedule.recurrence.interval === 1 && schedule.recurrence.endDate === null &&
+        ((JSON.stringify(schedule.recurrence.monthDays) === "[28,29]" && JSON.stringify(schedule.recurrence.setPositions) === "[-1]" &&
+          schedule.earlyReminder?.unit === "days" && schedule.earlyReminder.count === 1) ||
+          (!schedule.recurrence.monthDays && !schedule.recurrence.weekdays && !schedule.recurrence.ordinalWeekday && !schedule.recurrence.months && !schedule.recurrence.setPositions &&
+            (schedule.earlyReminder === null || schedule.earlyReminder.unit === "days" && schedule.earlyReminder.count === 1))))
+        inspectRootAbsoluteDatePair(locations.dateGraph, owner, { acknowledgedCompletionAt: Date.now() });
+      else validateAbsoluteDatePair(locations.dateGraph.reminder, locations.dateGraph.records.filter(record => ["Alarm", "AlarmTrigger"].includes(record.recordType)), owner);
+    }
     if (reminder.startDate !== null || reminder.allDay === null) throw new AppError("UNSUPPORTED_FEATURE", "Unclassified schedule.");
     schedule.status = "known";
   } catch (error) {
@@ -150,6 +171,10 @@ export async function inspectReminder(client: CloudKitRemindersClient, current: 
   const pages = new Map<string, ReturnType<CloudKitRemindersClient["queryRemindersPage"]>>();
   const familyClient = {
     lookup: (ids: string[]) => { const key = JSON.stringify(ids); if (!lookups.has(key)) lookups.set(key, client.lookup(ids)); return lookups.get(key)!; },
+    lookupRelationshipRecords: (ids: string[]) => {
+      const key = `relationships:${JSON.stringify(ids)}`;
+      if (!lookups.has(key)) lookups.set(key, client.lookupRelationshipRecords(ids)); return lookups.get(key)!;
+    },
     queryRemindersPage: (input: Parameters<CloudKitRemindersClient["queryRemindersPage"]>[0]) => {
       const key = JSON.stringify(input); if (!pages.has(key)) pages.set(key, client.queryRemindersPage(input)); return pages.get(key)!;
     },
@@ -206,7 +231,7 @@ export async function inspectReminder(client: CloudKitRemindersClient, current: 
       if (error instanceof AppError && error.message === "A nonmidnight recurrence EndDate requires an explicit recurrenceCalendarTimeZone.")
         actions[action] = check("requires_input", "This ended all-day daily recipe needs an explicit recurrenceCalendarTimeZone before eligibility can be determined. Supply the calendar zone and inspect again.", [reminder.id], ["recurrenceCalendarTimeZone", ...(action === "delete" ? ["recurringDeletionScope"] : [])]);
       else actions[action] = check("unsupported", reason(error, subtasks.status !== "known" ? subtasks.reason! :
-        reminder.recurrenceRuleIds?.length ? "This recurring root is outside the native lifecycle recipes. Only supported daily, timed weekly and observed last-day monthly schedules are eligible; recurrence with children, URL/tags, early/location alarms or assignments is refused." :
+        reminder.recurrenceRuleIds?.length ? "This recurring root is outside the native lifecycle recipes. Supported completion recipes include daily, timed weekly, ordinary timed monthly anchored to the current due date, all-day last-day monthly, and the observed timed monthly [28,29]/[-1] rule with a one-day early alert. Recurring deletion and reopening have separate recipes. Children, URL/tags, location alarms, assignments and other early-alert recipes are refused." :
         reminder.alarmIds?.length ? "The timed family must have one exact absolute date pair per scheduled member and no recurrence, early/location alarms, URL/tags or assignments." :
         "The ordinary one-level family or its exact completion/list metadata is outside the native lifecycle recipe. Review family relationships and current versions."));
     }
@@ -241,7 +266,21 @@ export async function inspectReminder(client: CloudKitRemindersClient, current: 
   }
   if (reminder.completed === false && reminder.deleted === false && !current.deleted && current.recordChangeTag)
     actions.update = check("requires_input", "Supply exact changes and the current recordChangeTag to prepare_reminder_update for a native read-only recipe preview. Eligibility depends on those changes; this inspection does not authorize or reserve a write.", [reminder.id], ["changes", "recordChangeTag"]);
-  const result = { schedule, organization, category, subtasks, actions, inspectionOnly: true as const };
+  // Synthetic-only shape/equality diagnostics, without native UUIDs or binary values.
+  const syntheticEarlyAlert = reminder.title?.startsWith("MCP protocol ") && schedule.earlyReminder ? (() => {
+    const payload = earlyReminderPayload(root), alert = payload.dueDateDeltaAlerts[0];
+    return { payload, alert };
+  })() : null;
+  const syntheticDiagnostics = syntheticEarlyAlert ? {
+    alertIdentity: await fingerprint(["synthetic-alert-v1", reminder.title, syntheticEarlyAlert.alert.identifier]),
+    accountIdentity: await fingerprint(["synthetic-account-v1", reminder.title, syntheticEarlyAlert.payload.accountIdentifier]),
+    creationDate: syntheticEarlyAlert.alert.creationDate,
+    acknowledgedDate: syntheticEarlyAlert.alert.acknowledgedDate ?? null,
+    reminderIdentityMatches: true as const,
+    minimumSupportedVersion: syntheticEarlyAlert.payload.minimumSupportedVersion,
+  } : undefined;
+  const result = { schedule, organization, category, subtasks, actions, inspectionOnly: true as const,
+    ...(syntheticDiagnostics ? { syntheticEarlyAlert: syntheticDiagnostics } : {}) };
   if (jsonBytes(result) > 65_536) throw new AppError("UNSUPPORTED_FEATURE", "The normalized inspection exceeds its response byte budget.");
   return result;
 }

@@ -1,0 +1,13 @@
+{
+  "source": "Three completions through the native Mac Reminders AppleScript interface on a dedicated synthetic test reminder, including a real early notification dismissed by the owner",
+  "scope": "Normalized schedule and early-payload identity/shape observations; no raw CloudKit export or credential material",
+  "dateEditContext": "The due date was moved through MCP while explicitly preserving the [28,29]/[-1] rule. This is not evidence for ordinary Monthly after a native date edit.",
+  "rule": { "frequency": "monthly", "interval": 1, "monthDays": [28, 29], "setPositions": [-1], "endDate": null },
+  "before": { "completed": false, "dueDate": "2026-10-14T08:00:00.000Z", "timeZone": "Europe/London", "earlyReminder": { "unit": "days", "count": 1 }, "acknowledged": false },
+  "activeAfter": { "sameReminderIdentity": true, "completed": false, "dueDate": "2026-10-29T09:00:00.000Z", "sameRuleIdentity": true, "sameEarlyAlertIdentity": true, "sameEarlyCreationDate": true, "sameAccountIdentity": true, "earlyReminderIdentityMatches": true, "sameReminderCreationDate": true },
+  "historyAfter": { "freshReminderIdentity": true, "completed": true, "dueDate": "2026-10-14T08:00:00.000Z", "recurrenceRuleCount": 0, "freshEarlyAlertIdentity": true, "sameEarlyCreationDate": true, "sameAccountIdentity": true, "earlyReminderIdentityMatches": true, "freshReminderCreationDate": true },
+  "earlyPayload": { "minimumSupportedVersion": 20230430, "alertCount": 1, "acknowledgedDatePresent": false },
+  "datePairs": { "activeAlarmCount": 1, "historyAlarmCount": 1, "freshDistinctAlarmIdentities": true },
+  "acknowledgedCompletion": { "notificationReceivedAndDismissedByOwner": true, "beforeAcknowledgementPresent": true, "activeSameAlertIdentity": true, "activeSameAcknowledgementTimestamp": true, "historyFreshAlertIdentity": true, "historySameAcknowledgementTimestamp": true, "sameAccountAndCreationMetadata": true },
+  "unobserved": ["other early offsets", "other monthly day sets", "delivery of future occurrences"]
+}

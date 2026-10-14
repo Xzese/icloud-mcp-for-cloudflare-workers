@@ -1,6 +1,6 @@
 import { AppError, WriteOutcomeUnknownError } from "../errors.ts";
 import { b64, utf8 } from "../crypto/bytes.ts";
-import { fingerprint, jsonBytes } from "../lib/canonical.ts";
+import { fingerprint } from "../lib/canonical.ts";
 import { stableNativePresentation } from "../lib/native-presentation.ts";
 import { normalizeList, normalizeReminder, referenceField, intrinsicParentIdentity, isKnownEmptyDeletionCollection, type CloudKitRecord, type CloudKitRecordItem } from "../icloud/cloudkit.ts";
 import type { RecurringIntent } from "../persistence/apple-sessions.ts";
@@ -11,6 +11,8 @@ import { RecurrenceCalendarTimeZone, recurrenceEndCalendarLabel } from "./recurr
 import { decodeDocument } from "./crdt.ts";
 import { updateResolutionTokenMap, type CloudKitWriteRecord } from "./writes.ts";
 import type { ListWrite } from "./list-writes.ts";
+import { withinCloudKitRequestBudget } from "../icloud/budgets.ts";
+import { earlyReminderPayload } from "./early-reminder.ts";
 
 type Fields = CloudKitWriteRecord["fields"];
 export type RecurringOperation = { operationType: "create" | "update" | "delete"; record: {
@@ -36,7 +38,7 @@ function resolution(record: CloudKitRecord, keys: string[], timestamp: number, r
   return JSON.stringify(updated);
 }
 
-export function nextRecurringDue(due: string, zone: string | null, allDay: boolean, kind: "weekly" | "last-day-monthly" | "daily") {
+export function nextRecurringDue(due: string, zone: string | null, allDay: boolean, kind: "weekly" | "last-day-monthly" | "monthly-29" | "monthly" | "daily") {
   const utc = (year: number, month: number, day: number, hour = 0, minute = 0, second = 0) => {
     const result = new Date(0); result.setUTCFullYear(year, month, day); result.setUTCHours(hour, minute, second, 0); return result;
   };
@@ -48,9 +50,23 @@ export function nextRecurringDue(due: string, zone: string | null, allDay: boole
     if (next.getUTCFullYear() < 1 || next.getUTCFullYear() > 9999) throw new AppError("UNSUPPORTED_FEATURE", "The next occurrence is outside the calendar range.");
     return next.toISOString();
   }
-  if (allDay || !zone || kind === "daily" && !RecurrenceCalendarTimeZone.safeParse(zone).success)
+  if (allDay || !zone || (kind === "daily" || kind === "monthly-29" || kind === "monthly") && !RecurrenceCalendarTimeZone.safeParse(zone).success)
     throw new AppError("UNSUPPORTED_FEATURE", "Timed completion requires a stored IANA-zone occurrence.");
-  const old = dateComponents(due, zone), local = utc(old.year, old.month - 1, old.day + (kind === "daily" ? 1 : 7), old.hour, old.minute, old.second);
+  const old = dateComponents(due, zone);
+  let local = utc(old.year, old.month - 1, old.day + (kind === "daily" ? 1 : 7), old.hour, old.minute, old.second);
+  if (kind === "monthly") {
+    if (old.day > utc(old.year, old.month + 1, 0).getUTCDate())
+      throw new AppError("UNSUPPORTED_FEATURE", "A monthly day absent from the next month requires a separate native calendar recipe.");
+    local = utc(old.year, old.month, old.day, old.hour, old.minute, old.second);
+  }
+  if (kind === "monthly-29") {
+    // Native final selection from [28,29]: February falls back to 28,
+    // and a moved earlier occurrence advances within the same month.
+    const candidate = (month: number) => utc(old.year, month, Math.min(29, utc(old.year, month + 1, 0).getUTCDate()), old.hour, old.minute, old.second);
+    local = candidate(old.month - 1);
+    if (local.getTime() <= utc(old.year, old.month - 1, old.day, old.hour, old.minute, old.second).getTime()) local = candidate(old.month);
+  }
+  if (local.getUTCFullYear() < 1 || local.getUTCFullYear() > 9999) throw new AppError("UNSUPPORTED_FEATURE", "The next occurrence is outside the calendar range.");
   const formatter = new Intl.DateTimeFormat("en-US-u-ca-gregory-nu-latn", { timeZone: zone, year: "numeric", month: "numeric", day: "numeric", hour: "numeric", minute: "numeric", second: "numeric", hourCycle: "h23" });
   const wall = (instant: number) => {
     const parts = formatter.formatToParts(new Date(instant)), get = (key: string) => Number(parts.find(part => part.type === key)?.value);
@@ -170,29 +186,38 @@ export async function planRecurringCompletion(graph: SchedulingGraph, list: Clou
   if (list.zoneID === undefined) list = { ...list, zoneID: { zoneName: "Reminders", zoneType: "REGULAR_CUSTOM_ZONE", ownerRecordName: owner } };
   const source = graph.reminder, reminder = normalizeReminder(source, owner);
   const rules = graph.records.filter(record => record.recordType === "RecurrenceRule");
+  if (Object.keys(source.fields).some(key => /parent|child|subtask/i.test(key) && key !== "ParentReminder"))
+    throw new AppError("UNSUPPORTED_FEATURE", "Recurring completion found unreviewed native parent/child metadata.");
+  if (Object.entries(source.fields).some(([key, raw]) => {
+    const wrapper = raw as { type?: unknown; value?: unknown } | null;
+    return wrapper?.value != null && (wrapper.type === "REFERENCE" && !["List", "ParentReminder"].includes(key) ||
+      ["STRING_LIST", "UNKNOWN_LIST"].includes(String(wrapper.type)) && Array.isArray(wrapper.value) && wrapper.value.length > 0 &&
+        !["AlarmIDs", "RecurrenceRuleIDs", "AttachmentIDs", "HashtagIDs", "AssignmentIDs"].includes(key));
+  })) throw new AppError("UNSUPPORTED_FEATURE", "Recurring completion found unreviewed native relationship fields.");
+  if (value(source, "AssignmentIDs") != null && !isKnownEmptyDeletionCollection("AssignmentIDs", source.fields.AssignmentIDs))
+    throw new AppError("UNSUPPORTED_FEATURE", "Recurring completion found native assignment metadata.");
   if (!graph.complete || rules.length !== 1 || reminder.recurrenceRuleIds?.length !== 1 || rules[0].recordName !== reminder.recurrenceRuleIds[0] ||
     reminder.completed !== (action === "reopen") || reminder.deleted !== false || reminder.parentReminderId !== null || reminder.startDate !== null || !reminder.dueDate ||
     (reminder.attachmentIds?.length ?? 0) || (reminder.hashtagIds?.length ?? 0) ||
-    Object.keys(source.fields).some(key => /parent|child|subtask/i.test(key) && key !== "ParentReminder") ||
-    Object.entries(source.fields).some(([key, raw]) => {
-      const wrapper = raw as { type?: unknown; value?: unknown } | null;
-      return wrapper?.value != null && (wrapper.type === "REFERENCE" && !["List", "ParentReminder"].includes(key) ||
-        ["STRING_LIST", "UNKNOWN_LIST"].includes(String(wrapper.type)) && Array.isArray(wrapper.value) && wrapper.value.length > 0 &&
-          !["AlarmIDs", "RecurrenceRuleIDs", "AttachmentIDs", "HashtagIDs", "AssignmentIDs"].includes(key));
-    }) ||
-    value(source, "DueDateDeltaAlertsData") != null || value(source, "AssignmentIDs") != null && !isKnownEmptyDeletionCollection("AssignmentIDs", source.fields.AssignmentIDs) ||
     referenceField(rules[0], "Reminder", "Reminder", owner) !== source.recordName || normalizeList(list, false).deleted !== false || normalizeList(list, false).isGroup !== false ||
     !list.recordChangeTag || list.recordChangeTag.length > 512 || list.raw.share != null || list.recordName !== reminder.listId) {
-    throw new AppError("UNSUPPORTED_FEATURE", "Recurring completion requires one exact ordinary root and its owned recurrence without subtasks, assignments, tags, attachments or early reminders.");
+    throw new AppError("UNSUPPORTED_FEATURE", "Recurring completion requires one exact ordinary root and its owned recurrence without subtasks, assignments, tags or attachments.");
   }
   const { kind, endDate } = readCompletionRecurrence(rules[0]), alarmed = (reminder.alarmIds?.length ?? 0) !== 0;
   const timedDaily = kind === "daily" && reminder.allDay !== true;
-  if (timedDaily) {
+  const timedMonthly = kind === "monthly-29" || kind === "monthly";
+  const early = value(source, "DueDateDeltaAlertsData") == null ? undefined : earlyReminderPayload(source);
+  if (kind === "monthly-29" && !early) throw new AppError("UNSUPPORTED_FEATURE", "This monthly completion requires the observed one-day early alert.");
+  if (early && (!timedMonthly || early.dueDateDeltaAlerts[0].dueDateDeltaUnit !== 2 || early.dueDateDeltaAlerts[0].dueDateDeltaCount !== -1))
+    throw new AppError("UNSUPPORTED_FEATURE", "Recurring completion requires the observed monthly one-day early alert.");
+  let monthlyPair: CloudKitRecord[] = [];
+  if (timedDaily || timedMonthly) {
     if (endDate !== null || reminder.allDay !== false || !RecurrenceCalendarTimeZone.safeParse(reminder.timeZone).success || !alarmed)
-      throw new AppError("UNSUPPORTED_FEATURE", "Timed daily completion requires a non-ended interval-one root with a stored IANA zone and one absolute date pair.");
-    inspectRootAbsoluteDatePair(graph, owner);
+      throw new AppError("UNSUPPORTED_FEATURE", "Timed daily or observed monthly completion requires a non-ended interval-one root with a stored IANA zone and one absolute date pair.");
+    const pair = inspectRootAbsoluteDatePair(graph, owner, timedMonthly ? { acknowledgedCompletionAt: timestamp } : {});
+    if (timedMonthly) monthlyPair = pair;
   }
-  if (alarmed && (kind !== "weekly" && !timedDaily || reminder.alarmIds?.length !== 1) || graph.records.length !== (alarmed ? 4 : 2)) throw new AppError("UNSUPPORTED_FEATURE", "This recurring alarm graph needs another completion recipe.");
+  if (alarmed && (kind !== "weekly" && !timedDaily && !timedMonthly || reminder.alarmIds?.length !== 1) || graph.records.length !== (alarmed ? 4 : 2)) throw new AppError("UNSUPPORTED_FEATURE", "This recurring alarm graph needs another completion recipe.");
   const due = Date.parse(reminder.dueDate);
   if (recurrenceCalendarTimeZone !== undefined && (kind !== "daily" || endDate === null || reminder.allDay !== true || reminder.timeZone !== null || alarmed))
     throw new AppError("UNSUPPORTED_FEATURE", "recurrenceCalendarTimeZone applies only to an ended all-day interval-one daily root without alarms.");
@@ -253,8 +278,20 @@ export async function planRecurringCompletion(graph: SchedulingGraph, list: Clou
     } else copied[key] = { type: String(wrapper.type), value: wrapper.value };
   }
   if (!copied.TitleDocument || copied.CreationDate?.type !== "TIMESTAMP" || !Number.isSafeInteger(copied.CreationDate.value)) throw new AppError("UNSUPPORTED_FEATURE", "History requires the exact title and original creation timestamp.");
+  if (timedMonthly) copied.CreationDate = { type: "TIMESTAMP", value: timestamp };
+  if (early) {
+    // Native completion preserves the active alert, creation and acknowledgement,
+    // but gives the history alert a fresh identity under its fresh reminder.
+    // Slot 22 is disjoint from the history (0..13), active (16..19) and
+    // membership (20) resolution-token replicas and is retained in the intent.
+    copied.DueDateDeltaAlertsData = { type: "ENCRYPTED_BYTES", value: b64(utf8(JSON.stringify({
+      ...early, reminderIdentifier: ids.history,
+      dueDateDeltaAlerts: [{ ...early.dueDateDeltaAlerts[0], identifier: ids.replicas[22] }],
+    }))) };
+  }
   const keys = ["allDay", "completed", "completionDate", "creationDate", "flagged", "lastModifiedDate", "list", "minimumSupportedVersion", "priority", "titleDocument", "dueDate",
-    ...(copied.NotesDocument ? ["notesDocument"] : []), ...(copied.TimeZone ? ["timeZone"] : [])];
+    ...(copied.NotesDocument ? ["notesDocument"] : []), ...(copied.TimeZone ? ["timeZone"] : []),
+    ...(early ? ["dueDateDeltaAlertsData"] : [])];
   const tokenMap = JSON.stringify({ map: Object.fromEntries(keys.map((key, index) => [key, { counter: 1, modificationTime: timestamp / 1000 - 978_307_200, replicaID: ids.replicas[index] }])) });
   const history: CloudKitWriteRecord = { recordName: `Reminder/${ids.history}`, recordType: "Reminder", parent: { recordName: list.recordName }, fields: {
     ...copied, Completed: { type: "INT64", value: 1 }, CompletionDate: { type: "TIMESTAMP", value: timestamp }, Deleted: { type: "INT64", value: 0 },
@@ -273,7 +310,9 @@ export async function planRecurringCompletion(graph: SchedulingGraph, list: Clou
   const operations: RecurringOperation[] = [{ operationType: "update", record: active }, { operationType: "create", record: history }, { operationType: "update", record: membership }];
   const retired: string[] = [];
   if (alarmed) {
-    const old = linkedDatePlan(graph, active, owner).dependencies;
+    const old = timedMonthly ? monthlyPair.map(record => ({
+      recordName: record.recordName, recordType: record.recordType, recordChangeTag: record.recordChangeTag!, fields: {},
+    })) : linkedDatePlan(graph, active, owner).dependencies;
     const includeZeroNanosecond = Object.hasOwn(decodeDateComponents(value(graph.records.find(record => record.recordType === "AlarmTrigger")!, "DateComponentsData")), "nanosecond");
     for (const record of [...old].reverse()) { retired.push(record.recordName); operations.push({ operationType: "delete", record: { ...record, fields: {} } }); }
     const pair = (root: CloudKitWriteRecord, due: string, alarm: string, trigger: string) => {
@@ -288,7 +327,7 @@ export async function planRecurringCompletion(graph: SchedulingGraph, list: Clou
     };
     pair(active, next, ids.activeAlarm, ids.activeTrigger); pair(history, reminder.dueDate, ids.historyAlarm, ids.historyTrigger);
   }
-  return finishRecurringPlan({ graph, list, ids, timestamp, mode, ...calendar, active, history, membership, operations, guards: [rules[0]], retired }, owner, timedDaily);
+  return finishRecurringPlan({ graph, list, ids, timestamp, mode, ...calendar, active, history, membership, operations, guards: [rules[0]], retired }, owner, timedDaily || timedMonthly);
 }
 
 async function finishRecurringPlan(plan: Omit<RecurringCompletionPlan, "sourceFingerprint" | "expected">, owner: string, preserveSourcePresentation = false): Promise<RecurringCompletionPlan> {
@@ -305,8 +344,8 @@ async function finishRecurringPlan(plan: Omit<RecurringCompletionPlan, "sourceFi
   for (const guard of guards) expected.push({ id: guard.recordName, type: guard.recordType as RecurringIntent["expected"][number]["type"], hash: await recurringRecordHash(guard, owner, plan.intrinsicParentGuards) });
   const guardedOperations = guards.map(guard => ({ operationType: "update", record: { recordName: guard.recordName, recordType: guard.recordType,
     recordChangeTag: guard.recordChangeTag, fields: { Deleted: { type: "INT64", value: 0 } } } }));
-  if (operations.length + guardedOperations.length > 32 || jsonBytes({ zoneID: { zoneName: "Reminders", zoneType: "REGULAR_CUSTOM_ZONE", ownerRecordName: owner },
-    atomic: true, operations: [...operations, ...guardedOperations] }) > 65_536) throw new AppError("UNSUPPORTED_FEATURE", "The entire recurring occurrence exceeds its atomic request budget.");
+  if (operations.length + guardedOperations.length > 32 || !withinCloudKitRequestBudget({ zoneID: { zoneName: "Reminders", zoneType: "REGULAR_CUSTOM_ZONE", ownerRecordName: owner },
+    atomic: true, operations: [...operations, ...guardedOperations] })) throw new AppError("UNSUPPORTED_FEATURE", "The entire recurring occurrence exceeds its atomic request budget.");
   const sourceFingerprint = await fingerprint([list, ...graph.records].map(record => ({ id: record.recordName, type: record.recordType, version: record.recordChangeTag,
     ...(plan.intrinsicParentGuards ? { parent: retainedIntrinsicIdentity(record, owner) } : record.recordType === "Reminder" ? { parent: intrinsicParentIdentity(record, owner) } : {}),
     fields: stableNativePresentation(record.fields) } )).sort((a, b) => a.id.localeCompare(b.id)));

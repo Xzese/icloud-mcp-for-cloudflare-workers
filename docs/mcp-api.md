@@ -5,6 +5,13 @@ what changes, and why. The input/output schemas advertised by `tools/list` are t
 machine-readable contract. This document describes the current source; an older deployment
 or a client with cached tool metadata can advertise an older contract.
 
+Sites clients use the stateless MCP `2026-07-28` discovery/list/call contract.
+`server/discover` returns that supported version and tool capability. The two
+tool methods share the SDK's enabled-tool schemas and callbacks through a narrowly
+scoped protocol-header adapter. Existing SDK MCP initialization remains supported
+with its advertised earlier versions. Owner authentication and all request byte
+limits precede either path; the Sites contract refuses batches and initialization.
+
 The connector follows **observed Apple Reminders behaviour for its supported recipes**.
 For example, completing a recurring occurrence normally advances the active reminder and
 creates completed history; it does not mark the next occurrence completed. The connector
@@ -60,6 +67,40 @@ Application errors set `isError: true` and include `error.code`, `message`, `ret
 `requestId`, with recovery details when appropriate. Input-schema failures can instead be
 MCP validation errors. A hosted adapter may label the outer error `INVALID_ARGUMENT`;
 inspect the nested connector error when present.
+
+Failures while decoding a List's `ReminderIDs` include `error.membershipDiagnostics`:
+`fieldType` (`STRING` or `OTHER`), `stringLength` (characters, or null), `jsonShape`
+(`not_inspected`, `invalid`, `array`, `object` or `scalar`) and `arrayLength` (or null).
+These expose only shape and size, never membership values or parser excerpts. Malformed
+fields, JSON, shapes or identities return `PROTOCOL_CHANGED`; exceeding the 131,072-character
+or 2,000-entry inspection limit returns `UNSUPPORTED_FEATURE`. Oversized strings are not
+parsed, so their JSON shape and array length remain unknown. Both failures are nonretryable
+and prevent lifecycle dispatch. A successful list summary deliberately returns
+`reminderIds: null` without inspecting membership; its separate `count` is not an inventory.
+
+Native inventories above 1,000 entries use bounded 200-item pages and exact lookup batches,
+at most 10 query pages and 2,000 distinct reminder identities. These inventory reads project
+`List`, `ParentReminder` and `Deleted`; document content and scheduling graphs do not
+establish parent relationships. Selected lifecycle participants are subsequently resolved
+with full fields and exact versions before planning.
+The relationship projection uses the List-scoped `reminderList` view including completed
+records, with linked-reference hydration disabled (`LookupValidatingReference=0`). Relationship
+normalization validates only those native links and deletion state; unrelated audit dates
+and document formats cannot stand in for a parent-link check. Owned deleted stubs are ignored.
+Query and exact-lookup phases each cap aggregate data at 8 MiB;
+large exact lookups run in groups of at most four alongside the independent query scan,
+draining both branches before a failure. Query-only identities are then resolved exactly;
+the 1 MiB per-response limit remains in force. Inspection and individual completion
+use a fixed 60-second request/lease allowance to cover bounded large inventories;
+other requests retain the existing defaults. Completion still requires at least ten
+seconds of unexpired lease before dispatch, with every generation/version, permission
+and disconnect fence checked again. No active lease is extended.
+A failed authorized inspection can include `error.inspectionDiagnostics` with
+bounded request paths, elapsed milliseconds, record counts/types and continuation
+flags. It never includes query bodies, native IDs, documents or cookies.
+Atomic writes can carry up to 256 KiB when native List ordering requires it; removing only
+those bounded ordering values must leave at most the original 64 KiB of other request data.
+This capacity does not enlarge reminder-content limits or permit splitting a recurring write.
 
 | Result or error | Meaning and next action |
 | --- | --- |
@@ -575,11 +616,12 @@ to inspect/reopen that completed occurrence, use `completedOccurrence.id` and it
 
 Active-series lifecycle recipes require an exact owned private root, one supported rule,
 a due date and complete bounded graph/descendant inspection. They exclude subtasks,
-`startDate`, assignments, tags, attachments, early reminders, location alarms and unknown
+`startDate`, assignments, tags, attachments, location alarms and unknown
 relationships. Completion/deletion require an open nondeleted active record; recurring
 reopening requires its completed exact final occurrence. The same exclusions apply to the
 active-series deletion recipes below. Independent history instead uses its supported
-ordinary lifecycle recipe.
+ordinary lifecycle recipe. Early reminders are excluded except for the exact completion-only
+monthly recipe below; that exception does not authorize recurring deletion or reopening.
 
 - **Timed weekly:** childless interval-one root in its stored IANA zone, zero or one supported
   absolute-date pair. A supported end must be on an exact weekly occurrence and local clock.
@@ -597,8 +639,37 @@ ordinary lifecycle recipe.
   without stored zone/alarms, using the observed no-end rule with native month days
   `[28,29,30,31]` and set position `[-1]`, advancing actual month ends and creating history.
   This is distinct from an arbitrary monthly recurrence or a guessed hidden anchor.
+- **Ordinary timed monthly:** a childless no-end interval-one monthly rule without
+  explicit day, weekday, month or set-position patterns advances one calendar month
+  from its current due date. A native date edit from the 13th to the 18th therefore
+  advances to the 18th of the following month. It requires a stored IANA zone and
+  one absolute date pair; either no early alert or the supported one-day early
+  alert is accepted. Local clock, active identity and rule are preserved, with
+  independent completed history at the old due date. Missing month days and
+  ambiguous/missing local times are refused rather than guessing a fallback.
+  This follows the owner's native Monthly/date-edit observation; it is distinct
+  from an explicit calendar day pattern.
+- **Timed monthly with one-day early alert:** the observed no-end interval-one rule with
+  native month days `[28,29]` and set position `[-1]`, a stored IANA zone, exactly one
+  absolute-date pair and one early alert of one day. Final selection chooses
+  day 29, falling back to February 28 in nonleap years. A moved earlier occurrence may
+  advance within its current month; the local clock is preserved across daylight saving.
+  The active early payload, including any acknowledgement timestamp, is unchanged. Completed history receives a fresh reminder and
+  alert identity, preserves the alert creation/acknowledgement timestamps and account metadata, has no rule,
+  and uses a fresh history creation timestamp. Alert identity is retained in the encrypted
+  intent before dispatch; uncertain results are reconciled without another write.
+  Other monthly patterns and offsets remain unsupported.
 
-For supported weekly or timed daily advancement with an absolute-date alarm, Apple creates
+  That monthly completion also accepts the old absolute alarm's nullable typed
+  `AcknowledgedDate` timestamp and its valid logical UUID even when Apple has
+  replaced the CloudKit alarm identity. Non-null timestamps must be finite whole
+  milliseconds and no later than execution. Both exact backlinks, trigger ID,
+  date components, resolution nonce, owned graph and every version remain checked.
+  The old pair is retired; both fresh pairs start without that old audit field.
+  This exception does not enable acknowledged-alarm date edits or other lifecycle
+  recipes.
+
+For supported weekly, timed daily or the observed timed monthly advancement with an absolute-date alarm, Apple creates
 separate fresh Alarm/
 AlarmTrigger pairs for next active and completed history and retires the exact old pair.
 History retains its own old-date pair; reopening it retains that pair. The connector follows

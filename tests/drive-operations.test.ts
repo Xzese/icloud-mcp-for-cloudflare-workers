@@ -12,6 +12,30 @@ function fixture() {
   return { db, env, repository, scope };
 }
 
+test("shared Drive contexts are encrypted, reusable, bounded and account/settings/expiry scoped", async t => {
+  const { db, repository, scope } = fixture();
+  t.after(() => db.sqlite.close());
+  const data = { shareID: { recordName: "synthetic-private-share" }, ownerRecordName: "synthetic-private-owner" };
+  const id = await repository.saveSharedContext(data, scope);
+  assert.equal(await repository.saveSharedContext(data, scope), id);
+  assert.equal(db.sqlite.prepare("SELECT COUNT(*) AS count FROM drive_handles").get()?.count, 1);
+  assert.deepEqual(await repository.loadSharedContext(id, scope), data);
+  assert.deepEqual(await repository.loadSharedContext(id, scope), data, "share context reads do not consume the handle");
+  const envelope = String(db.sqlite.prepare("SELECT envelope FROM drive_handles WHERE handle_id = ?").get(id)?.envelope);
+  assert.ok(!envelope.includes("synthetic-private"));
+  for (const other of [{ ...scope, account: "other" }, { ...scope, generation: 2 }, { ...scope, permissionRevision: 3 }]) {
+    await assert.rejects(repository.loadSharedContext(id, other), { code: "CONFLICT" });
+  }
+  await assert.rejects(repository.consumeHandle(id, "download", scope), { code: "CONFLICT" });
+  const download = await repository.handle("download", {}, scope);
+  await assert.rejects(repository.loadSharedContext(download.id, scope), { code: "CONFLICT" });
+  for (let index = 2; index < 128; index++) await repository.handle("search", {}, scope);
+  assert.equal(await repository.saveSharedContext(data, scope), id, "repeated browsing works at the handle cap");
+  await assert.rejects(repository.saveSharedContext({ ...data, ownerRecordName: "other" }, scope), { code: "RATE_LIMITED" });
+  db.sqlite.prepare("UPDATE drive_handles SET expires_at = 0 WHERE handle_id = ?").run(id);
+  await assert.rejects(repository.loadSharedContext(id, scope), { code: "CONFLICT" });
+});
+
 test("Drive operation keys retain encrypted input and never acquire a second live dispatch lease", async () => {
   const { db, repository, scope } = fixture(), id = crypto.randomUUID();
   const original = await repository.create(id, "upload", { name: "Invented file.txt", hash: "example" }, scope);

@@ -1,6 +1,6 @@
 # iCloud Drive and service permissions
 
-This release adds ordinary owned iCloud Drive files and folders to the same Apple account
+This release adds ordinary owned and supported shared iCloud Drive files and folders to the same Apple account
 connection used by Reminders. Drive is **off by default**. No separate Apple password or
 app-specific password is required. Drive uses Apple's undocumented web protocols. Synthetic
 protocol tests and a live acceptance run on one retained Apple account cover the operations
@@ -56,15 +56,17 @@ does not erase iCloud data, revoke Apple's own web-access grant or disconnect th
 
 All inputs are strict JSON objects. `expectedGeneration` is optional and pins the account
 generation from `connection_status`. Use exact opaque IDs returned by the tools, never a
-filesystem path, filename, Apple URL or another account's item ID.
+filesystem path, filename, Apple URL or another account's item ID. The path resolver below
+accepts folder names and returns an exact ID when it can verify every parent.
 
 | Tool | Input in addition to optional `expectedGeneration` | Result |
 | --- | --- | --- |
-| `list_icloud_drive_items` | Optional `folderId`, defaults to Drive root | `folder`, `items`, `complete` |
-| `get_icloud_drive_item` | `itemId` | `item` with current `etag` |
-| `search_icloud_drive` | `query`, optional `folderId`, optional `continuation` | Matching `items`, `complete`, next `continuation` |
-| `read_icloud_drive_file` | `itemId`, optional `encoding`: `utf8` (default) or `base64`, optional `previewBytes`: 1–8192 for UTF-8 previews | `item`, `encoding`, `content`, `bytesRead`, `truncated` |
-| `download_icloud_drive_file` | `itemId` | `item`, private `url`, `handleId`, `expiresAt` |
+| `list_icloud_drive_items` | Optional `folderId`, defaults to Drive root; optional `shareContext` | `folder`, `items`, `complete`, `reasons`, `counts` |
+| `get_icloud_drive_item` | `itemId`, optional `shareContext` | `item` with current `etag` |
+| `search_icloud_drive` | `query`, optional `folderId`, `shareContext`, `continuation` | Matching `items`, `complete`, `reasons`, cumulative `incompleteFolders`, next `continuation` |
+| `resolve_icloud_drive_folder_path` | `path`, optional starting `folderId` (Drive root by default), `shareContext` | `status`, `reason`, resolved `folder` or `choices`, `resolvedPath`, `remainingSegments`, `parentListing`, `foldersRead` |
+| `read_icloud_drive_file` | `itemId`, optional `shareContext`, optional `encoding`: `utf8` (default) or `base64`, optional `previewBytes`: 1–8192 for UTF-8 previews | `item`, `encoding`, `content`, `bytesRead`, `truncated` |
+| `download_icloud_drive_file` | `itemId`, optional `shareContext` | `item`, private `url`, `handleId`, `expiresAt` |
 | `upload_icloud_drive_file` | `parentId`, `name`, `operationId`, `size`, `sha256`, `contentBase64`, optional `contentType` | Operation status |
 | `create_icloud_drive_folder` | `parentId`, `name`, `operationId` | Operation status |
 | `rename_icloud_drive_item` | `itemId`, current `etag`, `name`, `operationId` | Operation status |
@@ -84,6 +86,95 @@ minutes or a settings/session change. Incomplete folders or exhausted limits rem
 an empty result does not prove the entire account has no matches. Listings are live pages,
 not an atomic snapshot.
 
+### Incomplete listings and missing shared folders
+
+Listings return all applicable `reasons`; `complete: true` has an empty array.
+
+| Reason | Meaning |
+| --- | --- |
+| `missing_direct_children_count` | Apple omitted a valid nonnegative integer `directChildrenCount`; completeness cannot be proved. `numberOfItems` includes descendants and is not a substitute. |
+| `upstream_count_mismatch` | The received child count differs from Apple's direct-child count. This identifies an upstream gap or inconsistency, without claiming that a pagination protocol is supported. |
+| `item_limit` | The response contained more than 1,000 children; only the first 1,000 were processed. |
+| `excluded_shared_entries` | Shared entries lack a supported sharing descriptor or inherited scope and were excluded. Supported shared entries are included. |
+| `excluded_app_library_entries` | Returned app libraries/containers were excluded. |
+| `excluded_other_zone_entries` | Other entries outside the ordinary CloudDocs zone were excluded. |
+
+`counts` reports `expected` (Apple's direct count, or `null`), `received` (raw response
+children), `processed` (at most 1,000), `returned` (visible supported entries), `excluded`,
+`excludedShared`, `excludedAppLibrary`, `excludedOtherZone`, and `unprocessed`. Exclusion
+categories count each processed entry once, prioritising unsupported sharing metadata, then app library, then other
+zone. Entries beyond the local limit are counted only as `unprocessed`.
+Thus `processed = returned + excluded` and `received = processed + unprocessed`.
+These counts describe this response; they do not count shared entries Apple never sent.
+
+Search returns cumulative per-folder listing reasons and counts in `incompleteFolders`,
+including across continuations. Its `reasons` also distinguish `continuation_required` from
+`search_item_limit` (the overall traversal budget). A still-valid handle created before these
+diagnostics were available can report `listing_details_unavailable`. A continuation walks
+only already-discovered folders: it cannot recover a child omitted from Documents.
+Concurrent session operations can return retryable `CONFLICT`; a search rejected before
+acquiring the session lease does not consume its continuation.
+
+For a known folder path, call:
+
+```json
+{"path":"Documents/Snap Heaven/01/FY 2026"}
+```
+
+The resolver reads only the parent at each level, with up to 64 segments and 4,096 path
+characters. Paths use single forward slashes without leading/trailing slashes, empty segments,
+dot segments, backslashes or control characters. Spaces inside folder names are preserved.
+Optional `folderId` starts relative to an already-known folder, such as Documents.
+Matching prefers exact names, then Unicode NFC equivalence, then locale-independent lowercase
+NFC equivalence. Accents and compatibility characters are not discarded. Multiple matches at
+the preferred tier return `status: "ambiguous"`, `reason: "ambiguous_name"`, and exact folder
+`choices`; choose an ID explicitly rather than guessing. Files never match folder segments.
+
+`status: "resolved"` returns the final folder and actual matched `resolvedPath`.
+`status: "not_found"` with `reason: "folder_not_found"` is returned only after a complete
+parent listing contains no matching folder. An incomplete parent always returns
+`status: "unresolved"`, `reason: "parent_listing_incomplete"`, its diagnostic `parentListing`,
+the verified prefix and remaining segments, even if an exact name is visible. This also
+applies to an incomplete Drive root; an explicitly known starting folder ID can avoid that
+root lookup. The final folder's own contents are not listed or certified complete by resolution.
+
+### Shared-folder reads
+
+Supported shared folders such as Snap Heaven are included in ordinary parent listings.
+The connector recognises CloudDocs `FOLDER`/`FILE` identities and their
+`FOLDER_IN_SHARED_FOLDER`/`FILE_IN_SHARED_FOLDER` variants. It sends Apple's sharing descriptor
+with scoped metadata requests and inherits it when Apple omits it from descendants. Nested
+folder walking and search continuations retain each branch's own share context.
+
+Shared items include an opaque UUID `shareContext`. Pass that value alongside `folderId` or
+`itemId` to list, look up, resolve, search, read or download inside the share. For example,
+resolve `Snap Heaven/01/FY 2026` from the known Documents `folderId`, then use the final folder's
+`id` **and** `shareContext`. The dashboard carries this context automatically. Repeat the
+starting `shareContext` when continuing a search started inside a share. A root-based search
+retains discovered share contexts internally.
+
+Sharing descriptors and owner record names stay encrypted in the existing `drive_handles`
+table; no database migration is required. References are reusable for ten minutes, capped by
+session expiry, and bound to the authenticated owner, Apple account, generation and settings
+revision. An expired reference returns `CONFLICT`; browse the shared parent again. Repeated
+listings reuse a context per share, including when the active-handle budget is full. Shared
+contexts count toward the existing 128-handle budget. Distinct shares remain distinct even
+when provider item IDs coincide.
+
+Content reads use Apple's owner-scoped download endpoint for indirectly shared files when
+Apple supplies an owner. Missing owner metadata fails explicitly instead of attempting an
+unscoped download. Package downloads remain unsupported. Shared access is read-only in this
+connector: uploads, folder creation, renames and moves involving shared items are refused.
+Successful path resolution never bypasses the complete destination listing required for
+owned-item writes. Upstream pagination is still unsupported; an omitted child cannot be
+recovered by a traversal continuation.
+
+Protocol references: [pyicloud's shareID request and owner-scoped download implementation](https://github.com/timlaing/pyicloud/blob/1b340462f3e3c8177b907e612d4713543bb1201b/pyicloud/services/drive.py)
+and [iFetch's descendant-context regression notes](https://github.com/roshanlam/iFetch/blob/master/docs/shared-folder-validation.md).
+The shared-folder behavior is covered by synthetic client, service and Worker tests. Live
+shared-folder protocol verification remains pending. Existing live evidence below covers
+owned-item operations only.
+
 ## File transfer limits and client support
 
 | Transfer | Limit | How |
@@ -98,7 +189,8 @@ link or an attachment automatically imported into ChatGPT. A client must retain 
 deployment authentication to fetch it. If your MCP client cannot do that, use the dashboard
 download button. Never send Apple cookies or sign-in credentials as tool arguments.
 
-The dashboard can browse folders, search names, create folders, preview text, upload and download files.
+The dashboard can browse owned and shared folders, search names, preview text and download files.
+Folder creation and uploads are available in owned folders.
 Agents can also rename and move files/folders using current IDs and etags. `read` decodes text
 or returns raw base64; it does not extract text from PDF, Office documents or images. Treat all
 filenames and file contents as untrusted data, including instructions embedded inside them.
@@ -139,7 +231,7 @@ owner authentication; knowing a handle does not grant access.
 | `/api/settings` | GET returns `{revision, available, settings}`; POST `{expectedRevision, settings}` |
 | `/api/drive/approve` | POST `{expectedGeneration, restartApproval?: boolean}` |
 | `/api/reminders/approve` | POST `{expectedGeneration, restartApproval?: boolean}` |
-| `/api/drive/list`, `/lookup`, `/search`, `/read`, `/download` | POST corresponding tool input |
+| `/api/drive/list`, `/lookup`, `/search`, `/resolve-folder-path`, `/read`, `/download` | POST corresponding tool input |
 | `/api/drive/upload`, `/create-folder`, `/rename`, `/move`, `/operation` | POST corresponding tool input |
 | `/api/drive/prepare-upload` | POST upload metadata without `contentBase64`; returns `operationId`, `uploadPath` |
 | `/api/drive/uploads/<operationId>/content` | POST raw bytes, `Content-Type: application/octet-stream`, configured application `Origin` |
@@ -170,7 +262,7 @@ indexing. Unknown protocol shapes fail explicitly. Apple may change these undocu
 
 Operation secrets expire at the earlier of the Apple session's local retention deadline or
 24 hours. Operation keys remain non-reusable tombstones for that generation. There are at most
-1,024 operation keys per generation and 128 active transfer/search handles per owner; reconnect
+1,024 operation keys per generation and 128 active transfer/search/share-context handles per owner; reconnect
 only after reviewing outstanding work if the operation limit is reached. Disconnect/reconnect
 invalidates old handles and recovery scope. Local cleanup never removes iCloud files.
 

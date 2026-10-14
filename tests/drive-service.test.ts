@@ -264,15 +264,242 @@ test("search uses bounded selected-tree continuations and refuses stale scope an
   assert.equal(folderReads, 3);
   assert.equal(first.items.length, 2);
   assert.equal(first.complete, false);
+  assert.deepEqual(first.reasons, ["continuation_required"]);
   assert.equal(first.scope, "selected-folder-tree");
   const next = await f.service.search({ query: "match", continuation: first.continuation });
   assert.equal(folderReads, 5);
   assert.equal(next.items.length, 2);
   assert.equal(next.complete, true);
+  assert.deepEqual(next.reasons, []);
   await assert.rejects(f.service.search({ query: "match", continuation: first.continuation }), { code: "CONFLICT" });
   await assert.rejects(f.service.createFolder({ operationId: crypto.randomUUID(), parentId: DRIVE_ROOT, name: "folder 1" }), { code: "CONFLICT" });
   const scoped = await f.service.search({ query: "match" });
   await assert.rejects(f.service.search({ query: "different", continuation: scoped.continuation }), { code: "CONFLICT" });
+});
+
+test("folder path resolution walks named parents, supports shares, and explains malformed shared entries", async t => {
+  const names = ["Documents", "Snap Heaven", "01", "FY 2026"];
+  const folders = names.map((name, index) => ({ ...root, drivewsid: `FOLDER::com.apple.CloudDocs::path-${index}`, docwsid: `path-${index}`, name, parentId: index ? `FOLDER::com.apple.CloudDocs::path-${index - 1}` : DRIVE_ROOT }));
+  const reads: string[] = [];
+  let shared: false | "valid" | "invalid" = false, missing = false;
+  const f = await fixture(t, (url, init) => {
+    assert.equal(url.pathname, "/retrieveItemDetailsInFolders");
+    const [{ drivewsid }] = JSON.parse(String(init.body));
+    reads.push(drivewsid);
+    const index = drivewsid === DRIVE_ROOT ? -1 : folders.findIndex(item => item.drivewsid === drivewsid);
+    const parent = index < 0 ? root : folders[index]!;
+    const child = folders[index + 1]!;
+    return json([{ ...parent, directChildrenCount: 1, items: missing && index === 0 ? [] : [{ ...child, ...(shared && index === 0 ? { shareID: shared === "valid" ? { recordName: "synthetic-share" } : [] } : {}) }] }]);
+  });
+  const resolved = await f.service.resolveFolderPath({ path: "Documents/Snap Heaven/01/FY 2026", expectedGeneration: f.generation });
+  assert.equal(resolved.status, "resolved");
+  assert.equal(resolved.folder?.id, folders[3]!.drivewsid);
+  assert.equal(resolved.resolvedPath, names.join("/"));
+  assert.equal(resolved.foldersRead, 4);
+  assert.deepEqual(reads, [DRIVE_ROOT, ...folders.slice(0, 3).map(item => item.drivewsid)]);
+  assert.equal(resolved.generation, f.generation);
+  reads.length = 0;
+  const relative = await f.service.resolveFolderPath({ folderId: folders[0]!.drivewsid, path: "snap heaven/01/fy 2026" });
+  assert.equal(relative.status, "resolved");
+  assert.equal(relative.resolvedPath, names.slice(1).join("/"));
+  assert.equal(reads.length, 3);
+  shared = "valid";
+  const sharedPath = await f.service.resolveFolderPath({ path: names.join("/") });
+  assert.equal(sharedPath.status, "resolved");
+  assert.ok(sharedPath.folder?.shareContext);
+  shared = "invalid";
+  reads.length = 0;
+  const excluded = await f.service.resolveFolderPath({ path: names.join("/") });
+  assert.equal(excluded.status, "unresolved");
+  assert.equal(excluded.resolvedPath, "Documents");
+  assert.deepEqual(excluded.remainingSegments, names.slice(1));
+  assert.deepEqual(excluded.parentListing.reasons, ["excluded_shared_entries"]);
+  assert.equal(excluded.parentListing.counts.excludedShared, 1);
+  assert.equal(reads.length, 2);
+  missing = true;
+  const omitted = await f.service.resolveFolderPath({ path: names.join("/") });
+  assert.equal(omitted.status, "unresolved");
+  assert.deepEqual(omitted.parentListing.reasons, ["upstream_count_mismatch"]);
+  const before = reads.length;
+  await assert.rejects(f.service.resolveFolderPath({ path: "Documents/../child" }), { code: "VALIDATION_ERROR" });
+  await assert.rejects(f.service.resolveFolderPath({ path: "Documents", expectedGeneration: f.generation + 1 }), { code: "CONFLICT" });
+  assert.equal(reads.length, before);
+  const saved = await f.settings.load();
+  await f.settings.save({ expectedRevision: saved.revision, settings: { ...saved.settings, drive: { ...saved.settings.drive, enabled: false } } });
+  await assert.rejects(f.service.resolveFolderPath({ path: "Documents" }), { code: "FORBIDDEN" });
+  assert.equal(reads.length, before);
+});
+
+test("large parent diagnostics survive search continuations and block resolution and upload allocation", async t => {
+  let reads = 0;
+  const children = Array.from({ length: 1001 }, (_, index) => file(`match-${index}.txt`, `large-${index}`));
+  const f = await fixture(t, url => {
+    assert.equal(url.pathname, "/retrieveItemDetailsInFolders", "an incomplete destination must never reach allocation");
+    reads++;
+    return json([{ ...root, directChildrenCount: 1001, items: children }]);
+  });
+  let result = await f.service.search({ query: "match" });
+  let matches = result.items.length;
+  assert.deepEqual(result.reasons, ["item_limit", "continuation_required"]);
+  while (result.continuation) {
+    result = await f.service.search({ query: "match", continuation: result.continuation });
+    matches += result.items.length;
+  }
+  assert.equal(matches, 1000);
+  assert.equal(result.complete, false);
+  assert.deepEqual(result.reasons, ["item_limit"]);
+  assert.equal(result.incompleteFolders.length, 1);
+  assert.equal(result.incompleteFolders[0]?.counts.unprocessed, 1);
+  assert.equal(reads, 1, "continuing only drains the discovered items; no guessed upstream pagination");
+  const unresolved = await f.service.resolveFolderPath({ path: "Documents/Snap Heaven" });
+  assert.equal(unresolved.status, "unresolved");
+  assert.deepEqual(unresolved.parentListing.reasons, ["item_limit"]);
+  const metadata = Object.fromEntries(Object.entries(await uploadInput("new.txt")).filter(([key]) => key !== "contentBase64"));
+  await assert.rejects(f.service.prepareUpload(metadata), error => (error as Error).message.includes("destination listing is incomplete"));
+  assert.equal(reads, 3);
+});
+
+test("search explains an exhausted tree budget separately from incomplete folder listings", async t => {
+  const folders = Array.from({ length: 1000 }, (_, i) => ({ ...root, drivewsid: `FOLDER::com.apple.CloudDocs::budget-${i}`, docwsid: `budget-${i}`, name: `Folder ${i}`, parentId: DRIVE_ROOT }));
+  const f = await fixture(t, () => json([{ ...root, directChildrenCount: 1000, items: folders }]));
+  const result = await f.service.search({ query: "absent" });
+  assert.equal(result.continuation, null);
+  assert.equal(result.complete, false);
+  assert.deepEqual(result.reasons, ["search_item_limit"]);
+  assert.deepEqual(result.incompleteFolders, []);
+});
+
+test("shared folders remain scoped through nested paths, cold clients, search continuations and downloads", async t => {
+  const descriptor = { recordName: "synthetic-share-record", zoneID: { zoneName: "com.apple.CloudDocs", ownerRecordName: "synthetic-share-owner" } };
+  const shareRoot = { ...root, drivewsid: "FOLDER::com.apple.CloudDocs::shared-root", docwsid: "shared-root", name: "Snap Heaven", parentId: DRIVE_ROOT, shareID: descriptor, owner: { ownerRecordName: "synthetic-share-owner" } };
+  const nested = ["01", "FY 2026", "Reports"].map((name, i) => ({ ...root, drivewsid: `FOLDER_IN_SHARED_FOLDER::com.apple.CloudDocs::shared-${i}`, docwsid: `shared-${i}`, name, parentId: i ? `FOLDER_IN_SHARED_FOLDER::com.apple.CloudDocs::shared-${i - 1}` : shareRoot.drivewsid }));
+  const sharedFile = { ...file("budget.txt", "shared-file", nested[2]!.drivewsid), drivewsid: "FILE_IN_SHARED_FOLDER::com.apple.CloudDocs::shared-file" };
+  let calls = 0, downloads = 0;
+  const f = await fixture(t, (url, init) => {
+    calls++;
+    if (url.hostname === "cvws.icloud-content.com") { downloads++; return new Response(new TextEncoder().encode("abc")); }
+    if (url.pathname === "/ws/com.apple.CloudDocs/download/by_id/synthetic-share-owner") {
+      assert.equal(url.searchParams.get("document_id"), sharedFile.docwsid);
+      return json({ document_id: sharedFile.docwsid, data_token: { url: syntheticDownloadURL() } });
+    }
+    assert.ok(["/retrieveItemDetailsInFolders", "/retrieveItemDetails"].includes(url.pathname), "shared reads must never send a mutation");
+    const body = JSON.parse(String(init.body));
+    const entry = Array.isArray(body) ? body[0] : body.items[0];
+    if (entry.drivewsid === DRIVE_ROOT) return json([{ ...root, items: [shareRoot], directChildrenCount: 1 }]);
+    if (entry.drivewsid === shareRoot.drivewsid) {
+      if (entry.shareID) assert.deepEqual(entry.shareID, descriptor);
+      return json([{ ...shareRoot, items: [nested[0]], directChildrenCount: 1 }]);
+    }
+    assert.deepEqual(entry.shareID, descriptor, "Apple does not repeat shareID below the root; the client must inherit it");
+    if (entry.drivewsid === sharedFile.drivewsid) return json({ items: [sharedFile] });
+    const index = nested.findIndex(folder => folder.drivewsid === entry.drivewsid);
+    assert.ok(index >= 0);
+    return json([{ ...nested[index], items: [index === 2 ? sharedFile : nested[index + 1]], directChildrenCount: 1 }]);
+  });
+  const listed = await f.service.list({});
+  assert.equal(listed.complete, true);
+  assert.deepEqual(listed.reasons, []);
+  const ref = listed.items[0]!;
+  assert.ok(ref.shareContext);
+  assert.ok(!JSON.stringify(listed).includes("synthetic-share-owner"));
+  assert.ok(!JSON.stringify(listed).includes("synthetic-share-record"));
+  const resolved = await f.service.resolveFolderPath({ path: "Snap Heaven/01/FY 2026" });
+  assert.equal(resolved.status, "resolved");
+  assert.equal(resolved.folder?.id, nested[1]!.drivewsid);
+  assert.equal(resolved.folder?.shareContext, ref.shareContext);
+  const cold = new DriveService(f.env, owner);
+  const childListing = await cold.list({ folderId: nested[1]!.drivewsid, shareContext: ref.shareContext });
+  assert.equal(childListing.items[0]?.shareContext, ref.shareContext);
+  const search = await f.service.search({ query: "budget" });
+  assert.ok(search.continuation);
+  const continued = await cold.search({ query: "budget", continuation: search.continuation });
+  assert.equal(continued.complete, true);
+  assert.equal(continued.items[0]?.id, sharedFile.drivewsid);
+  assert.equal(continued.items[0]?.shareContext, ref.shareContext);
+  const read = await cold.read({ itemId: sharedFile.drivewsid, shareContext: ref.shareContext });
+  assert.equal(read.content, "abc");
+  const prepared = await cold.download({ itemId: sharedFile.drivewsid, shareContext: ref.shareContext });
+  assert.equal(await (await new DriveService(f.env, owner).downloadContent(prepared.handleId)).text(), "abc");
+  assert.equal(downloads, 2);
+  const before = calls;
+  await assert.rejects(cold.list({ folderId: nested[0]!.drivewsid }), { code: "VALIDATION_ERROR" });
+  await assert.rejects(cold.list({ folderId: nested[0]!.drivewsid, shareContext: crypto.randomUUID() }), { code: "CONFLICT" });
+  await assert.rejects(cold.rename({ itemId: nested[0]!.drivewsid, etag: "root-version", name: "refused", operationId: crypto.randomUUID() }), { code: "VALIDATION_ERROR" });
+  assert.equal(calls, before);
+  await assert.rejects(cold.rename({ itemId: ref.id, etag: ref.etag, name: "refused", operationId: crypto.randomUUID() }), { code: "UNSUPPORTED_FEATURE" });
+  const metadata = Object.fromEntries(Object.entries(await uploadInput("refused.txt")).filter(([key]) => key !== "contentBase64"));
+  await assert.rejects(cold.prepareUpload({ ...metadata, parentId: ref.id }), { code: "UNSUPPORTED_FEATURE" });
+  const saved = await f.settings.load();
+  await f.settings.save({ expectedRevision: saved.revision, settings: saved.settings });
+  const scopedBefore = calls;
+  await assert.rejects(cold.list({ folderId: nested[0]!.drivewsid, shareContext: ref.shareContext }), { code: "CONFLICT" });
+  assert.equal(calls, scopedBefore);
+});
+
+test("concurrent searches preserve independent diagnostics and a rejected continuation remains usable", async t => {
+  const branches = ["a", "b"].map(key => ({ ...root, drivewsid: `FOLDER::com.apple.CloudDocs::${key}`, docwsid: key, name: key }));
+  let release: () => void = () => {};
+  let entered: () => void = () => {};
+  const blocked = new Promise<void>(resolve => { release = resolve; });
+  const started = new Promise<void>(resolve => { entered = resolve; });
+  let hold = false;
+  const f = await fixture(t, async (_url, init) => {
+    const [{ drivewsid }] = JSON.parse(String(init.body));
+    const key = drivewsid.split("::")[2].split("-")[0];
+    if (hold && drivewsid === `${branches[0]!.drivewsid}-2`) { entered(); await blocked; }
+    const branch = branches.find(item => item.docwsid === key)!;
+    if (drivewsid === branch.drivewsid) {
+      const children = Array.from({ length: 4 }, (_, index) => ({ ...branch, drivewsid: `${branch.drivewsid}-${index}`, docwsid: `${key}-${index}`, parentId: branch.drivewsid, name: `Folder ${index}` }));
+      return json([{ ...branch, directChildrenCount: key === "a" ? 5 : 4, items: key === "a" ? [...children, { ...file("shared.txt", "excluded", branch.drivewsid), shareID: [] }] : children }]);
+    }
+    return json([{ ...branch, drivewsid, docwsid: drivewsid.split("::")[2], items: [file(`${key}-match.txt`, `${key}-${drivewsid.split("::")[2]}-file`, drivewsid)], directChildrenCount: 1 }]);
+  });
+  const a = await f.service.search({ folderId: branches[0]!.drivewsid, query: "a-match" });
+  const b = await f.service.search({ folderId: branches[1]!.drivewsid, query: "b-match" });
+  assert.ok(a.continuation); assert.ok(b.continuation);
+  hold = true;
+  const active = f.service.search({ folderId: branches[0]!.drivewsid, query: "a-match", continuation: a.continuation });
+  try {
+    await started;
+    await assert.rejects(new DriveService(f.env, owner).search({ folderId: branches[1]!.drivewsid, query: "b-match", continuation: b.continuation }), { code: "CONFLICT" });
+  } finally { release(); }
+  const aFinal = await active;
+  const bFinal = await f.service.search({ folderId: branches[1]!.drivewsid, query: "b-match", continuation: b.continuation });
+  assert.deepEqual(aFinal.reasons, ["excluded_shared_entries"]);
+  assert.equal(aFinal.incompleteFolders[0]?.folderId, branches[0]!.drivewsid);
+  assert.equal(aFinal.complete, false);
+  assert.equal(bFinal.complete, true);
+  assert.deepEqual(bFinal.reasons, []);
+  assert.deepEqual(bFinal.incompleteFolders, []);
+  assert.ok(aFinal.items.every(item => item.name === "a-match.txt"));
+  assert.ok(bFinal.items.every(item => item.name === "b-match.txt"));
+  await assert.rejects(f.service.search({ folderId: branches[0]!.drivewsid, query: "a-match", continuation: a.continuation }), { code: "CONFLICT" });
+});
+
+test("shared search branches with identical provider child IDs keep distinct share contexts", async t => {
+  const shares = ["a", "b"].map(key => ({ ...root, drivewsid: `FOLDER::com.apple.CloudDocs::share-${key}`, docwsid: `share-${key}`, name: `Share ${key}`, parentId: DRIVE_ROOT, shareID: { recordName: `synthetic-share-${key}` } }));
+  const sharedChildId = "FOLDER_IN_SHARED_FOLDER::com.apple.CloudDocs::same-child";
+  const f = await fixture(t, (_url, init) => {
+    const [entry] = JSON.parse(String(init.body));
+    if (entry.drivewsid === DRIVE_ROOT) return json([{ ...root, items: shares, directChildrenCount: 2 }]);
+    const selected = shares.find(share => share.drivewsid === entry.drivewsid);
+    if (selected) {
+      assert.deepEqual(entry.shareID, selected.shareID);
+      return json([{ ...selected, items: [{ ...root, drivewsid: sharedChildId, docwsid: "same-child", name: "Child", parentId: selected.drivewsid }], directChildrenCount: 1 }]);
+    }
+    assert.equal(entry.drivewsid, sharedChildId);
+    const parent = shares.find(share => share.shareID.recordName === entry.shareID.recordName)!;
+    assert.ok(parent);
+    const leaf = { ...file(`${parent.docwsid}-match.txt`, "same-file", sharedChildId), drivewsid: "FILE_IN_SHARED_FOLDER::com.apple.CloudDocs::same-file" };
+    return json([{ ...root, drivewsid: sharedChildId, docwsid: "same-child", name: "Child", parentId: parent.drivewsid, items: [leaf], directChildrenCount: 1 }]);
+  });
+  const first = await f.service.search({ query: "match" });
+  assert.ok(first.continuation);
+  const next = await new DriveService(f.env, owner).search({ query: "match", continuation: first.continuation });
+  assert.equal(next.complete, true);
+  assert.deepEqual(next.items.map(item => item.name), ["share-a-match.txt", "share-b-match.txt"]);
+  assert.equal(next.items[0]?.id, next.items[1]?.id);
+  assert.notEqual(next.items[0]?.shareContext, next.items[1]?.shareContext);
 });
 
 test("expired mutation leases never repeat a write, and exact retained post-write versions reconcile safely", async t => {

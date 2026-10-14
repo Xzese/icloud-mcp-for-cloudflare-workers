@@ -1,4 +1,4 @@
-import { AppError, WriteOutcomeUnknownError, requireValue as requireInput } from "../errors.ts";
+import { AppError, ListMembershipError, WriteOutcomeUnknownError, requireValue as requireInput, type ListMembershipDiagnostics } from "../errors.ts";
 import type { CloudKitWriteRecord } from "../reminders/writes.ts";
 import type { ListWrite } from "../reminders/list-writes.ts";
 import { creationMembership } from "../reminders/creation.ts";
@@ -17,6 +17,7 @@ import { planDateAlarmLifecycle, verifyDateAlarmLifecycle, verifyLifecyclePartic
 import { planScheduledFamilyLifecycle, type ScheduledFamilyLifecyclePlan } from "../reminders/scheduled-family-lifecycle.ts";
 import { AppleHTTP, validatedAppleURL, appleWebHeaders } from "../transport/apple-http.ts";
 import { downloadShoppingAsset, uploadShoppingAsset, type ShoppingAssetFieldName, type ShoppingAssetToken } from "./shopping-assets.ts";
+import { MAX_LIST_MEMBERSHIP_CHARACTERS, MAX_LIST_MEMBERS, withinCloudKitRequestBudget } from "./budgets.ts";
 
 const REMINDERS_ZONE = { zoneName: "Reminders", zoneType: "REGULAR_CUSTOM_ZONE" } as const;
 const DEFAULT_OWNER = "__defaultOwner__";
@@ -26,7 +27,6 @@ const MAX_PAGE_SIZE = 200;
 const MAX_COMPOUND_RECORDS = 1000;
 const MAX_RECORD_NAME_LENGTH = 512;
 const MAX_TOKEN_LENGTH = 8192;
-const MAX_REQUEST_BYTES = 65_536;
 const MAX_RESPONSE_BYTES = 1_048_576;
 const MAX_ALL_LIST_PAGES = 25;
 const MAX_ALL_LIST_DURATION_MS = 20_000;
@@ -35,7 +35,8 @@ const MAX_ALL_LIST_IDS = 1_000;
 const RECORD_TYPES = new Set(["List", "Reminder", "Alarm", "AlarmTrigger", "Attachment", "Hashtag", "RecurrenceRule"]);
 const LIST_SUMMARY_KEYS = ["Name", "Color", "Count", "IsGroup", "Deleted"];
 const SEARCH_REMINDER_KEYS = ["List", "ParentReminder", "TitleDocument", "NotesDocument", "Completed", "CompletionDate", "DueDate", "StartDate", "Priority", "Flagged", "AllDay", "Deleted", "TimeZone", "AlarmIDs", "AttachmentIDs", "HashtagIDs", "RecurrenceRuleIDs"] as const;
-export interface CloudKitReadTrace { path: string; url: string; request: Record<string, unknown>; response: { status: number; returnedRecords: number; recordTypes: Record<string, number>; zones: number; continuationPresent: boolean; recordErrors: number }; }
+const RELATIONSHIP_KEYS = ["List", "ParentReminder", "Deleted"];
+export interface CloudKitReadTrace { elapsedMs: number; path: string; url: string; request: Record<string, unknown>; response: { status: number; returnedRecords: number; recordTypes: Record<string, number>; zones: number; continuationPresent: boolean; recordErrors: number }; }
 
 function requireValue(condition: unknown, message: string): asserts condition {
   if (!condition) throw new AppError("PROTOCOL_CHANGED", message);
@@ -367,14 +368,35 @@ export function normalizeList(record: CloudKitRecord, includeMembership = true):
   const count = integerField(record, "Count");
   if (count !== null) requireValue(count >= 0, "Apple returned a negative reminder list count.");
   let reminderIds: string[] | null = null;
-  const membership = includeMembership ? readField(record, "ReminderIDs", ["STRING"]) : undefined;
+  let membership: unknown;
+  if (includeMembership) {
+    try { membership = readField(record, "ReminderIDs", ["STRING"]); }
+    catch {
+      const field = record.fields.ReminderIDs;
+      const wrapper = field && typeof field === "object" && !Array.isArray(field) ? field as Record<string, unknown> : undefined;
+      throw new ListMembershipError("PROTOCOL_CHANGED", "Apple returned a malformed or unsupported ReminderIDs field.", {
+        fieldType: wrapper?.type === "STRING" ? "STRING" : "OTHER",
+        stringLength: typeof wrapper?.value === "string" ? wrapper.value.length : null,
+        jsonShape: "not_inspected", arrayLength: null,
+      });
+    }
+  }
   if (membership !== undefined && membership !== null) {
-    requireValue(typeof membership === "string" && membership.length <= 65_536, "Apple returned invalid list membership data.");
+    const diagnostics: ListMembershipDiagnostics = {
+      fieldType: "STRING", stringLength: typeof membership === "string" ? membership.length : null,
+      jsonShape: "not_inspected", arrayLength: null,
+    };
+    if (typeof membership !== "string") throw new ListMembershipError("PROTOCOL_CHANGED", "Apple returned a non-string ReminderIDs value.", diagnostics);
+    if (membership.length > MAX_LIST_MEMBERSHIP_CHARACTERS) throw new ListMembershipError("UNSUPPORTED_FEATURE", `List ReminderIDs exceeds the ${MAX_LIST_MEMBERSHIP_CHARACTERS}-character inspection limit.`, diagnostics);
     let parsed: unknown;
-    try { parsed = JSON.parse(membership as string); }
-    catch { throw new AppError("PROTOCOL_CHANGED", "Apple returned invalid list membership data."); }
-    requireValue(Array.isArray(parsed) && parsed.length <= 2_000, "Apple returned invalid list membership data.");
-    reminderIds = parsed.map((id) => canonicalRecordName(id, "Reminder"));
+    try { parsed = JSON.parse(membership); }
+    catch { throw new ListMembershipError("PROTOCOL_CHANGED", "Apple returned ReminderIDs that is not valid JSON.", { ...diagnostics, jsonShape: "invalid" }); }
+    diagnostics.jsonShape = Array.isArray(parsed) ? "array" : parsed !== null && typeof parsed === "object" ? "object" : "scalar";
+    diagnostics.arrayLength = Array.isArray(parsed) ? parsed.length : null;
+    if (!Array.isArray(parsed)) throw new ListMembershipError("PROTOCOL_CHANGED", "Apple returned ReminderIDs JSON with a non-array shape.", diagnostics);
+    if (parsed.length > MAX_LIST_MEMBERS) throw new ListMembershipError("UNSUPPORTED_FEATURE", `List ReminderIDs exceeds the ${MAX_LIST_MEMBERS}-entry inspection limit.`, diagnostics);
+    try { reminderIds = parsed.map((id) => canonicalRecordName(id, "Reminder")); }
+    catch { throw new ListMembershipError("PROTOCOL_CHANGED", "Apple returned an invalid identity in ReminderIDs.", diagnostics); }
   }
   return {
     id: rawName,
@@ -400,6 +422,15 @@ function summarizeListRecord(record: CloudKitRecordItem): { list: RemindersList;
 }
 
 export type DetachedDeletedReminder = Omit<Reminder, "listId"> & { listId: null };
+/** Inventory inspection needs native parent links, not documents or audit dates. */
+export function normalizeReminderRelationships(record: CloudKitRecord, owner: string) {
+  requireValue(record.recordType === "Reminder", "Relationship inspection requires a Reminder record.");
+  const id = recordName(record.recordName, ["Reminder"]), deleted = boolField(record, "Deleted");
+  const listId = referenceField(record, "List", "List", owner);
+  requireValue(listId !== null || deleted === true, "Apple returned a reminder without its source-proven List relationship.");
+  return { id, listId, deleted, parentReminderId: referenceField(record, "ParentReminder", "Reminder", owner) };
+}
+
 export function normalizeReminder(record: CloudKitRecord, expectedOwner?: string): Reminder;
 export function normalizeReminder(record: CloudKitRecord, expectedOwner: string | undefined, allowDetachedDeleted: true): Reminder | DetachedDeletedReminder;
 export function normalizeReminder(record: CloudKitRecord, expectedOwner = DEFAULT_OWNER, allowDetachedDeleted = false): Reminder | DetachedDeletedReminder {
@@ -566,12 +597,13 @@ export class CloudKitRemindersClient {
   private async post(path: CloudKitPath, payload: Record<string, unknown>, database: "private" | "shared" = "private"): Promise<Record<string, unknown>> {
     requireInput(database === "private" || path === "/zones/list" || path === "/records/lookup", "The shared diagnostic only supports zone discovery and exact record lookups.");
     const body = JSON.stringify(payload);
-    requireInput(new TextEncoder().encode(body).length <= MAX_REQUEST_BYTES, "The CloudKit request exceeded the byte budget.");
+    requireInput(withinCloudKitRequestBudget(payload), "The CloudKit request exceeded the byte budget.");
     const url = new URL(this.endpoint.href);
     if (database === "shared") url.pathname = url.pathname.replace(/\/private\/?$/, "/shared");
     url.pathname = `${url.pathname.replace(/\/$/, "")}${path}`;
     url.search = this.params.toString();
     const hasSessionCookie = this.http.jar.header(url).length > 0;
+    const started = Date.now();
     const response = await this.http.request(url.href, {
       method: "POST",
       headers: appleWebHeaders(),
@@ -627,7 +659,7 @@ export class CloudKitRemindersClient {
     if (path !== "/records/modify") {
       const redactedRequest = JSON.parse(JSON.stringify(payload, (key, value) => ["recordName", "ownerRecordName", "continuationMarker", "syncToken"].includes(key) ? "[redacted]" : key === "zoneName" && value !== "Reminders" ? "[other authorized zone]" : value)) as Record<string, unknown>;
       const redactedURL = new URL(url); redactedURL.searchParams.set("dsid", "[redacted]"); redactedURL.searchParams.set("clientId", "[redacted]");
-      this.readTrace.push({ path, url: redactedURL.href, request: redactedRequest, response: { status: response.status, returnedRecords: records.length, recordTypes, zones: zones.length, continuationPresent: typeof result.continuationMarker === "string", recordErrors: records.filter(record => record && typeof record.serverErrorCode === "string").length } });
+      this.readTrace.push({ elapsedMs: Date.now() - started, path, url: redactedURL.href, request: redactedRequest, response: { status: response.status, returnedRecords: records.length, recordTypes, zones: zones.length, continuationPresent: typeof result.continuationMarker === "string", recordErrors: records.filter(record => record && typeof record.serverErrorCode === "string").length } });
     }
     parseTopLevelError(result, { path, upstreamStatus: response.status, hasSessionCookie });
     return result;
@@ -680,7 +712,7 @@ export class CloudKitRemindersClient {
       "The list appearance fields do not match an observed native preset or emoji shape.");
     }
     const payload = { zoneID: this.requestZone, atomic: true, operations: [{ operationType, record }] };
-    requireInput(new TextEncoder().encode(JSON.stringify(payload)).length <= MAX_REQUEST_BYTES, "List write exceeded the request budget.");
+    requireInput(withinCloudKitRequestBudget(payload), "List write exceeded the request budget.");
     await beforeDispatch();
     try {
       const result = await this.post("/records/modify", payload);
@@ -1199,7 +1231,11 @@ export class CloudKitRemindersClient {
     requireInput(canonicalJSON(plan.operations) === canonicalJSON(rebuilt.operations) && canonicalJSON(plan.guards) === canonicalJSON(rebuilt.guards) && canonicalJSON(plan.expected) === canonicalJSON(rebuilt.expected) &&
       plan.mode === rebuilt.mode && plan.intrinsicParentGuards === rebuilt.intrinsicParentGuards && plan.sourceFingerprint === rebuilt.sourceFingerprint, "Recurring completion must match the validated native occurrence recipe.");
     this.validateWrite("update", { ...plan.active, fields: Object.fromEntries(Object.entries(plan.active.fields).filter(([key]) => key !== "AlarmIDs")) });
-    if (plan.history) this.validateWrite("create", { ...plan.history, fields: Object.fromEntries(Object.entries(plan.history.fields).filter(([key]) => !["AlarmIDs", "RecurrenceRuleIDs", "AttachmentIDs", "HashtagIDs", "AssignmentIDs"].includes(key))) });
+    if (plan.history) {
+      if (plan.history.fields.DueDateDeltaAlertsData) earlyReminderPayload({ ...plan.history, raw: {} });
+      this.validateWrite("create", { ...plan.history, fields: Object.fromEntries(Object.entries(plan.history.fields).filter(([key]) =>
+        !["AlarmIDs", "RecurrenceRuleIDs", "AttachmentIDs", "HashtagIDs", "AssignmentIDs", "DueDateDeltaAlertsData"].includes(key))) });
+    }
     const result = plan.intrinsicParentGuards ? await this.executeRecords([...plan.operations, ...plan.guards.map(record => ({ operationType: "update" as const,
       record: { recordName: record.recordName, recordType: record.recordType, recordChangeTag: record.recordChangeTag, fields: { Deleted: { type: "INT64", value: 0 } } } }))], beforeDispatch) :
       await this.executeRecords(plan.operations, beforeDispatch, plan.guards, ["List"], plan.mode === "advance" ? [] : [plan.list.recordName]);
@@ -1541,7 +1577,7 @@ export class CloudKitRemindersClient {
     }
     const payload = structuredClone({ zoneID: this.requestZone, atomic: true, operations: wireOperations });
     requireInput(new Set(group.map(operation => operation.record.recordName)).size === group.length, "An atomic write requires exactly one mutation or guard per record.");
-    requireInput(new TextEncoder().encode(JSON.stringify(payload)).length <= MAX_REQUEST_BYTES, "The reminder write exceeded its byte budget.");
+    requireInput(withinCloudKitRequestBudget(payload), "The reminder write exceeded its byte budget.");
     await beforeDispatch?.();
     try {
       const result = await this.post("/records/modify", payload);
@@ -1669,6 +1705,11 @@ export class CloudKitRemindersClient {
     return this.lookupInternal(recordNames, ["List", "Reminder"], listSummary);
   }
 
+  async lookupRelationshipRecords(recordNames: string[]): Promise<CloudKitLookupResult> {
+    requireInput(recordNames.every(name => name.startsWith("Reminder/")), "Relationship lookup accepts only exact Reminder identities.");
+    return this.lookupInternal(recordNames, ["Reminder"], false, RELATIONSHIP_KEYS);
+  }
+
   async lookupSchedulingRecords(recordNames: string[]): Promise<CloudKitLookupResult> {
     requireInput(this.owner !== undefined && recordNames.length <= 32, "Scheduling lookup requires a discovered private zone and a bounded graph.");
     return this.lookupInternal(recordNames, ["Reminder", "Alarm", "AlarmTrigger", "RecurrenceRule"], false);
@@ -1759,7 +1800,7 @@ export class CloudKitRemindersClient {
   }
 
 
-  private async lookupInternal(recordNames: string[], allowedTypes: string[], listSummary: boolean): Promise<CloudKitLookupResult> {
+  private async lookupInternal(recordNames: string[], allowedTypes: string[], listSummary: boolean, desiredKeys?: string[]): Promise<CloudKitLookupResult> {
     requireInput(Array.isArray(recordNames) && recordNames.length >= 1 && recordNames.length <= MAX_PAGE_SIZE, "The CloudKit lookup size is outside the supported limit.");
     const requestedRecordNames = recordNames.map((name) => requestedRecordName(name, allowedTypes));
     requireInput(!listSummary || requestedRecordNames.every(name => name.startsWith("List/")), "Only list lookups can use the list-summary projection.");
@@ -1767,7 +1808,7 @@ export class CloudKitRemindersClient {
     const result = await this.post("/records/lookup", {
       records: requestedRecordNames.map((name) => ({ recordName: name })),
       zoneID: this.requestZone,
-      ...(listSummary ? { desiredKeys: LIST_SUMMARY_KEYS } : {}),
+      ...(listSummary ? { desiredKeys: LIST_SUMMARY_KEYS } : desiredKeys ? { desiredKeys } : {}),
     });
     const parsed = pageRecords(result.records, requestedRecordNames.length, MAX_PAGE_SIZE, this.expectedOwner, true, false, allowedTypes);
     const requested = new Set(requestedRecordNames);
@@ -1910,7 +1951,7 @@ export class CloudKitRemindersClient {
     };
   }
 
-  async queryRemindersPage(options: { listId: string; includeCompleted: boolean; limit?: number; continuation?: string | null; projection?: "search" }): Promise<CloudKitPage> {
+  async queryRemindersPage(options: { listId: string; includeCompleted: boolean; limit?: number; continuation?: string | null; projection?: "search" | "relationships" }): Promise<CloudKitPage> {
     requireInput(typeof options.includeCompleted === "boolean", "The completed-reminder query option must be explicit.");
     const listId = requestedRecordName(options.listId, ["List"]);
     const limit = boundedLimit(options.limit);
@@ -1921,13 +1962,14 @@ export class CloudKitRemindersClient {
         filterBy: [
           { comparator: "EQUALS", fieldName: "List", fieldValue: { type: "REFERENCE", value: { recordName: listId, action: "VALIDATE" } } },
           { comparator: "EQUALS", fieldName: "includeCompleted", fieldValue: { type: "INT64", value: options.includeCompleted ? 1 : 0 } },
-          { comparator: "EQUALS", fieldName: "LookupValidatingReference", fieldValue: { type: "INT64", value: 1 } },
+          { comparator: "EQUALS", fieldName: "LookupValidatingReference", fieldValue: { type: "INT64", value: options.projection === "relationships" ? 0 : 1 } },
         ],
       },
       zoneID: this.requestZone,
       resultsLimit: limit,
     };
     if (options.projection === "search") payload.desiredKeys = SEARCH_REMINDER_KEYS;
+    if (options.projection === "relationships") payload.desiredKeys = RELATIONSHIP_KEYS;
     if (continuation) payload.continuationMarker = continuation;
     // Upstream does not define whether resultsLimit includes auxiliary records.
     // Bound the flattened response independently; follow Apple's continuation.
@@ -1941,7 +1983,9 @@ export class CloudKitRemindersClient {
       }
       unique.set(record.recordName, record);
       if ("recordType" in record && record.recordType === "Reminder") {
-        requireValue(normalizeReminder(record, this.expectedOwner).listId === listId, "Apple returned a reminder linked to a different list.");
+        const reminder = options.projection === "relationships" ? normalizeReminderRelationships(record, this.expectedOwner) : normalizeReminder(record, this.expectedOwner);
+        if (options.projection === "relationships" && reminder.deleted === true) { unique.delete(record.recordName); continue; }
+        requireValue(reminder.listId === listId, "Apple returned a reminder linked to a different list.");
       }
     }
     return { ...page, records: [...unique.values()] };

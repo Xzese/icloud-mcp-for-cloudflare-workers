@@ -197,15 +197,21 @@ export async function verifyReminderWrites(options) {
       }
       if (url.pathname.endsWith("/records/query")) {
         if (body.query.recordType === "Lists") return jsonResponse({ records: [...state.records.values()].filter(record => record.recordType === "List") });
+        const relationshipsOnly = body.desiredKeys?.length === 3 && body.desiredKeys.includes("ParentReminder");
         assert.equal(body.query.recordType, "reminderList");
+        if (relationshipsOnly) assert.equal(body.query.filterBy.find(filter => filter.fieldName === "LookupValidatingReference").fieldValue.value, 0);
         const requestedList = body.query.filterBy.find(filter => filter.fieldName === "List").fieldValue.value.recordName;
         if (state.nextListQuery) { const response = state.nextListQuery; state.nextListQuery = null; return jsonResponse(response); }
         assert.ok(state.records.get(requestedList)?.recordType === "List");
         state.onReminderListQuery?.();
-        const includeCompleted = body.query.filterBy.find(filter => filter.fieldName === "includeCompleted").fieldValue.value === 1;
+        const includeCompleted = relationshipsOnly || body.query.filterBy.find(filter => filter.fieldName === "includeCompleted").fieldValue.value === 1;
         const records = [...state.records.values()].filter(record => record.recordType === "Reminder" && record.fields.List?.value?.recordName === requestedList && record.fields.Deleted.value === 0 && (includeCompleted || record.fields.Completed.value === 0));
-        return jsonResponse({ records: records.map(record => state.foreignZoneIds.has(record.recordName)
-          ? { ...record, zoneID: { ...record.zoneID, ownerRecordName: "synthetic-foreign-owner" } } : record) });
+        return jsonResponse({ records: records.map(record => {
+          const scoped = state.foreignZoneIds.has(record.recordName)
+            ? { ...record, zoneID: { ...record.zoneID, ownerRecordName: "synthetic-foreign-owner" } } : record;
+          return body.desiredKeys?.length === 3 && body.desiredKeys.includes("ParentReminder")
+            ? { ...scoped, fields: Object.fromEntries(Object.entries(scoped.fields).filter(([key]) => body.desiredKeys.includes(key))) } : scoped;
+        }) });
       }
       if (url.pathname.endsWith("/records/lookup")) {
         if (state.holdLookup) {
@@ -1124,6 +1130,31 @@ export async function verifyReminderWrites(options) {
     const familyMembers = [familyParent, familyChild, independentChild].map(record => record.recordName.slice("Reminder/".length));
     familyList.fields.ReminderIDs = field("STRING", JSON.stringify([...previousMembership, ...familyMembers]));
     const familyTarget = id => ({ listId, reminderId: id, recordChangeTag: state.records.get(id).recordChangeTag });
+    // Malformed membership and local budgets must refuse completion before any write.
+    const validMembership = familyList.fields.ReminderIDs;
+    const beforeMembershipFailure = state.modifies.length;
+    const membershipTarget = { ...familyTarget(familyParent.recordName), expectedGeneration: generation };
+    for (const [value, code, jsonShape, arrayLength] of [
+      ["synthetic-invalid-membership", "PROTOCOL_CHANGED", "invalid", null],
+      ["{}", "PROTOCOL_CHANGED", "object", null],
+      [" ".repeat(131_073), "UNSUPPORTED_FEATURE", "not_inspected", null],
+      [JSON.stringify(Array(2001).fill("synthetic-member")), "UNSUPPORTED_FEATURE", "array", 2001],
+    ]) {
+      familyList.fields.ReminderIDs = field("STRING", value);
+      const failed = await mcp("tools/call", { name: "complete_reminder", arguments: membershipTarget });
+      assert.equal(failed.result.isError, true);
+      const detail = failed.result.structuredContent.error;
+      assert.equal(failed.result.structuredContent.error_code, code);
+      assert.equal(detail.code, code);
+      assert.equal(detail.retryable, false);
+      assert.deepEqual(detail.membershipDiagnostics, { fieldType: "STRING", stringLength: value.length, jsonShape, arrayLength });
+      assert.deepEqual(JSON.parse(failed.result.content[0].text), failed.result.structuredContent);
+      assert.equal(state.modifies.length, beforeMembershipFailure);
+      const reread = await mcp("tools/call", { name: "get_reminder", arguments: { listId, reminderId: membershipTarget.reminderId, expectedGeneration: generation } });
+      assert.equal(reread.result.structuredContent.record.completed, false);
+      assert.equal(reread.result.structuredContent.record.recordChangeTag, membershipTarget.recordChangeTag);
+    }
+    familyList.fields.ReminderIDs = validMembership;
     const beforeFamilyInspection = state.modifies.length;
     const familyInspection = await mcp("tools/call", { name: "inspect_reminder", arguments: { listId, reminderId: familyParent.recordName, expectedGeneration: generation } });
     assert.equal(familyInspection.result.isError, undefined, JSON.stringify(familyInspection.result));
@@ -1441,6 +1472,13 @@ export async function verifyReminderWrites(options) {
       Imported: field("INT64", 0), Deleted: field("INT64", 0), Reminder: field("REFERENCE", { recordName: recurringId, action: "VALIDATE" }),
     } });
     const submittedOccurrence = { listId, reminderId: recurringId, recordChangeTag: recurring.recordChangeTag, expectedGeneration: generation };
+    // A long ordering inventory includes definite retired IDs, as native lists
+    // can retain history beyond the visible open count. Preserve it atomically.
+    const orderingList = state.records.get(listId);
+    const orderingBefore = JSON.parse(orderingList.fields.ReminderIDs.value);
+    const retiredOrderingIds = Array.from({ length: 1822 - orderingBefore.length }, () => randomUUID());
+    orderingList.fields.ReminderIDs = field("STRING", JSON.stringify([...orderingBefore, ...retiredOrderingIds]));
+    assert.ok(orderingList.fields.ReminderIDs.value.length > 65_536);
     const beforeOccurrence = state.modifies.length;
     state.nextModify = "committed-500";
     const unknownOccurrence = await mcp("tools/call", { name: "complete_reminder", arguments: submittedOccurrence });
@@ -1465,6 +1503,10 @@ export async function verifyReminderWrites(options) {
     const nextOccurrence = nextOccurrenceResponse.result.structuredContent;
     assert.equal(nextOccurrence.record.dueDate, "2030-03-18T09:15:00.000Z");
     assert.equal(nextOccurrence.completedOccurrence.completed, true);
+    const expandedOrdering = JSON.parse(state.records.get(listId).fields.ReminderIDs.value);
+    assert.deepEqual(expandedOrdering.filter(id => retiredOrderingIds.includes(id)), retiredOrderingIds);
+    // Restore the small-list fixture for unrelated recipes with their own limits.
+    state.records.get(listId).fields.ReminderIDs = field("STRING", JSON.stringify(expandedOrdering.filter(id => !retiredOrderingIds.includes(id))));
     const foreignReferenceArgs = { ...submittedOccurrence, recordChangeTag: state.records.get(recurringId).recordChangeTag };
     const beforeForeignReference = state.modifies.length;
     state.nextModify = "recurring-related-reference-foreign";

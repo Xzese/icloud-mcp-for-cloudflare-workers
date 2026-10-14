@@ -1,9 +1,11 @@
 import { z } from "zod";
 import { AppError } from "../errors.ts";
-import { CloudKitRateLimitedError, normalizeList, normalizeReminder, type CloudKitRecord, type CloudKitRemindersClient } from "../icloud/cloudkit.ts";
+import { CloudKitRateLimitedError, normalizeList, normalizeReminder, normalizeReminderRelationships, type CloudKitRecord, type CloudKitRemindersClient } from "../icloud/cloudkit.ts";
 import { jsonBytes } from "../lib/canonical.ts";
 import { omitField } from "../lib/omit-field.ts";
 import { CreateReminderInput, ReminderTargetInput, assertOwnedReminder, buildCreateReminder, updateResolutionTokenMap, type CloudKitWriteRecord } from "./writes.ts";
+import { MAX_LIST_MEMBERS } from "../icloud/budgets.ts";
+type RelationshipClient = Pick<CloudKitRemindersClient, "lookup" | "queryRemindersPage"> & Partial<Pick<CloudKitRemindersClient, "lookupRelationshipRecords">>;
 
 export const ParentReminderInput = ReminderTargetInput.omit({ listId: true }).describe("Exact open root reminder ID and current version tag from the same list. Nested, recurring and alarmed parents are unsupported.");
 export const CreateSubtaskInput = CreateReminderInput.extend({
@@ -40,15 +42,16 @@ export function requireNoReadErrors(errors: { serverErrorCode: string }[]) {
   if (errors.length) throw new AppError("UNSUPPORTED_FEATURE", "The relationship inspection returned record errors; no mutation was dispatched.");
 }
 
-async function scanListReminders(client: Pick<CloudKitRemindersClient, "queryRemindersPage">, owner: string, listId: string): Promise<CloudKitRecord[]> {
+async function scanListReminders(client: Pick<CloudKitRemindersClient, "queryRemindersPage">, owner: string, listId: string, largeInventory = false): Promise<CloudKitRecord[]> {
   let continuation: string | null = null, bytes = 0, count = 0;
   const seen = new Set<string>(), remindersSeen = new Set<string>(), reminders: CloudKitRecord[] = [];
-  for (let index = 0; index < 5; index++) {
-    const page = await client.queryRemindersPage({ listId, includeCompleted: true, limit: 200, continuation });
+  for (let index = 0; index < (largeInventory ? 10 : 5); index++) {
+    const page = await client.queryRemindersPage({ listId, includeCompleted: true, limit: 200, continuation,
+      ...(largeInventory ? { projection: "relationships" as const } : {}) });
     requireNoReadErrors(page.recordErrors);
     for (const record of page.records) {
       bytes += jsonBytes(record);
-      if (bytes > 262_144 || ++count > 1000) throw new AppError("UNSUPPORTED_FEATURE", "The complete child check exceeds its inspection budget.");
+      if (bytes > (largeInventory ? 8_388_608 : 262_144) || ++count > (largeInventory ? 10_000 : 1000)) throw new AppError("UNSUPPORTED_FEATURE", "The complete child check exceeds its inspection budget.");
       if (record.recordName.startsWith("Reminder/")) {
         if (remindersSeen.has(record.recordName)) throw new AppError("PROTOCOL_CHANGED", "The child check returned a duplicate reminder identity.");
         remindersSeen.add(record.recordName);
@@ -64,9 +67,10 @@ async function scanListReminders(client: Pick<CloudKitRemindersClient, "queryRem
         if (Object.keys(record.fields).some(field => /parent|child|subtask/i.test(field) && field !== "ParentReminder")) {
           throw new AppError("UNSUPPORTED_FEATURE", "Unknown relationship fields prevent a complete child inspection.");
         }
-        const reminder = normalizeReminder(record, owner);
+        const reminder = normalizeReminderRelationships(record, owner);
+        if (reminder.deleted === true) continue;
         if (reminder.listId !== listId) throw new AppError("PROTOCOL_CHANGED", "The child check returned a reminder from another list.");
-        if (reminder.deleted !== true) reminders.push(record);
+        reminders.push(record);
       } else if (!record.deleted) throw new AppError("PROTOCOL_CHANGED", "The child check returned an unexpected record type.");
     }
     if (page.paginationComplete) {
@@ -82,7 +86,7 @@ async function scanListReminders(client: Pick<CloudKitRemindersClient, "queryRem
 function childRelationships(records: CloudKitRecord[], owner: string) {
   const children = new Map<string, string[]>();
   for (const record of records) {
-    const parent = normalizeReminder(record, owner).parentReminderId;
+    const parent = normalizeReminderRelationships(record, owner).parentReminderId;
     if (parent) children.set(parent, [...children.get(parent) ?? [], record.recordName]);
   }
   return children;
@@ -94,7 +98,7 @@ export async function listChildren(client: Pick<CloudKitRemindersClient, "queryR
 }
 
 /** Resolve query and native membership identities exactly, without trusting index freshness. */
-export async function inspectListChildren(client: Pick<CloudKitRemindersClient, "lookup" | "queryRemindersPage">,
+export async function inspectListChildren(client: RelationshipClient,
   owner: string, list: CloudKitRecord): Promise<Map<string, string[]>> {
   assertOwnedReminder(list, owner);
   const snapshot = normalizeList(list);
@@ -102,48 +106,92 @@ export async function inspectListChildren(client: Pick<CloudKitRemindersClient, 
     snapshot.reminderIds === null || new Set(snapshot.reminderIds).size !== snapshot.reminderIds.length) {
     throw new AppError("UNSUPPORTED_FEATURE", "Relationship inspection requires an exact live List with explicit, unambiguous membership.");
   }
-  const queried = await scanListReminders(client, owner, list.recordName);
+  const largeInventory = snapshot.reminderIds.length > 1000;
+  let bytes = 0;
+  const batchSize = 200;
+  const concurrency = largeInventory ? 4 : 1;
+  const lookupExact = async (ids: string[]) => {
+    const exact: CloudKitRecord[] = [], absent = new Set<string>();
+    for (let start = 0; start < ids.length; start += batchSize * concurrency) {
+      const batches = Array.from({ length: Math.min(concurrency, Math.ceil((ids.length - start) / batchSize)) },
+        (_, index) => ids.slice(start + index * batchSize, start + (index + 1) * batchSize));
+      // Drain every read before raising any failure or releasing the session lease.
+      const results = await Promise.allSettled(batches.map(batch => largeInventory && client.lookupRelationshipRecords
+        ? client.lookupRelationshipRecords(batch) : client.lookup(batch)));
+      const failures = results.filter((result): result is PromiseRejectedResult => result.status === "rejected");
+      if (failures.length) throw (failures.find(result => result.reason instanceof AppError &&
+        ["REAUTH_REQUIRED", "FORBIDDEN"].includes(result.reason.code)) ?? failures[0]).reason;
+      for (const [index, result] of results.entries()) {
+        if (result.status !== "fulfilled") throw new AppError("PROTOCOL_CHANGED", "An exact membership read did not settle.");
+        const batch = batches[index], found = result.value;
+        const missing = found.recordErrors.filter(error => error.serverErrorCode.toUpperCase() === "NOT_FOUND" &&
+          error.recordName !== null && batch.includes(error.recordName));
+        requireNoReadErrors(found.recordErrors.filter(error => !missing.includes(error)));
+        const answers = [...found.records.map(record => record.recordName), ...missing.map(error => error.recordName!)];
+        if (found.unresolvedRecordNames.length || answers.length !== batch.length || new Set(answers).size !== batch.length ||
+          answers.some(id => !batch.includes(id)) || !found.complete && missing.length === 0) {
+          throw new AppError("CONFLICT", "Every membership identity must resolve before relationship planning.", 409);
+        }
+        // Native ordering can retain retired IDs; definite absence is safe only for those entries.
+        for (const error of missing) absent.add(error.recordName!);
+        for (const record of found.records) {
+          bytes += jsonBytes(record);
+          if (bytes > (largeInventory ? 8_388_608 : 262_144)) throw new AppError("UNSUPPORTED_FEATURE", "The exact membership check exceeds its inspection budget.");
+          if (record.deleted) continue;
+          if (!("recordType" in record) || record.recordType !== "Reminder") throw new AppError("PROTOCOL_CHANGED", "The membership lookup returned an unexpected record type.");
+          assertOwnedReminder(record, owner);
+          const reminder = normalizeReminderRelationships(record, owner);
+          if (reminder.deleted === true) continue;
+          if (reminder.deleted !== false || reminder.listId !== list.recordName || !record.recordChangeTag) {
+            throw new AppError("CONFLICT", "The exact live membership changed or could not be established.", 409);
+          }
+          if (Object.keys(record.fields).some(field => /parent|child|subtask/i.test(field) && field !== "ParentReminder")) {
+            throw new AppError("UNSUPPORTED_FEATURE", "Unknown relationship fields prevent complete membership inspection.");
+          }
+          exact.push(record);
+        }
+      }
+    }
+    return { exact, absent };
+  };
+  let queried: CloudKitRecord[], native: Awaited<ReturnType<typeof lookupExact>>;
+  if (largeInventory) {
+    // Query freshness and exact native inventory are independent. Drain both
+    // branches before propagating a failure so the cookie jar/lease stays owned.
+    const results = await Promise.allSettled([
+      scanListReminders(client, owner, list.recordName, true), lookupExact(snapshot.reminderIds),
+    ] as const);
+    const failures = results.filter((result): result is PromiseRejectedResult => result.status === "rejected");
+    if (failures.length) throw (failures.find(result => result.reason instanceof AppError &&
+      ["REAUTH_REQUIRED", "FORBIDDEN"].includes(result.reason.code)) ?? failures[0]).reason;
+    if (results[0].status !== "fulfilled" || results[1].status !== "fulfilled")
+      throw new AppError("PROTOCOL_CHANGED", "The relationship reads did not settle.");
+    queried = results[0].value; native = results[1].value;
+  } else {
+    queried = await scanListReminders(client, owner, list.recordName);
+    const ids = [...new Set([...queried.map(record => record.recordName), ...snapshot.reminderIds])];
+    if (ids.length > 1000) throw new AppError("UNSUPPORTED_FEATURE", "The exact membership check exceeds its inspection budget.");
+    native = await lookupExact(ids);
+  }
   const queryIds = new Set(queried.map(record => record.recordName));
   const ids = [...new Set([...queryIds, ...snapshot.reminderIds])];
-  if (ids.length > 1000) throw new AppError("UNSUPPORTED_FEATURE", "The exact membership check exceeds its inspection budget.");
-  const exact: CloudKitRecord[] = [];
-  let bytes = 0;
-  for (let start = 0; start < ids.length; start += 200) {
-    const batch = ids.slice(start, start + 200), found = await client.lookup(batch);
-    const missing = found.recordErrors.filter(error => error.serverErrorCode.toUpperCase() === "NOT_FOUND" &&
-      error.recordName !== null && batch.includes(error.recordName));
-    requireNoReadErrors(found.recordErrors.filter(error => !missing.includes(error)));
-    const answers = [...found.records.map(record => record.recordName), ...missing.map(error => error.recordName!)];
-    if (found.unresolvedRecordNames.length || answers.length !== batch.length || new Set(answers).size !== batch.length ||
-      answers.some(id => !batch.includes(id)) || !found.complete && missing.length === 0) {
-      throw new AppError("CONFLICT", "Every membership identity must resolve before relationship planning.", 409);
-    }
-    // Native ordering can retain retired IDs; definite absence is safe only for those entries.
-    if (missing.some(error => queryIds.has(error.recordName!))) {
-      throw new AppError("CONFLICT", "A queried reminder disappeared during relationship inspection.", 409);
-    }
-    for (const record of found.records) {
-      bytes += jsonBytes(record);
-      if (bytes > 262_144) throw new AppError("UNSUPPORTED_FEATURE", "The exact membership check exceeds its inspection budget.");
-      if (record.deleted) continue;
-      if (!("recordType" in record) || record.recordType !== "Reminder") throw new AppError("PROTOCOL_CHANGED", "The membership lookup returned an unexpected record type.");
-      assertOwnedReminder(record, owner);
-      const reminder = normalizeReminder(record, owner, true);
-      if (reminder.deleted === true) continue;
-      if (reminder.deleted !== false || reminder.listId !== list.recordName || !record.recordChangeTag) {
-        throw new AppError("CONFLICT", "The exact live membership changed or could not be established.", 409);
-      }
-      if (Object.keys(record.fields).some(field => /parent|child|subtask/i.test(field) && field !== "ParentReminder")) {
-        throw new AppError("UNSUPPORTED_FEATURE", "Unknown relationship fields prevent complete membership inspection.");
-      }
-      exact.push(record);
-    }
+  if (ids.length > (largeInventory ? MAX_LIST_MEMBERS : 1000)) throw new AppError("UNSUPPORTED_FEATURE", "The exact membership check exceeds its inspection budget.");
+  const exact = native.exact;
+  if (largeInventory) {
+    const nativeIds = new Set(snapshot.reminderIds);
+    const extra = await lookupExact([...queryIds].filter(id => !nativeIds.has(id)));
+    exact.push(...extra.exact);
+    for (const id of extra.absent) native.absent.add(id);
   }
+  // A missing ordering-only identity can be retired; a queried one disappearing
+  // remains a conflict even when the two read branches overlap.
+  if ([...native.absent].some(id => queryIds.has(id)))
+    throw new AppError("CONFLICT", "A queried reminder disappeared during relationship inspection.", 409);
   return childRelationships(exact, owner);
 }
 
 export const HAS_SUBTASKS_MESSAGE = "This reminder has subtasks. Moving or deleting a parent is unsupported.";
-export async function requireNoChildren(client: Pick<CloudKitRemindersClient, "lookup" | "queryRemindersPage">, owner: string, list: CloudKitRecord, reminderId: string) {
+export async function requireNoChildren(client: RelationshipClient, owner: string, list: CloudKitRecord, reminderId: string) {
   if ((await inspectListChildren(client, owner, list)).has(reminderId)) throw new AppError("UNSUPPORTED_FEATURE", HAS_SUBTASKS_MESSAGE);
 }
 

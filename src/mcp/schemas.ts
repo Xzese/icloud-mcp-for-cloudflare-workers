@@ -87,6 +87,11 @@ const actionCheck = z.object({
   affectedReminderIds: z.array(z.string()).max(31), requiredInputs: z.array(z.string()).max(8),
 }).strict();
 export const ReminderInspectionOutput = z.object({
+  syntheticEarlyAlert: z.object({
+    alertIdentity: z.string().regex(/^[a-f0-9]{64}$/), accountIdentity: z.string().regex(/^[a-f0-9]{64}$/),
+    creationDate: z.number().finite(), acknowledgedDate: z.number().finite().nullable(),
+    reminderIdentityMatches: z.literal(true), minimumSupportedVersion: z.literal(20230430),
+  }).strict().optional(),
   generation: counter, record: ReminderOutput, inspectionOnly: z.literal(true),
   schedule: z.object({ status: inspectionStatus, dueDate: text, timeZone: text, allDay: flag,
     recurrence: RecurrenceSummary.nullable(), earlyReminder: z.object({ unit: z.enum(EARLY_UNITS), count: counter }).strict().nullable(),
@@ -285,6 +290,12 @@ export const ConnectionStatusOutput = z.object({
 
 const schedule = z.object({ locationAlarm: LocationAlarmSummary.nullable(), dueDate: text, timeZone: text, allDay: flag, recurrence: RecurrenceSummary.nullable(), earlyReminder: z.object({ unit: z.enum(EARLY_UNITS), count: counter }).strict().nullable() }).strict();
 export const PrepareUpdateOutput = z.object({
+  datePairShape: z.object({
+    alarmFields: z.array(z.string().max(64)).max(32), triggerFields: z.array(z.string().max(64)).max(32),
+    alarmUIDMatchesRecord: z.boolean(), alarmUIDMatchesIgnoringCase: z.boolean(), triggerIDMatchesRecord: z.boolean(),
+    alarmUIDIsUuid: z.boolean(), acknowledgementFieldType: z.string().max(32).nullable(),
+    reminderBacklinkMatches: z.boolean(), alarmBacklinkMatches: z.boolean(), absoluteTrigger: z.boolean(),
+  }).strict().optional(),
   generation: counter, supported: z.boolean(), classification: z.enum(["single-record", "linked-date", "unverified-linked-schedule"]),
   before: schedule, after: schedule.nullable(), linkedFeatures: z.object({ alarms: counter, recurrenceRules: counter, graphComplete: z.boolean() }).strict(),
   unsupportedReason: text, preparationToken: z.string().nullable(), expiresAt: nullableTime, operationCount: counter, message: z.string(),
