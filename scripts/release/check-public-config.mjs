@@ -4,7 +4,7 @@ import { fileURLToPath } from "node:url";
 import { parse } from "smol-toml";
 import { execFileSync } from "node:child_process";
 export const root = path.resolve(fileURLToPath(new URL("../../", import.meta.url)));
-const skipped = new Set([".git", "node_modules", "dist", ".next", ".vinext", ".wrangler", ".sites-runtime", ".agents", ".codex", "coverage", "outputs", "work"]);
+const skipped = new Set([".git", "node_modules", "dist", ".next", ".vinext", ".wrangler", ".sites-runtime", ".agents", ".codex", ".repowise", "coverage", "outputs", "work"]);
 export function privateFile(file) {
   return file.split("/").some(part => skipped.has(part)) || file.split("/")[0] === "release" ||
     /(?:^|\/)(?:\.env|\.dev\.vars)(?:\.|$)/.test(file) && !file.endsWith(".example") ||
