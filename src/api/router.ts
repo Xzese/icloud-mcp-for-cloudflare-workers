@@ -79,7 +79,7 @@ export async function applicationRoute(request: Request, env: RuntimeEnv, creden
         const connection = new AppleConnectionService(env, owner);
         return json(await (path === "/api/drive/approve" ? connection.approveDrive(value.data.expectedGeneration, value.data.restartApproval) : connection.approveReminders(value.data.expectedGeneration, value.data.restartApproval)));
       }
-      const driveActions = { list: "list", lookup: "get", search: "search", "resolve-folder-path": "resolveFolderPath", read: "read", download: "download", upload: "upload", "prepare-upload": "prepareUpload", "create-folder": "createFolder", rename: "rename", move: "move", operation: "operation" } as const;
+      const driveActions = { list: "list", lookup: "get", search: "search", traverse: "traverse", "resolve-folder-path": "resolveFolderPath", read: "read", download: "download", upload: "upload", "prepare-upload": "prepareUpload", "create-folder": "createFolder", rename: "rename", move: "move", operation: "operation" } as const;
       const driveAction = path.startsWith("/api/drive/") ? path.slice("/api/drive/".length) : "";
       if (Object.hasOwn(driveActions, driveAction)) {
         const method = driveActions[driveAction as keyof typeof driveActions];

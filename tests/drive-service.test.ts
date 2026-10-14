@@ -5,6 +5,7 @@ import { AppleSessionRepository, type AppleSession } from "../src/persistence/ap
 import { ServiceSettingsRepository } from "../src/persistence/service-settings.ts";
 import { DriveOperationRepository } from "../src/persistence/drive-operations.ts";
 import { DriveService } from "../src/drive/service.ts";
+import { TraversalResult } from "../src/drive/traversal.ts";
 import { AppleConnectionService } from "../src/auth/service.ts";
 import { DRIVE_ROOT } from "../src/icloud/drive.ts";
 import { loginAssurance } from "../src/auth/apple/policy.ts";
@@ -277,6 +278,150 @@ test("search uses bounded selected-tree continuations and refuses stale scope an
   await assert.rejects(f.service.search({ query: "different", continuation: scoped.continuation }), { code: "CONFLICT" });
 });
 
+test("recursive traversal pages beyond 1000 items without rereading folders, survives cold clients and filters names", async t => {
+  const folders = [0, 1, 2].map(index => ({ ...root, drivewsid: `FOLDER::com.apple.CloudDocs::wide-${index}`, docwsid: `wide-${index}`, name: `Folder ${index}`, parentId: DRIVE_ROOT }));
+  const reads = new Map<string, number>();
+  const f = await fixture(t, (_url, init) => {
+    const [{ drivewsid }] = JSON.parse(String(init.body));
+    reads.set(drivewsid, (reads.get(drivewsid) ?? 0) + 1);
+    const folder = folders.find(item => item.drivewsid === drivewsid);
+    const children = folder ? Array.from({ length: 600 }, (_, index) => file(`Match-${index}.txt`, `${folder.docwsid}-${index}`, folder.drivewsid)) : folders;
+    return json([{ ...(folder ?? root), items: children, directChildrenCount: children.length }]);
+  });
+  const input = { limit: 150, maxItems: 5000 };
+  let page = await f.service.traverse(input);
+  assert.equal(page.items.length, 150);
+  assert.equal(page.items[3]!.relativePath, "Folder 0/Match-0.txt");
+  assert.equal(page.items[3]!.depth, 2);
+  const first = page.continuation!;
+  const before = [...reads];
+  await assert.rejects(f.service.traverse({ ...input, query: "changed", continuation: first }), { code: "CONFLICT" });
+  assert.deepEqual([...reads], before);
+  const stored = f.db.sqlite.prepare("SELECT envelope FROM drive_handles WHERE handle_id = ?").get(first)!.envelope as string;
+  assert.equal(stored.includes("Match-"), false);
+  const items = [...page.items];
+  while (page.continuation) {
+    const previous = page.continuation;
+    page = await new DriveService(f.env, owner).traverse({ ...input, continuation: previous });
+    TraversalResult.parse(page);
+    items.push(...page.items);
+    assert.ok(page.foldersRead <= 3);
+    assert.equal(f.db.sqlite.prepare("SELECT COUNT(*) AS count FROM drive_handles WHERE kind = 'traversal'").get()!.count, page.continuation ? 1 : 0);
+  }
+  assert.equal(page.complete, true);
+  assert.deepEqual(page.progress, { visited: 1803, foldersVisited: 4, returned: 1803, queuedFolders: 0 });
+  assert.equal(new Set(items.map(item => item.id)).size, 1803);
+  assert.deepEqual([...reads.values()], [1, 1, 1, 1]);
+  await assert.rejects(f.service.traverse({ ...input, continuation: first }), { code: "CONFLICT" });
+  reads.clear();
+  let filtered = await f.service.traverse({ query: "mAtCh-599" });
+  const matches = [...filtered.items];
+  while (filtered.continuation) { filtered = await f.service.traverse({ query: "mAtCh-599", continuation: filtered.continuation }); matches.push(...filtered.items); }
+  assert.equal(filtered.complete, true);
+  assert.equal(matches.length, 3);
+  assert.equal(filtered.progress.visited, 1803);
+  assert.deepEqual([...reads.values()], [1, 1, 1, 1]);
+  const stale = await f.service.traverse(input);
+  const settings = await f.settings.load();
+  await f.settings.save({ expectedRevision: settings.revision, settings: settings.settings });
+  const dispatches = [...reads];
+  await assert.rejects(f.service.traverse({ ...input, continuation: stale.continuation }), { code: "CONFLICT" });
+  assert.deepEqual([...reads], dispatches);
+});
+
+test("recursive traversal explains item, folder and depth limits and upstream omissions, with cycle-safe walking", async t => {
+  const folders = ["a", "b"].map(name => ({ ...root, name, drivewsid: `FOLDER::com.apple.CloudDocs::${name}`, docwsid: name, parentId: DRIVE_ROOT }));
+  const f = await fixture(t, (_url, init) => {
+    const [{ drivewsid }] = JSON.parse(String(init.body));
+    const folder = folders.find(item => item.drivewsid === drivewsid);
+    const items = folder ? [file("leaf.txt", `leaf-${folder.docwsid}`, folder.drivewsid), root] : folders;
+    return json([{ ...(folder ?? root), items, directChildrenCount: items.length + (folder ? 1 : 0) }]);
+  });
+  const depth = await f.service.traverse({ maxDepth: 1 });
+  assert.equal(depth.items.length, 2); assert.equal(depth.continuation, null);
+  assert.deepEqual(depth.reasons, ["traversal_depth_limit"]);
+  const width = await f.service.traverse({ maxFolders: 1 });
+  assert.deepEqual(width.reasons, ["traversal_folder_limit"]);
+  const limited = await f.service.traverse({ maxItems: 1, limit: 1 });
+  assert.deepEqual(limited.reasons, ["traversal_item_limit"]); assert.equal(limited.continuation, null);
+  const all = await f.service.traverse({});
+  assert.equal(all.continuation, null); assert.equal(all.progress.foldersVisited, 3);
+  assert.equal(all.incompleteFolders.length, 2);
+  assert.deepEqual(all.reasons, ["upstream_count_mismatch"]);
+  assert.equal(all.complete, false);
+  await assert.rejects(f.service.traverse({ query: "" }), { code: "VALIDATION_ERROR" });
+  await assert.rejects(f.service.traverse({ maxItems: 100_001 }), { code: "VALIDATION_ERROR" });
+});
+
+test("recursive traversal keeps the cursor after a failed Apple read or session checkpoint", async t => {
+  const folders = [0, 1, 2, 3].map(index => ({ ...root, name: `Folder ${index}`, drivewsid: `FOLDER::com.apple.CloudDocs::resume-${index}`, docwsid: `resume-${index}`, parentId: DRIVE_ROOT }));
+  let fail = false;
+  const f = await fixture(t, (_url, init) => {
+    const [{ drivewsid }] = JSON.parse(String(init.body));
+    if (fail && drivewsid === folders[2]!.drivewsid) return new Response(null, { status: 400 });
+    return json([{ ...(folders.find(item => item.drivewsid === drivewsid) ?? root), items: drivewsid === DRIVE_ROOT ? folders : [], directChildrenCount: drivewsid === DRIVE_ROOT ? 4 : 0 }]);
+  });
+  const first = await f.service.traverse({ query: "absent" });
+  assert.equal(first.items.length, 0); assert.ok(first.continuation);
+  fail = true;
+  await assert.rejects(f.service.traverse({ query: "absent", continuation: first.continuation }));
+  assert.ok(f.db.sqlite.prepare("SELECT 1 FROM drive_handles WHERE handle_id = ?").get(first.continuation));
+  fail = false;
+  f.db.afterStatement = async sql => {
+    if (sql.startsWith("UPDATE apple_session_state SET version = version + 1, state")) {
+      f.db.afterStatement = null;
+      throw new Error("synthetic session checkpoint acknowledgement failure");
+    }
+  };
+  await assert.rejects(f.service.traverse({ query: "absent", continuation: first.continuation }), /checkpoint acknowledgement/);
+  assert.ok(f.db.sqlite.prepare("SELECT 1 FROM drive_handles WHERE handle_id = ?").get(first.continuation));
+  const final = await new DriveService(f.env, owner).traverse({ query: "absent", continuation: first.continuation });
+  assert.equal(final.complete, true); assert.equal(final.progress.foldersVisited, 5);
+  const expired = await f.service.traverse({ query: "absent" });
+  f.db.sqlite.prepare("UPDATE drive_handles SET expires_at = 0 WHERE handle_id = ?").run(expired.continuation!);
+  await assert.rejects(f.service.traverse({ query: "absent", continuation: expired.continuation }), { code: "CONFLICT" });
+});
+
+test("recursive traversal bounds encrypted checkpoint growth for very wide trees with long paths", async t => {
+  const f = await fixture(t, (_url, init) => {
+    const [{ drivewsid }] = JSON.parse(String(init.body));
+    const doc = drivewsid.split("::")[2];
+    const children = Array.from({ length: 500 }, (_, index) => ({ ...root, drivewsid: `FOLDER::com.apple.CloudDocs::${doc}-${index}`, docwsid: `${doc}-${index}`, parentId: drivewsid, name: `${index}-`.padEnd(255, "x") }));
+    return json([{ ...root, drivewsid, docwsid: doc, items: children, directChildrenCount: children.length }]);
+  });
+  const page = await f.service.traverse({ query: "absent", maxFolders: 5000, maxItems: 100_000 });
+  assert.equal(page.continuation, null);
+  assert.equal(page.complete, false);
+  assert.deepEqual(page.reasons, ["traversal_state_limit"]);
+  assert.equal(page.progress.visited, 1500);
+  assert.equal(f.db.sqlite.prepare("SELECT COUNT(*) AS count FROM drive_handles WHERE kind = 'traversal'").get()!.count, 0);
+});
+
+test("active recursive traversal retains queued shared contexts beyond their original inactivity deadline", async t => {
+  const owned = Array.from({ length: 8 }, (_, index) => ({ ...root, drivewsid: `FOLDER::com.apple.CloudDocs::owned-${index}`, docwsid: `owned-${index}`, name: `Owned ${index}`, parentId: DRIVE_ROOT }));
+  const shared = { ...root, drivewsid: "FOLDER::com.apple.CloudDocs::delayed-share", docwsid: "delayed-share", name: "Shared", parentId: DRIVE_ROOT, shareID: { recordName: "synthetic-delayed-share" } };
+  const clock = Date.now, began = clock();
+  try {
+    Date.now = () => began;
+    const f = await fixture(t, (_url, init) => {
+      const [entry] = JSON.parse(String(init.body));
+      const folder = [...owned, shared].find(item => item.drivewsid === entry.drivewsid);
+      if (folder === shared) assert.deepEqual(entry.shareID, shared.shareID);
+      const children = entry.drivewsid === DRIVE_ROOT ? [...owned, shared] : folder === shared ? [file("match.txt", "shared-leaf", shared.drivewsid)] : [];
+      return json([{ ...(folder ?? root), items: children, directChildrenCount: children.length }]);
+    });
+    let page = await f.service.traverse({ query: "match" });
+    assert.ok(page.continuation);
+    for (const minutes of [5, 11, 16]) {
+      Date.now = () => began + minutes * 60_000;
+      page = await new DriveService(f.env, owner).traverse({ query: "match", continuation: page.continuation });
+    }
+    assert.equal(page.complete, true);
+    assert.equal(page.items[0]!.relativePath, "Shared/match.txt");
+    assert.equal(page.progress.foldersVisited, 10);
+  } finally { Date.now = clock; }
+});
+
 test("folder path resolution walks named parents, supports shares, and explains malformed shared entries", async t => {
   const names = ["Documents", "Snap Heaven", "01", "FY 2026"];
   const folders = names.map((name, index) => ({ ...root, drivewsid: `FOLDER::com.apple.CloudDocs::path-${index}`, docwsid: `path-${index}`, name, parentId: index ? `FOLDER::com.apple.CloudDocs::path-${index - 1}` : DRIVE_ROOT }));
@@ -500,6 +645,12 @@ test("shared search branches with identical provider child IDs keep distinct sha
   assert.deepEqual(next.items.map(item => item.name), ["share-a-match.txt", "share-b-match.txt"]);
   assert.equal(next.items[0]?.id, next.items[1]?.id);
   assert.notEqual(next.items[0]?.shareContext, next.items[1]?.shareContext);
+  const traversed = await f.service.traverse({ query: "MATCH" });
+  assert.ok(traversed.continuation);
+  const continued = await new DriveService(f.env, owner).traverse({ query: "MATCH", continuation: traversed.continuation });
+  assert.equal(continued.complete, true);
+  assert.deepEqual(continued.items.map(item => item.relativePath), ["Share a/Child/share-a-match.txt", "Share b/Child/share-b-match.txt"]);
+  assert.notEqual(continued.items[0]?.shareContext, continued.items[1]?.shareContext);
 });
 
 test("expired mutation leases never repeat a write, and exact retained post-write versions reconcile safely", async t => {
