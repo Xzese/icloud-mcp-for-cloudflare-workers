@@ -1,32 +1,21 @@
 import "../lib/sites-env.mjs";
 import { Miniflare, Log, LogLevel, Response as WorkerResponse } from "miniflare";
 import { fetch as nodeFetch } from "undici";
-import { mkdir, readFile, readdir, writeFile, chmod, appendFile, stat, rename, cp, mkdtemp, rm } from "node:fs/promises";
+import { readFile, readdir, appendFile, stat, rename, cp, mkdtemp, rm } from "node:fs/promises";
 import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { randomBytes } from "node:crypto";
 import { resolve, join } from "node:path";
-import { localAppleHeaders, localAppleContentHeaders, classifyDriveRelayURL, DRIVE_MAX_METADATA_BYTES, DRIVE_MAX_TRANSFER_BYTES, DRIVE_TRANSFER_TIMEOUT_MS, summarizeAppleResponse, summarizeAppleFailure } from "./local-icloud-observation.mjs";
+import { localAppleHeaders, localAppleContentHeaders, localAppleDownloadHeaders, classifyDriveRelayURL, DRIVE_MAX_METADATA_BYTES, DRIVE_MAX_TRANSFER_BYTES, DRIVE_TRANSFER_TIMEOUT_MS, summarizeAppleResponse, summarizeAppleFailure } from "./local-icloud-observation.mjs";
 import { createLocalPushRelay } from "./local-icloud-push.mjs";
+import { openLocalState, localPort } from "./local-icloud-state.mjs";
 
 const root = resolve(new URL("../..", import.meta.url).pathname);
 if (process.argv.length > 2) throw new Error("Use npm run dev:icloud.");
-const state = process.env.LOCAL_ICLOUD_STATE_DIR ? resolve(process.env.LOCAL_ICLOUD_STATE_DIR) : join(root, ".sites-runtime/local-icloud");
-if (process.env.LOCAL_ICLOUD_STATE_DIR) {
-  const existing = await stat(join(state, "keys.json"));
-  if (!existing.isFile()) throw new Error("The explicit local state directory must contain its existing keys.json; no replacement login will be created.");
-}
-await mkdir(state, { recursive: true, mode: 0o700 });
-await chmod(state, 0o700);
-const configPath = join(state, "keys.json");
-try {
-  await writeFile(configPath, JSON.stringify({ owner: `local-${randomBytes(16).toString("hex")}`, key: randomBytes(32).toString("base64") }), { flag: "wx", mode: 0o600 });
-} catch (error) { if (error.code !== "EEXIST") throw error; }
-await chmod(configPath, 0o600);
-const keys = JSON.parse(await readFile(configPath, "utf8"));
-if (!/^local-[a-f0-9]{32}$/.test(keys.owner) || Buffer.from(keys.key, "base64").length !== 32) throw new Error("Invalid local key configuration.");
-const port = Number(process.env.LOCAL_ICLOUD_PORT ?? "5173");
-if (!Number.isInteger(port) || port < 1024 || port > 65535) throw new Error("LOCAL_ICLOUD_PORT must be an unprivileged TCP port.");
+const port = localPort();
+const local = await openLocalState(root);
+const state = local.directory, keys = local.keys;
+process.once("exit", local.release);
 const origin = `http://127.0.0.1:${port}`;
 // Miniflare indexes assets at startup. Keep its HTML/modules and indexed files
 // together even when a verification build replaces the canonical dist directory.
@@ -212,11 +201,7 @@ const worker = new Miniflare({
               await response.body?.cancel().catch(() => {});
               throw Object.assign(new Error("Local content transfer byte budget exceeded."), { code: "LOCAL_RESPONSE_BYTE_BUDGET" });
             }
-            const headers = new Headers();
-            for (const name of ["content-type", "content-length", "content-range", "etag", "last-modified"]) {
-              const value = response.headers.get(name);
-              if (value !== null) headers.set(name, value);
-            }
+            const headers = localAppleDownloadHeaders(response.headers, response.status, url);
             if (!response.body) { deadline.dispose(); return new WorkerResponse(null, { status: response.status, headers }); }
             const body = boundedLocalStream(response.body, DRIVE_MAX_TRANSFER_BYTES, deadline.signal, deadline.dispose);
             streamOwnsDeadline = true;
@@ -255,6 +240,7 @@ try {
   if (statements.length) await db.batch(statements.map(statement => db.prepare(statement)));
   await worker.ready;
   console.log(`Local Worker ready: ${origin}/`);
+  console.log("Local Apple state is shared across this repository's worktrees; only one Worker may use it at a time. LOCAL_ICLOUD_STATE_DIR selects an explicit private store.");
   console.log("Lists are retrieved directly on refresh; no historical or scheduled catalogue work.");
   console.log("Separate encrypted local session; reminder creation, editing, completion, reopening and deletion are available after sign-in. Diagnostics contain metadata and counts only.");
 } catch (error) { push.close(); await worker.dispose(); throw error; }

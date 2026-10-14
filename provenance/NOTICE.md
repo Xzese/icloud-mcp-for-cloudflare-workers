@@ -18,7 +18,7 @@ listed in `sources.json` (MIT, copyright Nick Craig-Wood). Its notice is preserv
 `licenses/rclone-MIT.txt` and the shipped third-party notice asset. Synthetic Drive tests
 use invented account IDs, content, names and tokens, not Apple account transcripts.
 
-Drive approval, read recovery and download compatibility also consult rclone revision
+Fresh sign-in request context and account preflight, Drive approval, read recovery and download compatibility also consult rclone revision
 `cf7cdbc49f902ba0e979de31f8c7d24ed1d52faf`. Shared docws reads consult the unmerged
 PR #9487 head `c0024a411a983937948db4e4b594c7550cd7a1bc`; its shared write workarounds
 are not ported. See `sources.json`. The same preserved rclone MIT notice applies.

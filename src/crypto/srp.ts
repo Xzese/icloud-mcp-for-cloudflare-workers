@@ -31,7 +31,9 @@ export async function srpProof(account: string, ephemeral: Uint8Array, derivedPa
   // Only k/u/g hashing is RFC-padded. M1/M2 and K use minimal unsigned encodings.
   let first: Uint8Array | undefined; let second: Uint8Array | undefined;
   try {
-    first = concat(xor, await digest(utf8(account)), salt, integerBytes(A), integerBytes(B), K);
+    // Apple treats account identifiers as lowercase in its SRP proof, including
+    // when the login form was populated with a mixed-case email address.
+    first = concat(xor, await digest(utf8(account.toLowerCase())), salt, integerBytes(A), integerBytes(B), K);
     const M1 = await digest(first);
     second = concat(integerBytes(A), M1, K);
     const M2 = await digest(second);

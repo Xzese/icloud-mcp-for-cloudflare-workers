@@ -120,7 +120,7 @@ Report production publication, production migration and live Apple acceptance se
 
 ## Existing local live session
 
-The local operator command reuses `.sites-runtime/local-icloud/keys.json` and the exact existing
+The local operator command uses the main Git checkout's shared `.sites-runtime/shared-local-icloud/keys.json` by default and the exact existing
 `isolated-local-icloud` D1 namespace. It refuses active readers/leases, absent/disconnected credentials,
 ambiguous database selection, mismatched binding and hard expiry. It does not initialize/reset D1,
 generate keys, write credentials to files or contact Apple.

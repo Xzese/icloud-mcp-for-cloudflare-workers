@@ -406,3 +406,24 @@ before Apple allocation; replay of the confirmed upload did not allocate or fina
 file. An 8 KiB preview of the large file was also verified, and a cancelled download's handle
 remained single-use. These measurements are from the
 local Worker relay, not a deployed Cloudflare performance test.
+
+On 14 October 2026, a read-only pass used the retained session through the centralized local
+Worker. Root browsing preserved its explicit incomplete result for the upstream count mismatch
+and excluded app libraries. Eighteen ordinary folders were browsed, and an exact folder lookup
+was verified. The existing 99-byte test file returned identical bytes through an inline base64
+read and authenticated attachment download. Reusing the download handle was refused; closed,
+open-ended and suffix byte ranges returned HTTP 206 with the expected bytes, and a multiple-range
+request returned HTTP 416. Reminders and Drive remained ready, with no Drive or Reminders data
+writes. Local diagnostics omit filenames, document identities, signed URLs and file contents.
+
+Centralization and a cold restart preserved the encryption key, session generation, original
+device-verification time and fixed retention deadline. A live root read passed after restart.
+All nine existing checkouts resolve to one protected shared store; the second current Worker was
+refused even on a different port. Legacy paths contain credential-free redirects so older
+launchers cannot open the newer retained session with an incompatible loader.
+
+The bounded browse found no shared-folder or package-archive fixtures. Shared docws fallback,
+package archives, HTTP 330 redirects, transient read retries and a new PCS/423 approval cycle
+remain covered by synthetic tests rather than this live pass. Fresh sign-in request-context
+corrections have synthetic coverage; this pass reused verified credentials instead of repeating
+Apple's rejected password sign-in.

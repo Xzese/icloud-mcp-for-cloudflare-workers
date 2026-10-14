@@ -18,7 +18,7 @@ const token = z.string().max(16_384).refine(value => !/[\r\n\x00]/.test(value));
 const CookieSchema = z.object({ name: z.string().min(1).max(256).regex(/^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/), value: z.string().max(8192).refine(value => !/[\x00-\x20\x7f;,]/.test(value)), domain: z.string().max(253).regex(/^(?:[a-z0-9-]+\.)*(?:apple\.com|icloud\.com)$/), hostOnly: z.boolean(), path: z.string().max(4096).startsWith("/"), secure: z.boolean(), expiresAt: z.number().finite().nullable() }).strict();
 export const AuthSnapshotSchema = z.object({ clientId: z.string().min(1).max(100).regex(/^[A-Za-z0-9-]+$/), headers: z.record(z.enum(responseHeaders), token), cookies: z.array(CookieSchema).max(200) }).strict();
 export type AuthSnapshot = z.infer<typeof AuthSnapshotSchema>;
-type AuthPath = "" | "/signin/init" | "/signin/complete?isRememberMeEnabled=true" | "/2sv/trust" | "/verify/phone" | "/verify/phone/securitycode" | "/verify/trusteddevice/securitycode" | "/bridge/step/0" | "/bridge/step/2" | "/bridge/step/4" | "/bridge/step/6" | "/bridge/code/validate";
+type AuthPath = "" | "/federate?isRememberMeEnabled=true" | "/signin/init" | "/signin/complete?isRememberMeEnabled=true" | "/2sv/trust" | "/verify/phone" | "/verify/phone/securitycode" | "/verify/trusteddevice/securitycode" | "/bridge/step/0" | "/bridge/step/2" | "/bridge/step/4" | "/bridge/step/6" | "/bridge/code/validate";
 type SetupPath = "/accountLogin" | "/validate" | "/requestWebAccessState" | "/enableDeviceConsentForPCS" | "/requestPCS";
 export interface AppleReply { status: number; body: Record<string, unknown> | null; text: string; retryAfterMs: number; }
 export class AppleAuthenticationError extends AppError {
@@ -58,17 +58,26 @@ export class AppleAuthHTTP {
   authHeaders(extra: Record<string, string> = {}) {
     const headers: Record<string, string> = {
       "User-Agent": APPLE_USER_AGENT, Accept: "application/json, text/javascript", "Content-Type": "application/json",
-      "X-Apple-OAuth-Client-Id": APPLE_WIDGET, "X-Apple-OAuth-Client-Type": "firstPartyAuth", "X-Apple-OAuth-Redirect-URI": "https://www.icloud.com", "X-Apple-OAuth-Require-Grant-Code": "true", "X-Apple-OAuth-Response-Mode": "web_message", "X-Apple-OAuth-Response-Type": "code", "X-Apple-OAuth-State": this.clientId, "X-Apple-Frame-Id": this.clientId, "X-Apple-Widget-Key": APPLE_WIDGET, Referer: "https://idmsa.apple.com",
-      "X-Apple-FD-Client-Info": JSON.stringify({ U: APPLE_USER_AGENT, L: "en-US", Z: "GMT+00:00", V: "1.1", F: "" }),
+      Origin: "https://idmsa.apple.com", Referer: "https://idmsa.apple.com/", "X-Requested-With": "XMLHttpRequest",
+      "X-Apple-OAuth-Client-Id": APPLE_WIDGET, "X-Apple-OAuth-Client-Type": "firstPartyAuth", "X-Apple-OAuth-Redirect-URI": "https://www.icloud.com", "X-Apple-OAuth-Require-Grant-Code": "true", "X-Apple-OAuth-Response-Mode": "web_message", "X-Apple-OAuth-Response-Type": "code", "X-Apple-OAuth-State": this.clientId, "X-Apple-Frame-Id": this.clientId, "X-Apple-Widget-Key": APPLE_WIDGET,
+      "X-Apple-I-FD-Client-Info": JSON.stringify({ U: APPLE_USER_AGENT, L: "en-US", Z: "GMT+00:00", V: "1.1", F: "" }),
     };
     for (const name of ["scnt", "X-Apple-ID-Session-Id", "X-Apple-Auth-Attributes"] as const) if (this.data[name]) headers[name] = this.data[name]!;
     return { ...headers, ...extra };
   }
   async bootstrap() {
     const url = new URL(`${AUTH_ROOT}/authorize/signin`);
-    url.search = new URLSearchParams({ frame_id: this.clientId, iframeid: this.clientId, state: this.clientId, skVersion: "7", client_id: APPLE_WIDGET, response_type: "code", redirect_uri: "https://www.icloud.com", response_mode: "web_message", authVersion: "latest" }).toString();
-    const reply = await this.send(url.href, "GET", undefined, this.authHeaders({ Accept: "text/html" }));
+    url.search = new URLSearchParams({ frame_id: this.clientId, iframeId: this.clientId, state: this.clientId, skVersion: "7", client_id: APPLE_WIDGET, response_type: "code", redirect_uri: "https://www.icloud.com", response_mode: "web_message", authVersion: "latest", language: "en_US" }).toString();
+    const reply = await this.send(url.href, "GET", undefined, { "User-Agent": APPLE_USER_AGENT, Accept: "text/html" });
     this.expect(reply, [200]);
+  }
+  async federate(accountName: string) {
+    const reply = await this.auth("/federate?isRememberMeEnabled=true", "POST", { accountName, rememberMe: true });
+    this.expect(reply, [200]);
+    requireNoAppleRejection(reply.body);
+    if (reply.body?.federated === true || reply.body?.isFederated === true) {
+      throw new AppError("UNSUPPORTED_AUTH", "Apple requires a federated account sign-in, which this connection does not support. Use Apple's official sign-in page.", 422);
+    }
   }
   auth(path: AuthPath, method: "GET" | "POST" | "PUT" = "GET", body?: unknown, extra: Record<string, string> = {}) {
     return this.send(AUTH_ROOT + path, method, body, this.authHeaders(extra));
@@ -100,7 +109,9 @@ export class AppleAuthHTTP {
     const reply = { status: response.status, body: object(parsed), text, retryAfterMs };
     if (response.status === 429 || response.status >= 500 && delay) throw new AppleRetryError(retryAfterMs);
     const errors = reply.body?.serviceErrors;
-    if (Array.isArray(errors) && errors.some(error => object(error)?.code === -20209)) throw new AppError("UNSUPPORTED_AUTH", "Apple has locked this account. Resolve the account condition through Apple before reconnecting.", 422);
+    if (Array.isArray(errors) && errors.some(error => object(error)?.code === -20209 || object(error)?.code === "-20209")) {
+      throw new AppError("UNSUPPORTED_AUTH", "Apple reports an account security lock for this sign-in. Resolve it through Apple's official sign-in or account recovery page before retrying.", 422);
+    }
     return reply;
   }
   expect(reply: AppleReply, allowed: number[]) {

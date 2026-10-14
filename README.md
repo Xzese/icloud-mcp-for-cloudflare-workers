@@ -378,15 +378,35 @@ The local launcher enables new 30-day sessions by default. Their deadline is fix
 device verification; saved-token renewal does not extend it. Set
 `APPLE_SESSION_RETENTION_WRITES=` explicitly only to test the legacy one-day writer.
 Existing one-day sessions require the owner-authorised retention migration described below.
-Both the launcher and migration accept `LOCAL_ICLOUD_STATE_DIR` to reuse an existing private
-state directory and its keys without creating a replacement login.
+Every Git worktree uses the main checkout's ignored `.sites-runtime/shared-local-icloud/` by default.
+The encryption key, Apple session, service preferences and D1 operation state are shared. A local
+Worker holds an OS-backed state lock; reuse that running Worker or stop it before launching a
+different checkout. A crash releases the lock automatically. The retention migration uses the
+same shared default and lock.
+
+To adopt an existing connected worktree session and link the legacy default directories, stop the
+local Workers first, then run:
+
+```bash
+npm run session:local:centralize -- --from /absolute/path/to/existing/private-state --link-worktrees
+```
+
+This copies a consistent encrypted SQLite snapshot without contacting Apple. Previous stores are
+preserved in private `*.before-centralize-*` directories; legacy worktree defaults become guarded
+redirects to the shared store. Older launchers refuse these credential-free markers before opening
+the database; update their launcher before restarting from an older branch, or use the running
+Worker. Migration refuses active stores and never overwrites a different connected shared session.
+
+Both the launcher and migration accept `LOCAL_ICLOUD_STATE_DIR` to select an existing private
+store explicitly for an isolated investigation, without creating a replacement login.
 `LOCAL_ICLOUD_PORT` selects a different loopback port (default `5173`); pass the same port
 to the migration command so it can check that the server is stopped.
 
-The live launcher creates a separate encrypted local session and explicitly enables the controlled
-login protocol. It listens only on IPv4 loopback, enforces a private local cookie and strips supplied
+The live launcher uses an encrypted local session separate from the hosted deployment and enables
+the controlled login protocol. It listens only on IPv4 loopback, enforces a private local cookie and strips supplied
 identity headers. It must remain running for local access and its automatic checks. Disconnect clears
-the stored session. Its ignored `.sites-runtime/local-icloud/` is private account state, not a fixture.
+the shared stored session for all worktrees. Its ignored `.sites-runtime/shared-local-icloud/` in the main
+checkout is private account state, not a fixture.
 
 Local tests and CI use synthetic data and do not require an Apple account.
 

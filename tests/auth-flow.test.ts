@@ -5,7 +5,7 @@ import fixtures from "./fixtures/protocol.json" with { type: "json" };
 import { b64, concat, hex, unb64, unhex, utf8 } from "../src/crypto/bytes.ts";
 import { bytesField, uint } from "../src/crypto/protobuf.ts";
 import { AppleSignInFlow } from "../src/auth/apple/flow.ts";
-import { AppleAuthHTTP } from "../src/auth/apple/http.ts";
+import { AppleAuthHTTP, APPLE_USER_AGENT, APPLE_WIDGET } from "../src/auth/apple/http.ts";
 import { AuthResponseSequence } from "../src/auth/apple/events.ts";
 import { APPLE_AUTH_PROTOCOL, AUTH_LIFETIME_MS } from "../src/auth/apple/protocol.ts";
 import { advancePcs, freshPcsCheckpoint } from "../src/auth/apple/pcs.ts";
@@ -87,6 +87,7 @@ const accountReply = {
 const bootHTML = (value: unknown) => `<html><script class="boot_args">${JSON.stringify(value)}</script></html>`;
 const hsa2Prefix = (htmlBoot: unknown, jsonBoot: unknown = {}) => [
   { cookies: ["authseed=synthetic-cookie; Path=/; Secure"] },
+  { body: { federated: false } },
   { body: challenge },
   { status: 409, body: { authType: "hsa2" } },
   { text: bootHTML(htmlBoot) },
@@ -99,19 +100,111 @@ async function beginHsa2(flow: AppleSignInFlow) {
   return flow.advance(proofMessage);
 }
 
+test("fresh Apple sign-in performs account preflight and carries its cookies and session headers into SRP", async () => {
+  const harness = scriptedHTTP([
+    { headers: { scnt: "synthetic-bootstrap-context", "X-Apple-ID-Session-Id": "synthetic-bootstrap-session" }, cookies: ["boot=synthetic; Path=/; Secure"] },
+    { body: { federated: false }, headers: { scnt: "synthetic-federation-context", "X-Apple-ID-Session-Id": "synthetic-federation-session", "X-Apple-Auth-Attributes": "synthetic-attributes" }, cookies: ["preflight=synthetic; Path=/; Secure"] },
+    { body: challenge },
+  ]);
+  const flow = new AppleSignInFlow(harness.http, new AbortController().signal, async () => { assert.fail("Preflight must not persist an authenticated session."); });
+  assert.equal((await flow.start(startMessage)).type, "srp-challenge");
+  const [bootstrap, preflight, init] = harness.requests;
+  assert.deepEqual(harness.requests.map(r => r.path), ["/appleauth/auth/authorize/signin", "/appleauth/auth/federate", "/appleauth/auth/signin/init"]);
+  const frame = bootstrap.url.searchParams.get("frame_id");
+  assert.equal(bootstrap.url.searchParams.get("iframeId"), frame);
+  assert.equal(bootstrap.url.searchParams.has("iframeid"), false);
+  assert.equal(bootstrap.url.searchParams.get("state"), frame);
+  assert.equal(bootstrap.url.searchParams.get("language"), "en_US");
+  assert.equal(bootstrap.body, undefined);
+  assert.equal(preflight.url.searchParams.get("isRememberMeEnabled"), "true");
+  assert.deepEqual(preflight.body, { accountName: srp.account, rememberMe: true });
+  assert.equal(preflight.headers.get("scnt"), "synthetic-bootstrap-context");
+  assert.equal(preflight.headers.get("x-apple-id-session-id"), "synthetic-bootstrap-session");
+  assert.equal(preflight.headers.get("cookie"), "boot=synthetic");
+  assert.equal(init.headers.get("scnt"), "synthetic-federation-context");
+  assert.equal(init.headers.get("x-apple-id-session-id"), "synthetic-federation-session");
+  assert.equal(init.headers.get("x-apple-auth-attributes"), "synthetic-attributes");
+  assert.equal(init.headers.get("cookie"), "boot=synthetic; preflight=synthetic");
+  for (const request of [preflight, init]) {
+    assert.equal(request.headers.get("origin"), "https://idmsa.apple.com");
+    assert.equal(request.headers.get("referer"), "https://idmsa.apple.com/");
+    assert.equal(request.headers.get("x-requested-with"), "XMLHttpRequest");
+    assert.equal(request.headers.get("x-apple-widget-key"), APPLE_WIDGET);
+    assert.equal(request.headers.get("x-apple-oauth-state"), frame);
+    assert.equal(request.headers.get("x-apple-frame-id"), frame);
+    assert.equal(request.headers.has("x-apple-fd-client-info"), false);
+    assert.deepEqual(JSON.parse(request.headers.get("x-apple-i-fd-client-info")!), { U: APPLE_USER_AGENT, L: "en-US", Z: "GMT+00:00", V: "1.1", F: "" });
+  }
+});
+
+test("rejected or federated account preflight never submits an SRP challenge or proof", async () => {
+  for (const [reply, code] of [
+    [{ status: 403 }, "REAUTH_REQUIRED"],
+    [{ body: { serviceErrors: [{ code: "-20209" }] } }, "UNSUPPORTED_AUTH"],
+    [{ body: { federated: true, federatedUrl: "https://untrusted.example.invalid/" } }, "UNSUPPORTED_AUTH"],
+  ] as [Reply, string][]) {
+    const harness = scriptedHTTP([{ body: {} }, reply]);
+    const flow = new AppleSignInFlow(harness.http, new AbortController().signal, async () => { assert.fail("Rejected preflight must not persist a session."); });
+    await assert.rejects(flow.start(startMessage), (error: any) => error.code === code);
+    await assert.rejects(flow.advance(proofMessage), (error: any) => error.code === "RESTART_REQUIRED");
+    assert.deepEqual(harness.requests.map(r => r.path), ["/appleauth/auth/authorize/signin", "/appleauth/auth/federate"]);
+  }
+});
+
+test("cancelling during account preflight stops before SRP initialization", async () => {
+  const controller = new AbortController();
+  let enter!: () => void, release!: (reply: Response) => void;
+  const entered = new Promise<void>(resolve => { enter = resolve; });
+  const deferred = new Promise<Response>(resolve => { release = resolve; });
+  const harness = scriptedHTTP([{ body: {} }, () => { enter(); return deferred; }], controller.signal);
+  const flow = new AppleSignInFlow(harness.http, controller.signal, async () => { assert.fail("Cancelled preflight must not persist a session."); });
+  const pending = flow.start(startMessage);
+  await entered;
+  controller.abort();
+  release(response({ body: { federated: false } }));
+  await assert.rejects(pending, (error: any) => error.code === "RESTART_REQUIRED");
+  assert.equal(harness.requests.length, 2);
+});
+
+test("Apple sign-in sends a lowercase account identifier in preflight and both SRP requests", async () => {
+  const harness = scriptedHTTP([{ body: {} }, { body: { federated: false } }, { body: challenge }, { status: 403 }]);
+  const flow = new AppleSignInFlow(harness.http, new AbortController().signal, async () => { assert.fail("A rejected login must not persist a session."); });
+  const browser = new BrowserSrpProof(srp.account.toUpperCase());
+  assert.equal(browser.accountName, srp.account);
+  browser.clear();
+  await flow.start({ ...startMessage, accountName: srp.account.toUpperCase() });
+  await assert.rejects(flow.advance(proofMessage), (error: any) => error.code === "REAUTH_REQUIRED");
+  assert.equal((harness.requests[1].body as { accountName: string }).accountName, srp.account);
+  assert.equal((harness.requests[2].body as { accountName: string }).accountName, srp.account);
+  assert.equal((harness.requests[3].body as { accountName: string }).accountName, srp.account);
+});
+
+test("Apple account security locks accept numeric or string codes and stop before verification or persistence", async () => {
+  for (const code of [-20209, "-20209"]) {
+    const harness = scriptedHTTP([{ body: {} }, { body: { federated: false } }, { body: challenge }, { status: 403, body: { serviceErrors: [{ code, message: "private account detail" }] } }]);
+    const flow = new AppleSignInFlow(harness.http, new AbortController().signal, async () => { assert.fail("A locked account must not persist a session."); });
+    await flow.start(startMessage);
+    await assert.rejects(flow.advance(proofMessage), (error: any) => error.code === "UNSUPPORTED_AUTH" &&
+      error.message.includes("account security lock") && !error.message.includes("private account detail"));
+    assert.equal(harness.requests.length, 4);
+    await assert.rejects(flow.advance(proofMessage), (error: any) => error.code === "RESTART_REQUIRED");
+    assert.equal(harness.requests.length, 4);
+  }
+});
+
 test("phone, voice and legacy trusted-device routes stop before verification, trust or persistence", async () => {
   for (const route of ["auth/verify/phone", "auth/verify/trusteddevice"]) {
     const harness = scriptedHTTP(hsa2Prefix({ direct: { authInitialRoute: route, hasTrustedDevices: true, twoSV: { phoneNumberVerification: { trustedPhoneNumber: { id: 7, pushMode: "sms" } } } } }, { phoneNumberVerification: { mode: "voice" } }));
     let persisted = false;
     const flow = new AppleSignInFlow(harness.http, new AbortController().signal, async () => { persisted = true; });
     await assert.rejects(beginHsa2(flow), (error: any) => error.code === "UNSUPPORTED_AUTH");
-    assert.equal(harness.requests.length, 5); assert.equal(persisted, false);
+    assert.equal(harness.requests.length, 6); assert.equal(persisted, false);
   }
-  const harness = scriptedHTTP([{ body: {} }, { body: challenge }, { status: 200, headers: authenticatedHeaders }]);
+  const harness = scriptedHTTP([{ body: {} }, { body: { federated: false } }, { body: challenge }, { status: 200, headers: authenticatedHeaders }]);
   let persisted = false;
   const flow = new AppleSignInFlow(harness.http, new AbortController().signal, async () => { persisted = true; });
   await assert.rejects(beginHsa2(flow), (error: any) => error.code === "UNSUPPORTED_AUTH");
-  assert.equal(harness.requests.length, 3); assert.equal(persisted, false);
+  assert.equal(harness.requests.length, 4); assert.equal(persisted, false);
 });
 
 function bridgeHarness(options: { settings?: ServiceSettings; validation?: Reply; account?: Reply; stepZero?: ReplyPlan; pushIdentity?: string; pushAlias?: string | "echo-request"; serverFlowId?: string; laterIdentity?: string } = {}) {
@@ -244,7 +337,7 @@ test("a security-key requirement found only in JSON stops before any verificatio
 
   await flow.start(startMessage);
   await assert.rejects(flow.advance(proofMessage), (error: any) => error.code === "UNSUPPORTED_AUTH");
-  assert.equal(harness.requests.length, 5);
+  assert.equal(harness.requests.length, 6);
   assert.equal(persisted, false);
 });
 
@@ -302,6 +395,7 @@ test("cancelling during deferred Apple proof submission prevents the late respon
   const deferred = new Promise<Response>(resolve => { release = resolve; });
   const plans: ReplyPlan[] = [
     { status: 200 },
+    { body: { federated: false } },
     { body: challenge },
     () => { enter(); return deferred; },
   ];
@@ -390,7 +484,7 @@ test("the auth socket rejects a valid message bound to another transaction befor
     constructor() { return { client, server }; }
   };
   const appleRequests: string[] = [];
-  const appleReplies: ReplyPlan[] = [{ status: 200 }, { body: challenge }];
+  const appleReplies: ReplyPlan[] = [{ status: 200 }, { body: { federated: false } }, { body: challenge }];
   const fetchShim = async (input: RequestInfo | URL) => {
     const url = new URL(String(input));
     appleRequests.push(url.pathname);
@@ -421,7 +515,7 @@ test("the auth socket rejects a valid message bound to another transaction befor
     assert.equal(hello.type, "hello");
     server.message(JSON.stringify({ ...startMessage, transactionId: hello.transactionId, nonce: hello.nonce }));
     await challengeSent;
-    assert.equal(appleRequests.length, 2);
+    assert.equal(appleRequests.length, 3);
     const differentTransaction = crypto.randomUUID();
     assert.notEqual(differentTransaction, hello.transactionId);
     server.message(JSON.stringify({ type: "cancel", transactionId: differentTransaction, nonce: hello.nonce, sequence: 1 }));
@@ -429,7 +523,7 @@ test("the auth socket rejects a valid message bound to another transaction befor
     assert.equal(rejected.type, "failed");
     assert.equal(rejected.error.code, "RESTART_REQUIRED");
     assert.equal(server.sent.length, 3); // hello, SRP challenge, then the transaction-fence failure
-    assert.equal(appleRequests.length, 2);
+    assert.equal(appleRequests.length, 3);
     assert.equal(db.version, 1); // only the start fence was acquired; no auth session commit ran
   } finally {
     if (responseDescriptor) Object.defineProperty(globalThis, "Response", responseDescriptor);

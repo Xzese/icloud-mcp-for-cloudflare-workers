@@ -9,6 +9,7 @@ export function beginAppleSignIn(accountName: string, initialPassword: string, c
   if (!consent.appleTrust || !consent.persistentSession || !initialPassword || initialPassword.length > 4096) throw new Error("Enter your Apple credentials and confirm Apple session trust and encrypted retention.");
   let password = initialPassword; initialPassword = "";
   const srp = new BrowserSrpProof(accountName); const bridge = new BrowserBridgeProof();
+  accountName = srp.accountName;
   const url = new URL("/api/auth/socket", location.origin); url.protocol = location.protocol === "https:" ? "wss:" : "ws:"; url.searchParams.set("generation", String(generation));
   const socket = new WebSocket(url, APPLE_AUTH_PROTOCOL);
   const events = new AuthResponseSequence(generation);

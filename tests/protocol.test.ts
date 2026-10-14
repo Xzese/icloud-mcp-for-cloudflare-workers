@@ -27,6 +27,14 @@ test("both Apple KDF protocols and SRP proofs match eight pinned Python transcri
   await assert.rejects(appleKdf("synthetic", unhex(f.salt), 1000, "invalid" as "s2k"));
 });
 
+test("Apple SRP proofs normalize mixed-case account identifiers against pinned transcripts", async () => {
+  for (const f of fixtures.srp) {
+    const result = await srpProof(f.account.toUpperCase(), unhex(f.ephemeral), unhex(f.derived), unhex(f.salt), unhex(f.B));
+    assert.equal(hex(result.M1), f.M1);
+    assert.equal(hex(result.M2), f.M2);
+  }
+});
+
 test("SPAKE2/scrypt transcript, confirmations and AES-GCM match pinned Python", async () => {
   const f = fixtures.bridge; const { w0, w1 } = await spakeScalars(f.code, unhex(f.salt));
   assert.equal(w0.toString(16), f.w0); assert.equal(w1.toString(16), f.w1);
