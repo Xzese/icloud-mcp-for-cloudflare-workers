@@ -88,6 +88,21 @@ test("Drive handles are scoped to settings/session and consumed once; disconnect
   await assert.rejects(repository.consumeHandle(handle.id, "download", { ...scope, permissionRevision: 3 }), { code: "CONFLICT" });
   assert.deepEqual(await repository.consumeHandle(handle.id, "download", scope), { itemId: "test-file" });
   await assert.rejects(repository.consumeHandle(handle.id, "download", scope), { code: "CONFLICT" });
+  const traversal = await repository.handle("traversal", { queue: ["Private folder"] }, scope);
+  await assert.rejects(repository.loadTraversalHandle(traversal.id, { ...scope, account: "other-account" }), { code: "CONFLICT" });
+  const retained = await repository.loadTraversalHandle(traversal.id, scope);
+  assert.deepEqual(retained.data, { queue: ["Private folder"] });
+  assert.ok(!retained.envelope.includes("Private folder"));
+  const advances = await Promise.allSettled([
+    repository.advanceTraversalHandle(traversal.id, retained.envelope, { queue: [] }, scope),
+    repository.advanceTraversalHandle(traversal.id, retained.envelope, { queue: [] }, scope),
+  ]);
+  assert.equal(advances.filter(result => result.status === "fulfilled").length, 1);
+  const next = advances.find(result => result.status === "fulfilled") as PromiseFulfilledResult<string>;
+  await assert.rejects(repository.loadTraversalHandle(traversal.id, scope), { code: "CONFLICT" });
+  const rotated = await repository.loadTraversalHandle(next.value, scope);
+  assert.deepEqual(rotated.data, { queue: [] });
+  assert.equal(await repository.advanceTraversalHandle(next.value, rotated.envelope, null, scope), null);
   const old = await repository.create(crypto.randomUUID(), "create", { name: "Folder" }, scope);
   const later = await repository.create(crypto.randomUUID(), "create", { name: "New folder" }, { ...scope, generation: 3 });
   await repository.clearBeforeGeneration(2);

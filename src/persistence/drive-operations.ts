@@ -104,7 +104,7 @@ export class DriveOperationRepository {
     await this.db.prepare("UPDATE drive_operations SET lease_id = NULL, lease_until = 0 WHERE owner_id = ? AND operation_id = ? AND lease_id = ?")
       .bind(this.owner, row.operation_id, row.lease_id).run();
   }
-  async handle(kind: "search" | "download", data: unknown, scope: DriveScope) {
+  async handle(kind: "search" | "download" | "traversal", data: unknown, scope: DriveScope) {
     await this.requireSchema();
     await this.db.prepare("DELETE FROM drive_handles WHERE owner_id = ? AND expires_at <= ?").bind(this.owner, Date.now()).run();
     const id = crypto.randomUUID(), expires = Math.min(scope.expiresAt, Date.now() + 10 * 60_000);
@@ -114,6 +114,44 @@ export class DriveOperationRepository {
       .bind(this.owner, id, scope.account, scope.generation, scope.permissionRevision, kind, expires, envelope, this.owner).run();
     if (!result.meta.changes) throw new AppError("RATE_LIMITED", "Too many active Drive continuations. Wait for older handles to expire.", 429, true);
     return { id, expiresAt: expires };
+  }
+  async loadTraversalHandle(id: string, scope: DriveScope) {
+    await this.requireSchema();
+    const row = await this.db.prepare("SELECT envelope FROM drive_handles WHERE owner_id = ? AND handle_id = ? AND kind = 'traversal' AND account_scope = ? AND generation = ? AND permission_revision = ? AND expires_at > ?")
+      .bind(this.owner, id, scope.account, scope.generation, scope.permissionRevision, Date.now()).first<{ envelope: string }>();
+    if (!row) throw new AppError("CONFLICT", "This traversal expired, was used, or belongs to different settings/session. Start a fresh traversal.", 409);
+    try { return { data: await this.envelopes.decrypt(EnvelopeSchema.parse(JSON.parse(row.envelope)), this.context(id, scope.account, scope.generation, "traversal")), envelope: row.envelope }; }
+    catch { throw new AppError("PROTOCOL_CHANGED", "The encrypted Drive traversal failed verification.", 503); }
+  }
+  async retainTraversalShares(values: (string | undefined)[], scope: DriveScope) {
+    const ids = [...new Set(values.filter((value): value is string => value !== undefined))];
+    if (!ids.length) return;
+    // Keep only contexts referenced by this page/queue alive, with the same
+    // inactivity deadline as its cursor. Never revive expired or foreign rows.
+    const now = Date.now(), expires = Math.min(scope.expiresAt, now + 10 * 60_000);
+    for (let offset = 0; offset < ids.length; offset += 50) {
+      const group = ids.slice(offset, offset + 50);
+      const rows = await this.db.prepare(`UPDATE drive_handles SET expires_at = MAX(expires_at, ?) WHERE owner_id = ? AND kind = 'share' AND account_scope = ? AND generation = ? AND permission_revision = ? AND expires_at > ? AND handle_id IN (${group.map(() => "?").join(",")}) RETURNING handle_id`)
+        .bind(expires, this.owner, scope.account, scope.generation, scope.permissionRevision, now, ...group).all();
+      if (rows.results.length !== group.length) throw new AppError("CONFLICT", "A required shared context expired or changed. Browse its parent again before restarting this traversal.", 409);
+    }
+  }
+  // Rotate the cursor only after a successful read/session checkpoint. An Apple
+  // failure leaves it available, and a compare-and-swap prevents double advance.
+  async advanceTraversalHandle(id: string, previous: string, data: unknown | null, scope: DriveScope): Promise<string | null> {
+    const next = data === null ? null : crypto.randomUUID();
+    const args = [this.owner, id, scope.account, scope.generation, scope.permissionRevision, Date.now(), previous];
+    let row;
+    if (next) {
+      const envelope = JSON.stringify(await this.envelopes.encrypt(data, this.context(next, scope.account, scope.generation, "traversal")));
+      row = await this.db.prepare("UPDATE drive_handles SET handle_id = ?, expires_at = ?, envelope = ? WHERE owner_id = ? AND handle_id = ? AND kind = 'traversal' AND account_scope = ? AND generation = ? AND permission_revision = ? AND expires_at > ? AND envelope = ? RETURNING handle_id")
+        .bind(next, Math.min(scope.expiresAt, Date.now() + 10 * 60_000), envelope, ...args).first();
+    } else {
+      row = await this.db.prepare("DELETE FROM drive_handles WHERE owner_id = ? AND handle_id = ? AND kind = 'traversal' AND account_scope = ? AND generation = ? AND permission_revision = ? AND expires_at > ? AND envelope = ? RETURNING handle_id")
+        .bind(...args).first();
+    }
+    if (!row) throw new AppError("CONFLICT", "This traversal continuation was already advanced or expired. Use the latest successful page's continuation.", 409);
+    return next;
   }
   async consumeHandle(id: string, kind: "search" | "download", scope: DriveScope): Promise<unknown> {
     await this.requireSchema();

@@ -64,6 +64,7 @@ accepts folder names and returns an exact ID when it can verify every parent.
 | `list_icloud_drive_items` | Optional `folderId`, defaults to Drive root; optional `shareContext` | `folder`, `items`, `complete`, `reasons`, `counts` |
 | `get_icloud_drive_item` | `itemId`, optional `shareContext` | `item` with current `etag` |
 | `search_icloud_drive` | `query`, optional `folderId`, `shareContext`, `continuation` | Matching `items`, `complete`, `reasons`, cumulative `incompleteFolders`, next `continuation` |
+| `traverse_icloud_drive` | Optional `folderId`, `shareContext`, `query`, `limit`, `maxItems`, `maxFolders`, `maxDepth`, `continuation` | Recursive `items` with `relativePath` and `depth`, `progress`, `complete`, `reasons`, cumulative `incompleteFolders`, next `continuation` |
 | `resolve_icloud_drive_folder_path` | `path`, optional starting `folderId` (Drive root by default), `shareContext` | `status`, `reason`, resolved `folder` or `choices`, `resolvedPath`, `remainingSegments`, `parentListing`, `foldersRead` |
 | `read_icloud_drive_file` | `itemId`, optional `shareContext`, optional `encoding`: `utf8` (default) or `base64`, optional `previewBytes`: 1–8192 for UTF-8 previews | `item`, `encoding`, `content`, `bytesRead`, `truncated` |
 | `download_icloud_drive_file` | `itemId`, optional `shareContext` | `item`, private `url`, `handleId`, `expiresAt` |
@@ -85,6 +86,53 @@ same root and query and the newly returned token. Tokens are single-use and expi
 minutes or a settings/session change. Incomplete folders or exhausted limits remain explicit;
 an empty result does not prove the entire account has no matches. Listings are live pages,
 not an atomic snapshot.
+
+### Recursive listing and search
+
+Use `POST /api/drive/traverse` or `traverse_icloud_drive` to list a selected folder's descendants.
+Omit `query` for an inventory, or provide a case-insensitive filename substring to filter results.
+The starting folder is excluded; its immediate files and folders have depth 1. Each returned
+item includes its ordinary metadata, exact ID and optional share context, plus a relative
+display path. Paths are labels, not identities or filesystem paths; use IDs for subsequent actions.
+
+```json
+{
+  "folderId": "FOLDER::com.apple.CloudDocs::root",
+  "limit": 200,
+  "maxItems": 10000,
+  "maxFolders": 1000,
+  "maxDepth": 64
+}
+```
+
+To search, add `"query": "invoice"`. To continue, repeat the same folder, share context,
+query and limits with the returned `continuation`. Combine all successful pages. An empty
+page can still have a continuation. A successfully advanced cursor is single-use; it expires
+after ten minutes without a successful page, a settings/account change, or session expiry.
+Encrypted queue state survives Worker restarts. Failed Apple reads and failed session
+checkpoints do not advance the input cursor. If a successful response is lost, its old cursor
+cannot be replayed; restart the read-only traversal.
+
+Traversal is breadth-first, with at most three folder listings and 200 returned items per call.
+Each discovered `(folder ID, share context)` is listed once in a successful traversal; retries
+after a failed page may reread that page's folders. Pending metadata carries across pages so
+small output pages do not refetch large parent listings. `progress` reports cumulative inspected
+`visited` items, `foldersVisited`, returned matches, and `queuedFolders` still awaiting processing.
+The traversal inspects names and metadata, not file contents, and does not build an account index.
+
+Defaults are 10,000 inspected items, 1,000 discovered folders including the starting folder,
+and depth 64; upper bounds are 100,000 items, 5,000 folders and depth 64. `limit` is 1–200.
+Limits apply to the entire traversal, not just matches. Item exhaustion ends the traversal;
+folder/depth limits skip additional branches while already queued work can continue. Reasons
+include `traversal_item_limit`, `traversal_folder_limit`, `traversal_depth_limit` and
+`traversal_state_limit` (the shared 512,000-byte plaintext encryption budget). `continuation_required` marks
+remaining work. `complete` is true only after all discovered work finishes without omissions
+or limits; cumulative `incompleteFolders` preserves Apple's listing diagnostics through the final page.
+
+Apple's per-folder 1,000-item boundary and unsupported entries still apply. Continuations
+cannot recover children omitted by Apple. Successful pages keep referenced shared contexts
+alive for the same ten-minute inactivity window; expired contexts are never revived. Concurrent
+native edits can change later pages: the result is a live traversal, not an atomic snapshot.
 
 ### Incomplete listings and missing shared folders
 
@@ -241,7 +289,7 @@ owner authentication; knowing a handle does not grant access.
 | `/api/settings` | GET returns `{revision, available, settings}`; POST `{expectedRevision, settings}` |
 | `/api/drive/approve` | POST `{expectedGeneration, restartApproval?: boolean}` |
 | `/api/reminders/approve` | POST `{expectedGeneration, restartApproval?: boolean}` |
-| `/api/drive/list`, `/lookup`, `/search`, `/resolve-folder-path`, `/read`, `/download` | POST corresponding tool input |
+| `/api/drive/list`, `/lookup`, `/search`, `/traverse`, `/resolve-folder-path`, `/read`, `/download` | POST corresponding tool input |
 | `/api/drive/upload`, `/create-folder`, `/rename`, `/move`, `/operation` | POST corresponding tool input |
 | `/api/drive/prepare-upload` | POST upload metadata without `contentBase64`; returns `operationId`, `uploadPath` |
 | `/api/drive/uploads/<operationId>/content` | POST raw bytes, `Content-Type: application/octet-stream`, configured application `Origin` |
@@ -428,3 +476,14 @@ package archives, HTTP 330 redirects, transient read retries and a new PCS/423 a
 remain covered by synthetic tests rather than this live pass. Fresh sign-in request-context
 corrections have synthetic coverage; this pass reused verified credentials instead of repeating
 Apple's rejected password sign-in.
+
+A subsequent read-only live pass verified `/api/drive/traverse` with a 100-item, 12-folder,
+depth-4 budget and 20-item pages. Seven pages returned 100 metadata items after listing 11
+folders; pages containing buffered metadata required no additional folder reads. The input
+cursor survived a cold Worker restart. Changed-query requests were rejected without consuming
+the cursor, successful-cursor replay was rejected, and a bounded name search found the selected
+existing file. Relative paths, depth, cumulative progress and page sizes were checked without
+logging names or identities. The final listing correctly remained incomplete because of the
+root's upstream omissions and the configured scan limits. Drive and Reminders stayed ready,
+and no Apple data writes were made. Shared-context retention beyond ten minutes and traversal
+beyond 1,000 items are covered by synthetic regressions rather than this live pass.

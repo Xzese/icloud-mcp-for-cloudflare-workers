@@ -139,6 +139,7 @@ native behaviour from connector safeguards and links the supporting live evidenc
 | --- | --- |
 | `connection_status` | Report account/service readiness, saved permissions, session generation and tool availability; does not contact Apple. |
 | `list_icloud_drive_items`, `get_icloud_drive_item`, `search_icloud_drive` | Browse exact metadata and search names within a selected folder tree. |
+| `traverse_icloud_drive` | Recursively list or filter a folder tree with relative paths, encrypted resumable pages, configurable limits and explicit completeness. |
 | `read_icloud_drive_file`, `download_icloud_drive_file` | Read bounded text/base64 or prepare a private authenticated download. |
 | `upload_icloud_drive_file`, `create_icloud_drive_folder` | Add new files or folders using retained operation UUIDs. |
 | `rename_icloud_drive_item`, `move_icloud_drive_item` | Organise owned items using current etags. |

@@ -195,6 +195,7 @@ export async function verifyDrive(options) {
     const listedTools = await mcp("tools/list", {});
     assert.ok(listedTools.result.tools.some(tool => tool.name === "list_icloud_drive_items" && tool.outputSchema.properties.items));
     assert.ok(listedTools.result.tools.some(tool => tool.name === "get_icloud_drive_item" && tool.outputSchema.properties.item));
+    assert.ok(listedTools.result.tools.some(tool => tool.name === "traverse_icloud_drive" && tool.outputSchema.properties.progress));
     assert.ok(listedTools.result.tools.some(tool => tool.name === "resolve_icloud_drive_folder_path" && tool.outputSchema.properties.parentListing));
     const missingPath = await mcp("tools/call", { name: "resolve_icloud_drive_folder_path", arguments: { expectedGeneration: generation, path: "Documents/Snap Heaven/01/FY 2026" } });
     assert.equal(missingPath.result.isError, undefined, JSON.stringify(missingPath));
@@ -253,6 +254,28 @@ export async function verifyDrive(options) {
     assert.equal(typedItem.documentId, uploadedDocId);
     assert.equal(typedItem.size, payloadBytes.length);
     assert.equal(Object.hasOwn(typedItem, "raw"), false);
+    const recursiveInput = { expectedGeneration: generation, limit: 1 };
+    const recursiveFirst = await request("/api/drive/traverse", { method: "POST", body: JSON.stringify(recursiveInput) });
+    assert.equal(recursiveFirst.status, 200);
+    let recursivePage = await recursiveFirst.json();
+    const recursiveItems = [...recursivePage.items];
+    const initialCursor = recursivePage.continuation;
+    while (recursivePage.continuation) {
+      const next = await mcp("tools/call", { name: "traverse_icloud_drive", arguments: { ...recursiveInput, continuation: recursivePage.continuation } });
+      assert.equal(next.result.isError, undefined, JSON.stringify(next));
+      recursivePage = next.result.structuredContent;
+      recursiveItems.push(...recursivePage.items);
+    }
+    assert.equal(recursivePage.complete, false);
+    assert.deepEqual(recursivePage.reasons, ["missing_direct_children_count"]);
+    assert.equal(recursivePage.progress.foldersVisited, 3);
+    assert.deepEqual(recursiveItems.map(item => item.relativePath), ["Shared Fixture", uploadedName, "Shared Fixture/01"]);
+    const recursiveReplay = await request("/api/drive/traverse", { method: "POST", body: JSON.stringify({ ...recursiveInput, continuation: initialCursor }) });
+    assert.equal(recursiveReplay.status, 409);
+    const recursiveSearch = await mcp("tools/call", { name: "traverse_icloud_drive", arguments: { query: "SYNTHETIC-LARGE" } });
+    assert.equal(recursiveSearch.result.structuredContent.complete, false);
+    assert.deepEqual(recursiveSearch.result.structuredContent.reasons, ["missing_direct_children_count"]);
+    assert.deepEqual(recursiveSearch.result.structuredContent.items.map(item => item.id), [uploadedId]);
     const getCall = await mcp("tools/call", { name: "get_icloud_drive_item", arguments: { expectedGeneration: generation, itemId: typedItem.id } });
     assert.equal(getCall.result.structuredContent.item.documentId, uploadedDocId);
     assert.equal(getCall.result.structuredContent.item.etag, "synthetic-upload-etag");
@@ -309,7 +332,7 @@ export async function verifyDrive(options) {
     assert.equal(revokedReadBody.error.code, "FORBIDDEN");
     assert.equal(downloads, downloadsBeforeRevocation, "revoked content access must not issue another Apple content request");
     return {
-      checks: ["signed-owner-origin", "300-KiB-streaming-upload", "exact-document-commit-and-idempotent-replay", "typed-MCP-metadata", "shared-path-and-persisted-private-context", "private-single-use-download", "docws-shared-fallback", "validated-330-and-byte-ranges", "bounded-package-archive", "64-KiB-inline-guidance-and-8-KiB-preview", "contents-permission-revocation"],
+      checks: ["signed-owner-origin", "300-KiB-streaming-upload", "exact-document-commit-and-idempotent-replay", "typed-MCP-metadata", "recursive-HTTP-MCP-listing-search-and-cursor-rotation", "shared-path-and-persisted-private-context", "private-single-use-download", "docws-shared-fallback", "validated-330-and-byte-ranges", "bounded-package-archive", "64-KiB-inline-guidance-and-8-KiB-preview", "contents-permission-revocation"],
       uploadedBytes: payloadBytes.length, operationId, metadataTools: 2,
       outboundTransferBytes: observedUpload?.byteLength ?? 0, appleUploadRequests: allocations + transfers + finalizations, downloads,
     };

@@ -15,11 +15,12 @@ import { DriveClient, DRIVE_ROOT, DriveItemSchema, UploadReceiptSchema, type Dri
 import { DriveHTTP, type DriveByteRange } from "../transport/drive-http.ts";
 import { DriveSharedContext } from "./shared.ts";
 import { resolveDriveFolderPath } from "./folder-path.ts";
+import { newTraversal, traversalPage, TraversalState } from "./traversal.ts";
 import { DriveFolderListingDiagnostics, type DriveSearchReason } from "./listing.ts";
-import { accountScope } from "../lib/canonical.ts";
+import { accountScope, fingerprint } from "../lib/canonical.ts";
 import { b64, unb64, hex } from "../crypto/bytes.ts";
 import type { RuntimeEnv } from "../platform/sites.ts";
-import { ListDrive, GetDriveItem, SearchDrive, ResolveDriveFolderPath, ReadDrive, DownloadDrive, UploadDrive, UploadDriveMetadata, CreateDriveFolder, RenameDriveItem, MoveDriveItem, GetDriveOperation, OperationId, INLINE_FILE_BYTES, DRIVE_FILE_BYTES, INLINE_UPLOAD_GUIDANCE } from "./schemas.ts";
+import { ListDrive, GetDriveItem, SearchDrive, TraverseDrive, ResolveDriveFolderPath, ReadDrive, DownloadDrive, UploadDrive, UploadDriveMetadata, CreateDriveFolder, RenameDriveItem, MoveDriveItem, GetDriveOperation, OperationId, INLINE_FILE_BYTES, DRIVE_FILE_BYTES, INLINE_UPLOAD_GUIDANCE } from "./schemas.ts";
 
 type Saved = Awaited<ReturnType<AppleSessionRepository["load"]>>;
 type Upload = z.infer<typeof UploadDriveMetadata>;
@@ -151,6 +152,27 @@ export class DriveService {
   async get(input: unknown) {
     const request = parse(GetDriveItem, input);
     return this.metadata("drive.browse", request.expectedGeneration, async c => ({ item: await c.client.getItem(request.itemId, request.shareContext), generation: c.scope.generation }));
+  }
+  async traverse(input: unknown) {
+    const { continuation, expectedGeneration, ...options } = parse(TraverseDrive, input);
+    const context = await this.open("drive.browse", expectedGeneration);
+    let failure: unknown;
+    try {
+      const retained = continuation ? await this.operations.loadTraversalHandle(continuation, context.scope) : null;
+      const state = retained ? parse(TraversalState, retained.data) : newTraversal(options);
+      if (await fingerprint(state.input) !== await fingerprint(options)) conflict("Repeat the same folder, share context, query and limits when continuing a traversal.");
+      const page = await traversalPage(context.client, state);
+      await this.finish(context);
+      await this.operations.retainTraversalShares([
+        ...page.result.items.map(item => item.shareContext),
+        ...(page.canContinue ? [...page.state.queue.map(folder => folder.shareContext), page.state.pending?.folder.shareContext, ...(page.state.pending?.items.map(item => item.shareContext) ?? [])] : []),
+      ], context.scope);
+      const next = continuation && retained
+        ? await this.operations.advanceTraversalHandle(continuation, retained.envelope, page.canContinue ? page.state : null, context.scope)
+        : page.canContinue ? (await this.operations.handle("traversal", page.state, context.scope)).id : null;
+      return { ...page.result, continuation: next, generation: context.scope.generation };
+    } catch (error) { failure = error; throw error; }
+    finally { await this.close(context, failure); }
   }
   async resolveFolderPath(input: unknown) {
     const request = parse(ResolveDriveFolderPath, input);

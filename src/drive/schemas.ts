@@ -16,6 +16,15 @@ const readContext = { ...common, shareContext: SharedContextId.optional() };
 export const ListDrive = z.object({ ...readContext, folderId: DriveId.default("FOLDER::com.apple.CloudDocs::root") }).strict();
 export const GetDriveItem = z.object({ ...readContext, itemId: DriveId }).strict();
 export const SearchDrive = z.object({ ...readContext, folderId: DriveId.default("FOLDER::com.apple.CloudDocs::root"), query: z.string().trim().min(1).max(200), continuation: z.string().uuid().optional() }).strict();
+export const TraverseDriveOptions = z.object({
+  folderId: DriveId.default("FOLDER::com.apple.CloudDocs::root"), shareContext: SharedContextId.optional(),
+  query: z.string().trim().min(1).max(200).optional().describe("Optional case-insensitive name substring; omit to list every supported descendant."),
+  limit: z.number().int().min(1).max(200).default(200).describe("Maximum results in this page."),
+  maxItems: z.number().int().min(1).max(100_000).default(10_000).describe("Maximum inspected items across the entire traversal."),
+  maxFolders: z.number().int().min(1).max(5000).default(1000).describe("Maximum discovered folders, including the starting folder."),
+  maxDepth: z.number().int().min(1).max(64).default(64).describe("Maximum item depth relative to the starting folder; immediate children have depth 1."),
+}).strict();
+export const TraverseDrive = TraverseDriveOptions.extend({ ...common, continuation: z.string().uuid().optional() }).strict();
 export const ResolveDriveFolderPath = z.object({ ...readContext,
   folderId: DriveId.default("FOLDER::com.apple.CloudDocs::root").describe("Starting folder ID; path is relative to this folder, or Drive root when omitted."),
   path: z.string().min(1).max(4096).refine(value => {
