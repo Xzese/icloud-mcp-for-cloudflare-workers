@@ -318,3 +318,25 @@ test("zero-byte downloads avoid Apple fetch and mutation calls never follow redi
   await assert.rejects(client.renameItem(zero, "renamed.txt"), AppError);
   assert.equal(sent, 1);
 });
+
+test("shared roots fall back to docws after a 400, while unmapped identities never guess document URLs", async () => {
+  const root = { ...folder, drivewsid: "SHARED_FOLDER::com.apple.CloudDocs::share", name: "Shared", item_id: "private-share-root", shareID: { recordName: "synthetic-share" }, items: [], directChildrenCount: 0 };
+  const known = { ...file, item_id: "private-known-file", parentId: root.drivewsid };
+  let deny = false, fallbacks = 0;
+  const client = makeClient((url, init) => {
+    if (url.pathname === "/v1/item/private-share-root") { fallbacks++; return json({ item_id: "private-share-root", item_info: { name: "Shared", type: "FOLDER", version: "2z", size: "0" } }); }
+    if (url.pathname === "/v1/enumerate/private-share-root") return json({ drive_item: [{ item_id: known.item_id, item_info: { name: `${known.name}.pdf`, type: "FILE", version: known.etag, size: String(known.size) } }] });
+    const [entry] = JSON.parse(String(init.body));
+    return deny ? new Response(null, { status: 400 }) : entry.drivewsid === DRIVE_ROOT ? json([{ ...rootItem, items: [root], directChildrenCount: 1 }]) : json([{ ...root, items: [known], directChildrenCount: 1 }]);
+  });
+  const selected = (await client.listItems(DRIVE_ROOT)).items[0]!;
+  await client.listItems(selected.id, selected.shareContext);
+  deny = true;
+  const listed = await client.listItems(selected.id, selected.shareContext);
+  assert.equal(listed.folder.id, selected.id);
+  assert.equal(listed.items[0]?.id, known.drivewsid, "Enumeration reuses an already-discovered identity.");
+  assert.equal(listed.complete, false);
+  assert.equal(fallbacks, 1);
+  await assert.rejects(client.getItem("FOLDER_IN_SHARED_FOLDER::com.apple.CloudDocs::unmapped", selected.shareContext), { code: "UPSTREAM_UNAVAILABLE" });
+  assert.equal(fallbacks, 1);
+});

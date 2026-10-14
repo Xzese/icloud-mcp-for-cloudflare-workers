@@ -1,8 +1,8 @@
 import { z } from "zod";
 import { DRIVE_FILE_LIMIT_LABEL } from "../drive/limits.ts";
 import { DriveListingDiagnostics, type DriveListingReason } from "../drive/listing.ts";
-import { DriveSharedContext, DriveShareID, type SharedContext, type DriveSharedStore } from "../drive/shared.ts";
-import { canonicalJSON } from "../lib/canonical.ts";
+import { DriveSharedContext, DriveShareID, DriveDocwsItemID, type SharedContext, type DriveSharedStore } from "../drive/shared.ts";
+import { canonicalJSON, fingerprint } from "../lib/canonical.ts";
 import { AppError } from "../errors.ts";
 import type { AppleHTTP } from "../transport/apple-http.ts";
 import { DRIVE_MAX_METADATA_BYTES, DRIVE_MAX_TRANSFER_BYTES, DriveHTTP, driveContentURL, driveServiceURL } from "../transport/drive-http.ts";
@@ -14,6 +14,14 @@ const NAME_MAX = 255;
 const IDENTIFIER = /^[A-Za-z0-9._:-]{1,512}$/;
 
 export const DRIVE_ROOT = ROOT_ID;
+
+class DriveRequestError extends AppError {
+  readonly upstreamStatus: number;
+  constructor(status: number) {
+    super(status === 429 ? "RATE_LIMITED" : "UPSTREAM_UNAVAILABLE", "Apple rejected the iCloud Drive request.", status === 429 ? 429 : 502, [408, 429, 500, 502, 503, 504].includes(status));
+    this.upstreamStatus = status;
+  }
+}
 
 function protocol(message: string): never {
   throw new AppError("PROTOCOL_CHANGED", message);
@@ -42,15 +50,16 @@ export const DriveConnectionSchema = z.object({
 export type DriveConnection = z.infer<typeof DriveConnectionSchema>;
 
 export const DriveItemSchema = z.object({
-  id: z.string().regex(/^(?:FOLDER|FILE)(?:_IN_SHARED_FOLDER)?::com\.apple\.CloudDocs::[A-Za-z0-9._-]{1,256}$/),
+  id: z.string().regex(/^(?:(?:FOLDER|FILE)(?:_IN_SHARED_FOLDER)?|SHARED_FOLDER)::com\.apple\.CloudDocs::[A-Za-z0-9._-]{1,256}$/),
   // Upstream fixtures show docwsid is an opaque document key (UUID), with "root" for Drive root.
   documentId: z.string().regex(/^[A-Za-z0-9._-]{1,256}$/),
   zone: z.literal(ZONE),
   name: z.string().min(1).max(NAME_MAX),
   type: z.enum(["file", "folder"]),
+  package: z.literal(true).optional(),
   etag: z.string().min(1).max(512),
   size: z.number().int().safe().nonnegative().nullable(),
-  parentId: z.string().regex(/^FOLDER(?:_IN_SHARED_FOLDER)?::com\.apple\.CloudDocs::[A-Za-z0-9._-]{1,256}$/).nullable(),
+  parentId: z.string().regex(/^(?:FOLDER(?:_IN_SHARED_FOLDER)?|SHARED_FOLDER)::com\.apple\.CloudDocs::[A-Za-z0-9._-]{1,256}$/).nullable(),
   modifiedAt: z.string().datetime({ offset: true }).nullable(),
   shareContext: z.string().uuid().optional(),
 }).strict();
@@ -91,7 +100,7 @@ function opaqueDocumentId(value: unknown): value is string {
 }
 
 function readableId(value: unknown, prefixes: readonly string[] = ["FOLDER", "FILE"]): value is string {
-  return ownedId(value, prefixes.flatMap(prefix => [prefix, `${prefix}_IN_SHARED_FOLDER`]));
+  return ownedId(value, prefixes.flatMap(prefix => prefix === "FOLDER" ? [prefix, `${prefix}_IN_SHARED_FOLDER`, "SHARED_FOLDER"] : [prefix, `${prefix}_IN_SHARED_FOLDER`]));
 }
 
 function validName(name: string): void {
@@ -113,7 +122,8 @@ function item(raw: unknown, expectedParent: string | null = null, shareContext?:
   if (!readableId(id) || !opaqueDocumentId(documentId) || raw.zone !== ZONE || !shareContext && (raw.shareID !== undefined || raw.shareId !== undefined || raw.share !== undefined || String(id).includes("_IN_SHARED_FOLDER::"))) {
     return protocol("Apple returned an unsupported or unscoped iCloud Drive item.");
   }
-  const kind = typeof raw.type === "string" ? raw.type.toLowerCase() : "";
+  const rawKind = typeof raw.type === "string" ? raw.type.toLowerCase() : "";
+  const kind = rawKind === "shared_folder" ? "folder" : rawKind === "package" ? "file" : rawKind;
   if (kind !== "file" && kind !== "folder") return protocol("Apple returned an unsupported iCloud Drive item type.");
   let name = raw.name;
   if (typeof name === "string" && typeof raw.extension === "string" && raw.extension && !name.endsWith(`.${raw.extension}`)) name = `${name}.${raw.extension}`;
@@ -125,7 +135,7 @@ function item(raw: unknown, expectedParent: string | null = null, shareContext?:
   if (expectedParent !== null && rawParent !== null && rawParent !== undefined && rawParent !== expectedParent) return protocol("Apple returned an iCloud Drive child with a different parent identity.");
   const parentId = rawParent === null || rawParent === undefined ? null : rawParent;
   const size = raw.size === undefined || raw.size === null || kind === "folder" ? null : typeof raw.size === "number" ? raw.size : typeof raw.size === "string" && /^\d+$/.test(raw.size) ? Number(raw.size) : NaN;
-  const parsed = DriveItemSchema.safeParse({ id, documentId, zone: ZONE, name, type: kind, etag: raw.etag, size, parentId, modifiedAt: isoDate(raw.dateModified ?? raw.dateChanged), ...(shareContext ? { shareContext } : {}) });
+  const parsed = DriveItemSchema.safeParse({ id, documentId, zone: ZONE, name, type: kind, etag: raw.etag, size, parentId, modifiedAt: isoDate(raw.dateModified ?? raw.dateChanged), ...(rawKind === "package" ? { package: true } : {}), ...(shareContext ? { shareContext } : {}) });
   if (!parsed.success) return protocol("Apple returned invalid iCloud Drive item metadata.");
   return parsed.data;
 }
@@ -160,6 +170,7 @@ export class DriveClient {
   private readonly sharedStore: DriveSharedStore;
   private readonly sharedContexts = new Map<string, SharedContext>();
   private readonly sharedIds = new Map<string, string>();
+  private readonly docwsIds = new Map<string, string>();
   private readonly uploadAllocations = new Map<string, { url: string; name: string; size: number; contentType: string }>();
 
   constructor(http: AppleHTTP, connection: DriveConnection, sharedStore?: DriveSharedStore) {
@@ -172,15 +183,42 @@ export class DriveClient {
     this.transport = new DriveHTTP(http);
     this.params = new URLSearchParams({ clientBuildNumber: connection.clientBuildNumber, clientMasteringNumber: connection.clientMasteringNumber, clientId: connection.clientId, dsid: connection.dsid });
     this.sharedStore = sharedStore ?? {
-      save: async context => { const id = crypto.randomUUID(); this.sharedContexts.set(id, context); return id; },
+      save: async context => { const id = this.sharedIds.get(this.shareKey(context)) ?? crypto.randomUUID(); this.sharedContexts.set(id, context); return id; },
       load: async id => { const context = this.sharedContexts.get(id); if (!context) throw new AppError("CONFLICT", "The shared Drive context is unavailable. Browse its parent again.", 409); return context; },
     };
   }
 
   private async shared(id?: string): Promise<SharedContext | undefined> {
     if (!id) return undefined;
-    if (!this.sharedContexts.has(id)) this.sharedContexts.set(id, DriveSharedContext.parse(await this.sharedStore.load(id)));
+    if (!this.sharedContexts.has(id)) {
+      const context = DriveSharedContext.parse(await this.sharedStore.load(id));
+      this.sharedContexts.set(id, context); this.sharedIds.set(this.shareKey(context), id);
+      for (const [itemId, reference] of Object.entries(context.references ?? {})) this.docwsIds.set(`${id}|${reference.itemId}`, itemId);
+    }
     return this.sharedContexts.get(id)!;
+  }
+  private shareKey(context: SharedContext): string {
+    return canonicalJSON({ shareID: context.shareID, ...(context.ownerRecordName ? { ownerRecordName: context.ownerRecordName } : {}) });
+  }
+  private async remember(raw: Record<string, unknown>, shareContext?: string): Promise<void> {
+    if (!shareContext || raw.item_id === undefined) return;
+    const itemId = DriveDocwsItemID.safeParse(raw.item_id);
+    if (!itemId.success) protocol("Apple returned an unsupported shared document identity.");
+    const selected = item(raw, null, shareContext);
+    const context = (await this.shared(shareContext))!;
+    context.references ??= {};
+    context.references[selected.id] = { itemId: itemId.data, documentId: selected.documentId, parentId: selected.parentId };
+    this.docwsIds.set(`${shareContext}|${itemId.data}`, selected.id);
+  }
+  private async persistShared(): Promise<void> {
+    for (const context of this.sharedContexts.values()) {
+      if (context.references) {
+        // Validate once per page, rather than revalidating all remembered IDs
+        // for every child in a large shared folder.
+        if (!DriveSharedContext.safeParse(context).success) throw new AppError("RATE_LIMITED", "The shared Drive identity budget was exceeded. Start a fresh browse after older contexts expire.", 429);
+        await this.sharedStore.save(context);
+      }
+    }
   }
   private async contextFor(raw: Record<string, unknown>, inheritedId?: string): Promise<string | undefined> {
     const inherited = await this.shared(inheritedId);
@@ -191,14 +229,20 @@ export class DriveClient {
     if (shareID === undefined) return undefined;
     const owner = isRecord(raw.owner) ? raw.owner.ownerRecordName : undefined;
     const descriptorOwner = isRecord(shareID) ? shareID.ownerRecordName ?? (isRecord(shareID.zoneID) ? shareID.zoneID.ownerRecordName : undefined) : undefined;
-    const ownerRecordName = owner ?? (descriptor === undefined ? inherited?.ownerRecordName : descriptorOwner);
+    const sameShare = inherited && canonicalJSON(inherited.shareID) === canonicalJSON(shareID);
+    const ownerRecordName = owner ?? descriptorOwner ?? (descriptor === undefined || sameShare ? inherited?.ownerRecordName : undefined);
     const parsedContext = DriveSharedContext.safeParse({ shareID, ...(ownerRecordName === undefined ? {} : { ownerRecordName }) });
     if (!parsedContext.success) return protocol("Apple returned an unsupported iCloud Drive sharing owner.");
     const context = parsedContext.data;
-    const key = canonicalJSON(context);
+    const key = this.shareKey(context);
+    if (inheritedId && inherited && this.shareKey(inherited) === key) {
+      this.sharedIds.set(key, inheritedId);
+      return inheritedId;
+    }
     if (!this.sharedIds.has(key)) {
       const id = await this.sharedStore.save(context);
-      this.sharedIds.set(key, id); this.sharedContexts.set(id, context);
+      this.sharedIds.set(key, id);
+      await this.shared(id);
     }
     return this.sharedIds.get(key)!;
   }
@@ -216,18 +260,25 @@ export class DriveClient {
     const url = this.endpoint(service, path, params);
     const result = await this.transport.metadata(url, { method, ...(body === undefined ? {} : { body }), signal: this.http.signal });
     if (result.status === 401 || result.status === 403 || result.status === 421 || result.status === 450) throw new AppError("REAUTH_REQUIRED", "Apple did not accept iCloud Drive access.", 409);
-    if (result.status < 200 || result.status >= 300) throw new AppError("UPSTREAM_UNAVAILABLE", "Apple rejected the iCloud Drive request.", 502, false);
+    if (result.status === 423) throw new AppError("DEVICE_APPROVAL_PENDING", "Apple requires renewed Drive web-access approval. Approve Drive access on the dashboard.", 409);
+    if (result.status < 200 || result.status >= 300) throw new DriveRequestError(result.status);
     return parseJSON(result.bytes);
   }
 
   private async details(id: string, shareContext?: string): Promise<Record<string, unknown>> {
     validateItemId(id);
     const shared = await this.shared(shareContext);
-    if (id.includes("_IN_SHARED_FOLDER::") && !shared) throw new AppError("VALIDATION_ERROR", "Pass the shareContext returned with this shared Drive item.", 400);
+    if ((id.includes("_IN_SHARED_FOLDER::") || id.startsWith("SHARED_FOLDER::")) && !shared) throw new AppError("VALIDATION_ERROR", "Pass the shareContext returned with this shared Drive item.", 400);
+    if (shared?.references?.[id] && id.includes("_IN_SHARED_FOLDER::")) return this.docwsDetails(id, shareContext!);
     // Files use Apple's exact-item lookup; the folder endpoint rejects file IDs.
     const fileLookup = id.startsWith("FILE::") || id.startsWith("FILE_IN_SHARED_FOLDER::");
     const entry = { drivewsid: id, partialData: false, ...(fileLookup ? { includeHierarchy: false } : {}), ...(shared ? { shareID: shared.shareID } : {}) };
-    const result = await this.request("drive", fileLookup ? "/retrieveItemDetails" : "/retrieveItemDetailsInFolders", "POST", fileLookup ? { items: [entry] } : [entry]);
+    let result: unknown;
+    try { result = await this.request("drive", fileLookup ? "/retrieveItemDetails" : "/retrieveItemDetailsInFolders", "POST", fileLookup ? { items: [entry] } : [entry]); }
+    catch (error) {
+      if (shared?.references?.[id] && error instanceof DriveRequestError && [400, 404].includes(error.upstreamStatus)) return this.docwsDetails(id, shareContext!);
+      throw error;
+    }
     const entries = fileLookup && isRecord(result) ? result.items : result;
     if (fileLookup && isRecord(result)) checkStatus(result);
     if (!Array.isArray(entries) || entries.length !== 1 || !isRecord(entries[0])) return protocol("Apple returned an unsupported iCloud Drive lookup response.");
@@ -236,9 +287,41 @@ export class DriveClient {
     return entries[0];
   }
 
+  private async docwsItem(raw: unknown, shareContext: string, parentId: string | null, expectedId?: string): Promise<Record<string, unknown>> {
+    if (!isRecord(raw) || !isRecord(raw.item_info) || !DriveDocwsItemID.safeParse(raw.item_id).success) return protocol("Apple returned invalid shared document metadata.");
+    checkStatus(raw);
+    if (raw.zone !== undefined && raw.zone !== ZONE || raw.item_info.zone !== undefined && raw.item_info.zone !== ZONE) return protocol("Apple returned shared document metadata outside CloudDocs.");
+    const context = (await this.shared(shareContext))!;
+    const knownId = expectedId ?? this.docwsIds.get(`${shareContext}|${raw.item_id}`);
+    const reference = knownId ? context.references?.[knownId] : undefined;
+    if (knownId && (!reference || raw.item_id !== reference.itemId)) return protocol("Apple returned a different shared document identity.");
+    const info = raw.item_info;
+    const type = typeof info.type === "string" ? info.type.toUpperCase() : "";
+    if (!["FILE", "FOLDER", "PACKAGE"].includes(type)) return protocol("Apple returned an unsupported shared document type.");
+    if (knownId && (knownId.startsWith("FILE") ? type === "FOLDER" : type !== "FOLDER")) return protocol("Apple changed the shared document type.");
+    const key = reference?.documentId ?? `docws-${(await fingerprint(raw.item_id)).slice(0, 32)}`;
+    const id = knownId ?? `${type === "FOLDER" ? "FOLDER" : "FILE"}_IN_SHARED_FOLDER::${ZONE}::${key}`;
+    const normalized = { drivewsid: id, docwsid: reference?.documentId ?? key, zone: ZONE, item_id: raw.item_id, name: info.name,
+      type, etag: info.version, size: info.size, parentId: expectedId ? reference!.parentId : parentId,
+      dateModified: typeof info.modified_at === "string" && /^\d+$/.test(info.modified_at) ? Number(info.modified_at) : info.modified_at,
+      ...(info.directChildrenCount === undefined ? {} : { directChildrenCount: info.directChildrenCount }),
+      ...(isRecord(info.urls) ? { urls: info.urls } : {}), docws: true };
+    await this.remember(normalized, shareContext);
+    return normalized;
+  }
+  private async docwsDetails(id: string, shareContext: string): Promise<Record<string, unknown>> {
+    const reference = (await this.shared(shareContext))?.references?.[id];
+    if (!reference) throw new AppError("CONFLICT", "Browse the shared item's parent again to restore its document identity.", 409);
+    const raw = await this.request("documents", `/v1/item/${reference.itemId}`, "GET");
+    return this.docwsItem(raw, shareContext, reference.parentId, id);
+  }
+
   async getItem(id: string, shareContext?: string): Promise<DriveItem> {
     const raw = await this.details(id, shareContext);
-    return item(raw, null, await this.contextFor(raw, shareContext));
+    const context = await this.contextFor(raw, shareContext);
+    await this.remember(raw, context);
+    await this.persistShared();
+    return item(raw, null, context);
   }
 
   async listItems(folderId: string, shareContext?: string): Promise<DriveListing> {
@@ -246,6 +329,17 @@ export class DriveClient {
     const raw = await this.details(folderId, shareContext);
     const folder = item(raw, null, await this.contextFor(raw, shareContext));
     if (folder.type !== "folder") throw new AppError("VALIDATION_ERROR", "The selected iCloud Drive item is not a folder.");
+    await this.remember(raw, folder.shareContext);
+    if (raw.docws === true && folder.shareContext) {
+      const reference = (await this.shared(folder.shareContext))!.references![folder.id]!;
+      const params = new URLSearchParams(this.params); params.set("limit", String(MAX_ITEMS + 1));
+      const listing = await this.request("documents", `/v1/enumerate/${reference.itemId}`, "GET", undefined, params);
+      if (!isRecord(listing) || !Array.isArray(listing.drive_item)) return protocol("Apple returned an invalid shared folder enumeration.");
+      // Enumeration alone does not establish completeness or pagination support.
+      const children: unknown[] = [];
+      for (const child of listing.drive_item.slice(0, MAX_ITEMS)) children.push(await this.docwsItem(child, folder.shareContext, folder.id));
+      raw.items = [...children, ...listing.drive_item.slice(MAX_ITEMS)];
+    }
     if (!Array.isArray(raw.items)) return protocol("Apple did not return the folder contents in the supported response shape.");
     // `numberOfItems` includes descendants (the pinned root fixture has 3 direct
     // children and 5 items total). Only directChildrenCount can prove this page.
@@ -262,11 +356,14 @@ export class DriveClient {
       // regular folders. Return visible owned children and disclose the omission.
       // Count each excluded entry once, prioritising shared over app/zone.
       const descriptor = child.shareID ?? child.shareId;
-      if (descriptor !== undefined && !DriveShareID.safeParse(descriptor).success || descriptor === undefined && !folder.shareContext && (child.share !== undefined || String(child.drivewsid).includes("_IN_SHARED_FOLDER::"))) { excludedShared++; continue; }
+      if (descriptor !== undefined && !DriveShareID.safeParse(descriptor).success || descriptor === undefined && !folder.shareContext && (child.share !== undefined || String(child.drivewsid).includes("_IN_SHARED_FOLDER::") || String(child.drivewsid).startsWith("SHARED_FOLDER::"))) { excludedShared++; continue; }
       const kind = typeof child.type === "string" ? child.type.toUpperCase() : "";
       if (kind === "APP_LIBRARY" || kind === "APP_CONTAINER") { excludedAppLibrary++; continue; }
       if (child.zone !== ZONE) { excludedOtherZone++; continue; }
-      items.push(item(child, folder.id, await this.contextFor(child, folder.shareContext)));
+      const context = await this.contextFor(child, folder.shareContext);
+      const selected = item(child, folder.id, context);
+      items.push(selected);
+      await this.remember({ ...child, parentId: selected.parentId }, context);
     }
     const reasons: z.infer<typeof DriveListingReason>[] = [];
     if (expectedCount === null) reasons.push("missing_direct_children_count");
@@ -275,6 +372,7 @@ export class DriveClient {
     if (excludedShared) reasons.push("excluded_shared_entries");
     if (excludedAppLibrary) reasons.push("excluded_app_library_entries");
     if (excludedOtherZone) reasons.push("excluded_other_zone_entries");
+    await this.persistShared();
     return { folder, items, complete: reasons.length === 0, reasons, counts: {
       expected: expectedCount, received: raw.items.length, processed: bounded.length, returned: items.length,
       excluded: excludedShared + excludedAppLibrary + excludedOtherZone, excludedShared, excludedAppLibrary, excludedOtherZone,
@@ -282,7 +380,7 @@ export class DriveClient {
     } };
   }
 
-  async prepareDownload(selected: DriveItem): Promise<{ url: string }> {
+  async prepareDownload(selected: DriveItem): Promise<{ url: string; package?: boolean }> {
     const itemValue = DriveItemSchema.parse(selected);
     validateItemId(itemValue.id);
     if (itemValue.type !== "file" || itemValue.size === null) throw new AppError("UNSUPPORTED_FEATURE", "Only ordinary iCloud Drive files can be downloaded.");
@@ -290,6 +388,14 @@ export class DriveClient {
     const params = new URLSearchParams(this.params);
     params.set("document_id", itemValue.documentId);
     const shared = await this.shared(itemValue.shareContext);
+    if (shared?.references?.[itemValue.id] && itemValue.id.includes("_IN_SHARED_FOLDER::")) {
+      const raw = await this.docwsDetails(itemValue.id, itemValue.shareContext!);
+      const current = item(raw, null, itemValue.shareContext);
+      if (current.etag !== itemValue.etag || current.size !== itemValue.size || current.name !== itemValue.name) throw new AppError("CONFLICT", "The shared Drive file changed. Refresh it before downloading.", 409);
+      const url = isRecord(raw.urls) ? raw.urls.url_download : undefined;
+      driveContentURL(url, "download");
+      return { url: url as string, ...(current.package ? { package: true } : {}) };
+    }
     if (itemValue.id.includes("_IN_SHARED_FOLDER::") && !shared?.ownerRecordName) throw new AppError("UNSUPPORTED_FEATURE", "Apple did not identify the shared file's owner for a scoped download.", 409);
     const ownerPath = shared?.ownerRecordName ? `/${shared.ownerRecordName}` : "";
     const result = await this.request("documents", `/ws/${ZONE}/download/by_id${ownerPath}`, "GET", undefined, params);
@@ -301,13 +407,16 @@ export class DriveClient {
       driveContentURL(token.url, "download");
       return { url: token.url };
     }
-    if (result.package_token !== undefined) throw new AppError("UNSUPPORTED_FEATURE", "iCloud Drive package downloads are not supported.");
+    if (isRecord(result.package_token) && typeof result.package_token.url === "string") {
+      driveContentURL(result.package_token.url, "download");
+      return { url: result.package_token.url, package: true };
+    }
     return protocol("Apple returned no supported iCloud Drive data download address.");
   }
 
   async download(selected: DriveItem, signal?: AbortSignal): Promise<Response> {
     const checked = DriveItemSchema.parse(selected);
-    if (checked.type === "file" && checked.size === 0) return new Response(null, { status: 200 });
+    if (checked.type === "file" && checked.size === 0 && !checked.package) return new Response(null, { status: 200 });
     const prepared = await this.prepareDownload(selected);
     return this.transport.download(prepared.url, signal ?? this.http.signal);
   }

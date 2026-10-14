@@ -4,6 +4,7 @@ import { configuredEnvelopes } from "./apple-sessions.ts";
 import { fingerprint } from "../lib/canonical.ts";
 import type { RuntimeEnv } from "../platform/sites.ts";
 import { DRIVE_UPLOAD_LEASE_MS } from "../drive/limits.ts";
+import { DriveSharedContext } from "../drive/shared.ts";
 
 export interface DriveScope { account: string; generation: number; permissionRevision: number; expiresAt: number; }
 export type DrivePhase = "prepared" | "allocating" | "allocated" | "uploading" | "uploaded" | "committing" | "confirmed" | "unknown" | "failed";
@@ -124,12 +125,20 @@ export class DriveOperationRepository {
   }
   async saveSharedContext(data: unknown, scope: DriveScope): Promise<string> {
     await this.requireSchema();
+    const context = DriveSharedContext.parse(data);
+    const identity = { shareID: context.shareID, ...(context.ownerRecordName ? { ownerRecordName: context.ownerRecordName } : {}) };
     // Repeated listings reuse one encrypted context per share in this scope.
-    const hash = await fingerprint(["drive-share-v1", this.owner, scope.account, scope.generation, scope.permissionRevision, data]);
+    const hash = await fingerprint(["drive-share-v1", this.owner, scope.account, scope.generation, scope.permissionRevision, identity]);
     const id = `${hash.slice(0, 8)}-${hash.slice(8, 12)}-4${hash.slice(13, 16)}-8${hash.slice(17, 20)}-${hash.slice(20, 32)}`;
     await this.db.prepare("DELETE FROM drive_handles WHERE owner_id = ? AND expires_at <= ?").bind(this.owner, Date.now()).run();
     const expires = Math.min(scope.expiresAt, Date.now() + 10 * 60_000);
-    const envelope = JSON.stringify(await this.envelopes.encrypt(data, this.context(id, scope.account, scope.generation, "share")));
+    const existing = await this.db.prepare("SELECT envelope FROM drive_handles WHERE owner_id = ? AND handle_id = ? AND kind = 'share' AND account_scope = ? AND generation = ? AND permission_revision = ? AND expires_at > ?")
+      .bind(this.owner, id, scope.account, scope.generation, scope.permissionRevision, Date.now()).first<{ envelope: string }>();
+    if (existing) {
+      const previous = DriveSharedContext.parse(await this.envelopes.decrypt(EnvelopeSchema.parse(JSON.parse(existing.envelope)), this.context(id, scope.account, scope.generation, "share")));
+      if (previous.references) context.references = { ...previous.references, ...context.references };
+    }
+    const envelope = JSON.stringify(await this.envelopes.encrypt(DriveSharedContext.parse(context), this.context(id, scope.account, scope.generation, "share")));
     const result = await this.db.prepare(`INSERT INTO drive_handles (owner_id,handle_id,account_scope,generation,permission_revision,kind,expires_at,envelope)
       SELECT ?,?,?,?,?,?,?,? WHERE (SELECT COUNT(*) FROM drive_handles WHERE owner_id = ?) < 128 OR EXISTS (SELECT 1 FROM drive_handles WHERE owner_id = ? AND handle_id = ?)
       ON CONFLICT(owner_id,handle_id) DO UPDATE SET expires_at = excluded.expires_at, envelope = excluded.envelope`)

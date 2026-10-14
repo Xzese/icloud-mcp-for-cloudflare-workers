@@ -141,7 +141,7 @@ root lookup. The final folder's own contents are not listed or certified complet
 ### Shared-folder reads
 
 Supported shared folders such as Snap Heaven are included in ordinary parent listings.
-The connector recognises CloudDocs `FOLDER`/`FILE` identities and their
+The connector recognises CloudDocs `SHARED_FOLDER` roots, `FOLDER`/`FILE` identities and their
 `FOLDER_IN_SHARED_FOLDER`/`FILE_IN_SHARED_FOLDER` variants. It sends Apple's sharing descriptor
 with scoped metadata requests and inherits it when Apple omits it from descendants. Nested
 folder walking and search continuations retain each branch's own share context.
@@ -163,13 +163,23 @@ when provider item IDs coincide.
 
 Content reads use Apple's owner-scoped download endpoint for indirectly shared files when
 Apple supplies an owner. Missing owner metadata fails explicitly instead of attempting an
-unscoped download. Package downloads remain unsupported. Shared access is read-only in this
+unscoped download. Supported package tokens download complete ZIP archives under the same
+64 MiB streamed-byte cap. Packages expose `package: true` when Apple identifies their type;
+inline reads, previews and range downloads are unavailable for archives. Shared access is read-only in this
 connector: uploads, folder creation, renames and moves involving shared items are refused.
 Successful path resolution never bypasses the complete destination listing required for
-owned-item writes. Upstream pagination is still unsupported; an omitted child cannot be
-recovered by a traversal continuation.
+owned-item writes. For shared descendants with an Apple `item_id`, the connector stores an encrypted mapping
+inside the existing share context and uses the read-only `docws /v1/item` and `/v1/enumerate`
+endpoints. Shared roots with a known mapping can also fall back after a 400/404 Drive lookup.
+Descendants returned without a normal Drive ID receive stable connector IDs scoped by the
+share context. Apple item IDs and signed download URLs remain server-side. Mappings reuse one
+handle per share, with at most 2,000 references and a 256 KB mapping budget. A complete parent
+listing still requires a direct-child count: enumeration without one reports
+`missing_direct_children_count`, so path resolution remains unresolved even when children are
+visible. Upstream pagination is still unsupported; an omitted child cannot be recovered by a
+traversal continuation.
 
-Protocol references: [pyicloud's shareID request and owner-scoped download implementation](https://github.com/timlaing/pyicloud/blob/1b340462f3e3c8177b907e612d4713543bb1201b/pyicloud/services/drive.py)
+Protocol references: [rclone’s unmerged shared-folder PR #9487](https://github.com/rclone/rclone/pull/9487), [pyicloud's shareID request and owner-scoped download implementation](https://github.com/timlaing/pyicloud/blob/1b340462f3e3c8177b907e612d4713543bb1201b/pyicloud/services/drive.py)
 and [iFetch's descendant-context regression notes](https://github.com/roshanlam/iFetch/blob/master/docs/shared-folder-validation.md).
 The shared-folder behavior is covered by synthetic client, service and Worker tests. Live
 shared-folder protocol verification remains pending. Existing live evidence below covers
@@ -241,6 +251,36 @@ For large uploads, compute the digest first, retain the operation UUID, prepare 
 and POST the bytes to `uploadPath`. Do not invent another UUID after a timeout. Application
 errors contain sanitized codes/messages and a request ID; inspect operation status for recovery.
 
+## Read recovery and download compatibility
+
+Metadata reads and download opening retry transient network failures and HTTP 408, 429, 500,
+502, 503 and 504 at most twice. Metadata calls share an eight-second deadline including waits;
+read dispatches within a client are paced at least 100 ms apart. Retries honor `Retry-After`
+when the wait fits the opening budget; longer delays are returned without retrying early.
+Writes, upload allocation/finalization and uploads are never automatically replayed by this
+transport. Download retries stop once streaming begins.
+
+An HTTP 423 metadata response marks only Drive approval as pending. Reads and status checks
+never send a device prompt; use the existing explicit approval action. When protected storage
+is enabled, an Apple approval success response is accepted only after a nonempty, unexpired
+`X-APPLE-WEBAUTH-PCS-Documents` cookie applies to the discovered Drive host.
+
+Private download GETs accept one HTTP `Range: bytes=start-end`, open-ended, or suffix range.
+They return 206 with an exact `Content-Range` and validate Apple's range and total against the
+pinned file metadata. Invalid/unsatisfiable ranges return 416; package ranges are refused.
+Each request consumes its download handle, including invalid ranges: request a fresh handle
+for each part or retry. Files still must fit the 64 MiB file cap. Apple servers that ignore the
+range fail explicitly instead of returning different bytes.
+
+Only Apple's nonstandard 330 content redirect is followed, with at most three hops, loop
+rejection and the existing signed Apple content URL validation at every hop. No Apple cookies
+or authorization headers are sent to the content server. Package archive sizes may differ
+from their unpacked metadata sizes, so archive downloads omit the metadata `Content-Length`
+and enforce the actual streamed-byte cap.
+
+The new paths have synthetic protocol and Worker coverage. Live verification of shared
+`docws` reads, package archives, ranges and 330 redirects remains pending.
+
 ## Interrupted operations and boundaries
 
 The encrypted operation ledger records intent, allocation, transfer receipt and finalization
@@ -257,7 +297,7 @@ preflight check is not an atomic no-overwrite guarantee against another Apple cl
 creating the same name concurrently; avoid concurrent destination edits during initial testing.
 
 Excluded: deletion/trash, replacing file contents, public sharing, shared-library mutations,
-app-library and package operations, arbitrary URL imports, recursive uploads and whole-account
+app-library operations and package writes, arbitrary URL imports, recursive uploads and whole-account
 indexing. Unknown protocol shapes fail explicitly. Apple may change these undocumented endpoints.
 
 Operation secrets expire at the earlier of the Apple session's local retention deadline or

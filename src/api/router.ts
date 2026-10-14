@@ -47,7 +47,7 @@ export async function applicationRoute(request: Request, env: RuntimeEnv, creden
     if (request.method === "GET") {
       if (path === "/api/settings") return json(await new ServiceSettingsRepository(env, owner).load());
       const download = /^\/api\/drive\/downloads\/([a-f0-9-]{36})$/i.exec(path);
-      if (download) return await new DriveService(env, owner).downloadContent(z.string().uuid().parse(download[1]), request.signal);
+      if (download) return await new DriveService(env, owner).downloadContent(z.string().uuid().parse(download[1]), request.signal, request.headers.get("range"));
       if (path === "/api/auth/config") return json(appleGates(env));
       if (path === "/api/connection") return json(await new AppleConnectionService(env, owner).status());
       const job = /^\/api\/reminder-jobs\/([a-f0-9-]{36})$/i.exec(path);

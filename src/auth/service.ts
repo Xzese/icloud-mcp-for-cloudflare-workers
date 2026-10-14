@@ -346,7 +346,7 @@ export class AppleConnectionService {
       const result = await advancePcs(http, saved.session.connection.dsid, checkpoint, Date.now(), "drive", async () => {
         if (!(await new ServiceSettingsRepository(this.env, this.owner).load()).settings.drive.enabled) throw new AppError("FORBIDDEN", "Drive was disabled before Apple approval.", 403);
         await repository.assertAccountLease(fence);
-      });
+      }, requireDriveConnection(saved.session).driveURL);
       await repository.commitResume(fence, appleSuccess({ ...saved.session, auth: http.snapshot(), services: {
         ...services, drive: { connection: services.drive.connection, state: result.state, pcs: result.checkpoint,
           ...(result.state === "DEVICE_APPROVAL_PENDING" ? { action: result.action } : {}) } } }), saved.state, saved.action ?? undefined);

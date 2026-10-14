@@ -24,7 +24,7 @@ const uploadedDocId = "synthetic-upload";
 const uploadedName = "synthetic-large.bin";
 const sharedDescriptor = { recordName: "synthetic-shared-record" };
 const sharedFolder = { drivewsid: "FOLDER::com.apple.CloudDocs::shared-root", docwsid: "shared-root", zone: "com.apple.CloudDocs", name: "Shared Fixture", type: "FOLDER", etag: "shared-etag", parentId: DRIVE_ROOT, shareID: sharedDescriptor, owner: { ownerRecordName: "synthetic-owner" } };
-const sharedChild = { drivewsid: "FOLDER_IN_SHARED_FOLDER::com.apple.CloudDocs::shared-child", docwsid: "shared-child", zone: "com.apple.CloudDocs", name: "01", type: "FOLDER", etag: "child-etag", parentId: sharedFolder.drivewsid };
+const sharedChild = { drivewsid: "FOLDER_IN_SHARED_FOLDER::com.apple.CloudDocs::shared-child", docwsid: "shared-child", item_id: "private-docws-child", zone: "com.apple.CloudDocs", name: "01", type: "FOLDER", etag: "child-etag", parentId: sharedFolder.drivewsid };
 const fileItem = (size, etag = "synthetic-upload-etag") => ({
   drivewsid: uploadedId, docwsid: uploadedDocId, zone: "com.apple.CloudDocs", name: uploadedName, type: "FILE", etag,
   parentId: DRIVE_ROOT, size, dateModified: 1_800_000_000_000,
@@ -58,6 +58,7 @@ export async function verifyDrive(options) {
   let transferError = null;
   let finalizationPayload = null;
   let uploaded = false;
+  let packageDownload = false, redirectDownload = false;
   let observedUpload = null;
   const outboundService = async request => {
     const url = new URL(request.url);
@@ -76,6 +77,12 @@ export async function verifyDrive(options) {
       assert.equal(drivewsid, uploadedId, "post-commit and metadata reads must look up the exact uploaded identity");
       assert.equal(uploaded, true, "the exact file lookup is available only after the synthetic commit");
       return json({ items: [fileItem(payloadBytes.length)] });
+    }
+    if (url.hostname === "p01-docws.icloud.com" && url.pathname === "/v1/item/private-docws-child") {
+      return json({ item_id: "private-docws-child", item_info: { name: "01", type: "FOLDER", version: "child-etag", size: "0" } });
+    }
+    if (url.hostname === "p01-docws.icloud.com" && url.pathname === "/v1/enumerate/private-docws-child") {
+      return json({ drive_item: [] });
     }
     if (url.hostname === "p01-docws.icloud.com" && url.pathname === "/ws/com.apple.CloudDocs/upload/web") {
       allocations++;
@@ -112,12 +119,21 @@ export async function verifyDrive(options) {
     }
     if (url.hostname === "p01-docws.icloud.com" && url.pathname === "/ws/com.apple.CloudDocs/download/by_id") {
       assert.equal(url.searchParams.get("document_id"), uploadedDocId, "download preparation pins the exact document ID");
-      return json({ document_id: uploadedDocId, data_token: { url: syntheticUrl.href } });
+      return json({ document_id: uploadedDocId, [packageDownload ? "package_token" : "data_token"]: { url: syntheticUrl.href } });
     }
     if (url.hostname === "cvws.icloud-content.com") {
       downloads++;
       assert.equal(request.headers.has("cookie"), false, "signed content download carries no Apple cookies");
-      return new Response(payloadBytes, { headers: { "content-type": "application/octet-stream", "set-cookie": "synthetic=private", location: "https://example.invalid" } });
+      if (redirectDownload && url.pathname.endsWith("/file")) {
+        const destination = new URL(syntheticUrl); destination.pathname += "-redirected";
+        return new Response(null, { status: 330, headers: { location: destination.href } });
+      }
+      const range = request.headers.get("range");
+      if (range) {
+        assert.equal(range, "bytes=2-5");
+        return new Response(payloadBytes.subarray(2, 6), { status: 206, headers: { "Content-Range": `bytes 2-5/${payloadBytes.length}`, "Content-Length": "4" } });
+      }
+      return new Response(packageDownload ? new TextEncoder().encode("synthetic zip") : payloadBytes, { headers: { "content-type": packageDownload ? "application/zip" : "application/octet-stream", "set-cookie": "synthetic=private", location: "https://example.invalid" } });
     }
     throw new Error(`Unexpected synthetic Drive request: ${request.method} ${url.hostname}${url.pathname}`);
   };
@@ -164,8 +180,9 @@ export async function verifyDrive(options) {
     await db.prepare("INSERT INTO apple_session_state (owner_id, account_id, generation, version, state, envelope, updated_at) VALUES (?, 'apple-reminders', ?, 1, 'READY', ?, ?)")
       .bind(owner, generation, JSON.stringify(envelope), Date.now()).run();
 
-    const request = async (path, { method = "GET", body, binary = false, user = owner } = {}) => {
+    const request = async (path, { method = "GET", body, binary = false, user = owner, range } = {}) => {
       const headers = { "cf-access-jwt-assertion": assertion, "oai-authenticated-user-id": user, "oai-authenticated-user-email": "synthetic@example.invalid" };
+      if (range) headers.range = range;
       if (method === "POST") Object.assign(headers, binary ? { origin, "content-type": "application/octet-stream" } : { origin, "content-type": "application/json", accept: "application/json, text/event-stream" });
       return worker.dispatchFetch(origin + path, { method, headers, ...(body === undefined ? {} : { body }) });
     };
@@ -196,7 +213,12 @@ export async function verifyDrive(options) {
     assert.ok(!JSON.stringify(resolvedShare.result.structuredContent).includes("synthetic-shared-record"));
     const sharedListing = await request("/api/drive/list", { method: "POST", body: JSON.stringify({ folderId: sharedItem.id, shareContext: sharedItem.shareContext }) });
     assert.equal(sharedListing.status, 200);
-    assert.equal((await sharedListing.json()).complete, true);
+    const sharedPage = await sharedListing.json();
+    assert.equal(sharedPage.complete, false);
+    assert.deepEqual(sharedPage.reasons, ["missing_direct_children_count"]);
+    assert.equal(sharedPage.folder.id, sharedChild.drivewsid);
+    assert.equal(sharedPage.folder.shareContext, sharedItem.shareContext);
+    assert.equal(JSON.stringify(sharedPage).includes("private-docws"), false);
 
     const limitIntent = { operationId: randomUUID(), parentId: DRIVE_ROOT, name: "limit-boundary.bin", size: 64 * 1024 * 1024, sha256: "a".repeat(64), contentType: "application/octet-stream" };
     const acceptedLimit = await request("/api/drive/prepare-upload", { method: "POST", body: JSON.stringify(limitIntent) });
@@ -258,6 +280,23 @@ export async function verifyDrive(options) {
     assert.equal(previewCall.result.structuredContent.content, Buffer.from(payloadBytes.subarray(0, 8192)).toString("utf8"));
     assert.equal(downloads, 2);
 
+    const rangeHandle = await mcp("tools/call", { name: "download_icloud_drive_file", arguments: { itemId: typedItem.id } });
+    redirectDownload = true;
+    const rangeResponse = await request(rangeHandle.result.structuredContent.url, { range: "bytes=2-5" });
+    assert.equal(rangeResponse.status, 206);
+    assert.equal(rangeResponse.headers.get("content-range"), `bytes 2-5/${payloadBytes.length}`);
+    assert.ok(Buffer.from(await rangeResponse.arrayBuffer()).equals(Buffer.from(payloadBytes.subarray(2, 6))));
+    assert.equal((await request(rangeHandle.result.structuredContent.url, { range: "bytes=2-5" })).status, 409);
+    redirectDownload = false; packageDownload = true;
+    const packageHandle = await mcp("tools/call", { name: "download_icloud_drive_file", arguments: { itemId: typedItem.id } });
+    const archive = await request(packageHandle.result.structuredContent.url);
+    assert.equal(archive.status, 200);
+    assert.equal(archive.headers.get("content-length"), null);
+    assert.ok(archive.headers.get("content-disposition").includes(".zip"));
+    assert.equal(await archive.text(), "synthetic zip");
+    packageDownload = false;
+    const downloadsBeforeRevocation = downloads;
+
     const settingsRow = await db.prepare("SELECT revision, settings_json FROM owner_service_settings WHERE owner_id = ?").bind(owner).first();
     const revoked = JSON.parse(settingsRow.settings_json);
     revoked.drive.contents = false;
@@ -268,9 +307,9 @@ export async function verifyDrive(options) {
     const revokedReadBody = await revokedRead.json();
     assert.equal(revokedRead.status, 403, JSON.stringify(revokedReadBody));
     assert.equal(revokedReadBody.error.code, "FORBIDDEN");
-    assert.equal(downloads, 2, "revoked content access must not issue another Apple content request");
+    assert.equal(downloads, downloadsBeforeRevocation, "revoked content access must not issue another Apple content request");
     return {
-      checks: ["signed-owner-origin", "300-KiB-streaming-upload", "exact-document-commit-and-idempotent-replay", "typed-MCP-metadata", "shared-path-and-persisted-private-context", "private-single-use-download", "64-KiB-inline-guidance-and-8-KiB-preview", "contents-permission-revocation"],
+      checks: ["signed-owner-origin", "300-KiB-streaming-upload", "exact-document-commit-and-idempotent-replay", "typed-MCP-metadata", "shared-path-and-persisted-private-context", "private-single-use-download", "docws-shared-fallback", "validated-330-and-byte-ranges", "bounded-package-archive", "64-KiB-inline-guidance-and-8-KiB-preview", "contents-permission-revocation"],
       uploadedBytes: payloadBytes.length, operationId, metadataTools: 2,
       outboundTransferBytes: observedUpload?.byteLength ?? 0, appleUploadRequests: allocations + transfers + finalizations, downloads,
     };

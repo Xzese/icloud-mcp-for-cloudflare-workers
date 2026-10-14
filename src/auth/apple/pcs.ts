@@ -9,8 +9,8 @@ export const freshPcsCheckpoint = (now = Date.now()): PcsCheckpoint => ({ consen
 // Each call makes at most two HTTP requests. Waiting belongs to a later owner
 // request, not a sleeping Worker or background retry loop.
 export function advancePcs(http: AppleAuthHTTP, dsid: string, input: PcsCheckpoint, now?: number, service?: "reminders", authorize?: () => Promise<void>): Promise<RemindersPcsResult>;
-export function advancePcs(http: AppleAuthHTTP, dsid: string, input: PcsCheckpoint, now: number, service: "drive", authorize?: () => Promise<void>): Promise<PcsResult>;
-export async function advancePcs(http: AppleAuthHTTP, dsid: string, input: PcsCheckpoint, now = Date.now(), service: "reminders" | "drive" = "reminders", authorize?: () => Promise<void>): Promise<PcsResult> {
+export function advancePcs(http: AppleAuthHTTP, dsid: string, input: PcsCheckpoint, now: number, service: "drive", authorize?: () => Promise<void>, driveURL?: string): Promise<PcsResult>;
+export async function advancePcs(http: AppleAuthHTTP, dsid: string, input: PcsCheckpoint, now = Date.now(), service: "reminders" | "drive" = "reminders", authorize?: () => Promise<void>, driveURL?: string): Promise<PcsResult> {
   const checkpoint = { ...input };
   if (now >= checkpoint.expiresAt) throw new AppError("AUTH_EXPIRED", "The device-consent attempt expired. Restart setup.", 409);
   if (now < checkpoint.nextAttemptAt) throw new AppError("RATE_LIMITED", "Wait until the displayed retry time before checking device consent again.", 429, true);
@@ -34,7 +34,19 @@ export async function advancePcs(http: AppleAuthHTTP, dsid: string, input: PcsCh
   await authorize?.();
   const pcs = await http.setup("/requestPCS", { appName: service === "drive" ? "iclouddrive" : "reminders", derivedFromUserAction: checkpoint.pcsAttempts === 0 }, dsid); http.expect(pcs, [200]);
   checkpoint.pcsAttempts++;
-  if (pcs.body?.status === "success") { checkpoint.nextAttemptAt = 0; return { state: "READY", checkpoint }; }
+  if (pcs.body?.status === "success") {
+    // A success envelope alone does not prove usable Drive keys. Check a live,
+    // nonempty cookie scoped to the discovered Drive endpoint, not just its name.
+    const cookies = driveURL ? http.http.jar.header(new URL(driveURL), now).split(";").map(value => value.trim()) : [];
+    const hasDriveKeys = driveURL ? cookies.some(value => value.startsWith("X-APPLE-WEBAUTH-PCS-Documents=") && value !== "X-APPLE-WEBAUTH-PCS-Documents=") :
+      http.snapshot().cookies.some(cookie => cookie.name === "X-APPLE-WEBAUTH-PCS-Documents" && cookie.value &&
+        (cookie.expiresAt === null || cookie.expiresAt > now) && !cookie.hostOnly && cookie.domain === "icloud.com" && cookie.path === "/");
+    if (service === "drive" && !hasDriveKeys) {
+      checkpoint.nextAttemptAt = now + 5000;
+      return { state: "DEVICE_APPROVAL_PENDING", action: "wait-for-drive-keys", checkpoint };
+    }
+    checkpoint.nextAttemptAt = 0; return { state: "READY", checkpoint };
+  }
   if (!["Requested the device to upload cookies.", "Cookies not available yet on server."].includes(String(pcs.body?.message))) throw new AppError("PROTOCOL_CHANGED", "Apple returned an unsupported service key-consent response.");
   checkpoint.nextAttemptAt = now + 5000;
   return { state: "DEVICE_APPROVAL_PENDING", action: service === "drive" ? "wait-for-drive-keys" : "wait-for-reminders-keys", checkpoint };
