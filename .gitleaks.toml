@@ -1,5 +1,5 @@
-# Keep every default secret rule. Only these eight invented create/retry UUIDs
-# in this exact synthetic acceptance fixture's Git history are false positives.
+# Keep every default secret rule. These invented create/retry UUIDs and one
+# historical synthetic check label are exact rule/path/value false positives.
 # New test keys are generated at runtime instead of adding static key literals.
 [extend]
 useDefault = true
@@ -11,3 +11,11 @@ condition = "AND"
 paths = ['''^tests/integration/reminder-writes\.mjs$''']
 regexTarget = "secret"
 regexes = ['''^(46cf8eef-6cab-4aa2-a725-219769337d8b|d92b886c-0f7a-4b48-b497-4fc88a97a2e4|1cdf7593-e38e-4b34-a01d-7962fc67d237|08b44b21-e311-4ef1-bb51-17fa343d0b6f|6734def8-8505-47ab-8145-0f41020d77e4|d0faad2e-5328-4c98-81b7-226511a771aa|ce5075f1-bfa0-43bd-850a-a0d6ce2a8cac|b2b55d9e-e5da-40ad-8d73-29cff5f851f5)$''']
+
+[[allowlists]]
+description = "Historical synthetic checks array label after disabled-Apple-access; not a credential"
+targetRules = ["generic-api-key"]
+condition = "AND"
+paths = ['''^scripts/test-worker\.mjs$''']
+regexTarget = "secret"
+regexes = ['''^encrypted-D1-CAS$''']

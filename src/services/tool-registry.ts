@@ -16,6 +16,7 @@ export const TOOL_PERMISSIONS: Readonly<Record<string, ServicePermission>> = Obj
     "create_reminder_job", "append_reminder_job_items", "start_reminder_job", "cancel_reminder_job", "resume_reminder_job", "continue_reminder_job",
   ].map(name => [name, "reminders.write" as const])),
   list_icloud_drive_items: "drive.browse", get_icloud_drive_item: "drive.browse", search_icloud_drive: "drive.browse",
+  resolve_icloud_drive_folder_path: "drive.browse",
   read_icloud_drive_file: "drive.contents", download_icloud_drive_file: "drive.contents",
   upload_icloud_drive_file: "drive.upload", create_icloud_drive_folder: "drive.organize",
   rename_icloud_drive_item: "drive.organize", move_icloud_drive_item: "drive.organize", get_icloud_drive_operation: "drive.browse",

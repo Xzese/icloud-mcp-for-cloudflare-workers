@@ -59,6 +59,8 @@ test("Drive reads normalize exact owned identities and report count mismatches a
   assert.equal(listed.folder.id, folder.drivewsid);
   assert.equal(listed.items[0]?.name, "Scanned document 1.pdf");
   assert.equal(listed.complete, false);
+  assert.deepEqual(listed.reasons, ["upstream_count_mismatch"]);
+  assert.deepEqual(listed.counts, { expected: 2, received: 1, processed: 1, returned: 1, excluded: 0, excludedShared: 0, excludedAppLibrary: 0, excludedOtherZone: 0, unprocessed: 0 });
   assert.equal((await client.getItem(file.drivewsid)).documentId, file.docwsid);
   const root = await client.getItem(DRIVE_ROOT);
   assert.equal(root.name, "root");
@@ -71,13 +73,47 @@ test("Drive reads normalize exact owned identities and report count mismatches a
   const rootListing = await mixedRoot.listItems(DRIVE_ROOT);
   assert.deepEqual(rootListing.items.map((entry) => entry.id), [rootChild.drivewsid]);
   assert.equal(rootListing.complete, false);
+  assert.deepEqual(rootListing.reasons, ["excluded_app_library_entries"]);
+  assert.equal(rootListing.counts.excludedAppLibrary, 1);
 });
 
-test("Drive refuses per-item errors, shared IDs, unsupported hosts, and redirects", async () => {
+test("Drive listing diagnostics distinguish unknown counts, upstream omissions, local limits and excluded entries", async () => {
+  for (const directChildrenCount of [undefined, null, "1", -1, 1.5]) {
+    const client = makeClient(() => json([{ ...folder, directChildrenCount, numberOfItems: 1, items: [file] }]));
+    const page = await client.listItems(folder.drivewsid);
+    assert.equal(page.complete, false);
+    assert.deepEqual(page.reasons, ["missing_direct_children_count"]);
+    assert.equal(page.counts.expected, null);
+  }
+  const children = Array.from({ length: 1001 }, (_, index) => ({ ...file, drivewsid: `FILE::com.apple.CloudDocs::child-${index}`, docwsid: `child-${index}` }));
+  const limited = await makeClient(() => json([{ ...folder, directChildrenCount: 1001, items: children }])).listItems(folder.drivewsid);
+  assert.deepEqual(limited.reasons, ["item_limit"]);
+  assert.equal(limited.items.length, 1000);
+  assert.deepEqual(limited.counts, { expected: 1001, received: 1001, processed: 1000, returned: 1000, excluded: 0, excludedShared: 0, excludedAppLibrary: 0, excludedOtherZone: 0, unprocessed: 1 });
+  const boundary = await makeClient(() => json([{ ...folder, directChildrenCount: 1000, items: children.slice(0, 1000) }])).listItems(folder.drivewsid);
+  assert.equal(boundary.complete, true);
+  assert.deepEqual(boundary.reasons, []);
+  const excluded = [
+    { ...file, shareID: [], zone: "other-zone", type: "APP_LIBRARY" },
+    { ...file, shareId: [] },
+    { ...file, type: "app_library", zone: "other-zone" },
+    { ...file, type: "APP_CONTAINER" },
+    { ...file, zone: "other-zone" },
+  ];
+  const mixed = await makeClient(() => json([{ ...folder, directChildrenCount: 8, items: [...excluded, file] }])).listItems(folder.drivewsid);
+  assert.deepEqual(mixed.reasons, ["upstream_count_mismatch", "excluded_shared_entries", "excluded_app_library_entries", "excluded_other_zone_entries"]);
+  assert.deepEqual(mixed.counts, { expected: 8, received: 6, processed: 6, returned: 1, excluded: 5, excludedShared: 2, excludedAppLibrary: 2, excludedOtherZone: 1, unprocessed: 0 });
+  assert.equal(JSON.stringify(mixed).includes("synthetic-share"), false);
+});
+
+test("Drive refuses per-item errors, unscoped shared IDs, unsupported hosts, and redirects", async () => {
   const failed = makeClient(() => json([{ ...file, status: "ITEM_NOT_FOUND" }]));
   await assert.rejects(failed.getItem(file.drivewsid), AppError);
   const shared = makeClient(() => json([{ ...file, shareID: "synthetic-share" }]));
-  await assert.rejects(shared.getItem(file.drivewsid), AppError);
+  const sharedItem = await shared.getItem(file.drivewsid);
+  assert.ok(sharedItem.shareContext);
+  await assert.rejects(shared.renameItem(sharedItem, "refused.txt"), { code: "UNSUPPORTED_FEATURE" });
+  await assert.rejects(shared.getItem("FILE_IN_SHARED_FOLDER::com.apple.CloudDocs::unscoped"), { code: "VALIDATION_ERROR" });
   const prefixedDocumentId = makeClient(() => json([{ ...file, docwsid: `DOCUMENT::com.apple.CloudDocs::${file.docwsid}` }]));
   await assert.rejects(prefixedDocumentId.getItem(file.drivewsid), AppError);
   const mismatchedIdentity = makeClient(() => json({ items: [{ ...file, drivewsid: "FILE::com.apple.CloudDocs::516C896C-6AA5-4A30-B30E-5502C2333DAF" }] }));
@@ -250,6 +286,10 @@ test("a fresh Drive client restores a validated durable allocation without alloc
 
 test("exported metadata transport URL validator accepts only named Apple service endpoints", () => {
   assert.equal(validateDriveMetadataURL(new URL("https://p01-drivews.icloud.com/retrieveItemDetailsInFolders")).hostname, "p01-drivews.icloud.com");
+  assert.equal(validateDriveMetadataURL(new URL("https://p01-docws.icloud.com/ws/com.apple.CloudDocs/download/by_id/synthetic-owner")).hostname, "p01-docws.icloud.com");
+  for (const path of ["/ws/com.apple.CloudDocs/download/by_id/owner/extra", "/ws/com.apple.CloudDocs/download/by_id/owner%2Fextra", "/ws/other/download/by_id/owner", "/ws/com.apple.CloudDocs/upload/web/owner"]) {
+    assert.throws(() => validateDriveMetadataURL(new URL(path, "https://p01-docws.icloud.com")), AppError);
+  }
   assert.throws(() => validateDriveMetadataURL(new URL("https://attacker.example/retrieveItemDetailsInFolders")), AppError);
   assert.throws(() => validateDriveMetadataURL(new URL("https://p01-drivews.icloud.com/ws/com.apple.CloudDocs/upload/web")), AppError);
 });

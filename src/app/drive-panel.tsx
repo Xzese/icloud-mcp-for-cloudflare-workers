@@ -22,7 +22,7 @@ async function call<T>(path: string, body?: unknown): Promise<T> {
 export default function DrivePanel() {
   const [connection, setConnection] = useState<Connection | null>(null);
   const [listing, setListing] = useState<Listing | null>(null);
-  const [trail, setTrail] = useState([{ id: ROOT, name: "iCloud Drive" }]);
+  const [trail, setTrail] = useState<{ id: string; name: string; shareContext?: string }[]>([{ id: ROOT, name: "iCloud Drive" }]);
   const [busy, setBusy] = useState(false), [error, setError] = useState(""), [notice, setNotice] = useState("");
   const [name, setName] = useState(""), [query, setQuery] = useState("");
   const [matches, setMatches] = useState<DriveItem[] | null>(null);
@@ -59,22 +59,22 @@ export default function DrivePanel() {
   }
   const context = { expectedGeneration: connection?.generation };
   async function browse(nextTrail = trail) {
-    const result = await call<Listing>("/api/drive/list", { ...context, folderId: nextTrail[nextTrail.length - 1]!.id });
+    const result = await call<Listing>("/api/drive/list", { ...context, folderId: nextTrail[nextTrail.length - 1]!.id, shareContext: nextTrail[nextTrail.length - 1]!.shareContext });
     setListing(result); setTrail(nextTrail); setMatches(null); setContinuation(null); setPreview(null);
   }
   async function find(more = false) {
-    const result = await call<{ items: DriveItem[]; complete: boolean; continuation: string | null }>("/api/drive/search", { ...context, folderId: folder.id, query, ...(more && continuation ? { continuation } : {}) });
+    const result = await call<{ items: DriveItem[]; complete: boolean; continuation: string | null }>("/api/drive/search", { ...context, folderId: folder.id, shareContext: folder.shareContext, query, ...(more && continuation ? { continuation } : {}) });
     setMatches(previous => more ? [...(previous ?? []), ...result.items] : result.items); setContinuation(result.continuation); setSearchComplete(result.complete);
   }
   async function download(item: DriveItem) {
-    const result = await call<{ url: string }>("/api/drive/download", { ...context, itemId: item.id });
+    const result = await call<{ url: string }>("/api/drive/download", { ...context, itemId: item.id, shareContext: item.shareContext });
     // Same-origin owner authentication is retained by the browser. The handle
     // never contains an Apple signed URL or turns into a public share.
     const link = document.createElement("a"); link.href = result.url; link.download = item.name; link.click();
   }
   async function previewText(item: DriveItem) {
     setPreview(null);
-    setPreview(await call<TextPreview>("/api/drive/read", { ...context, itemId: item.id, encoding: "utf8", previewBytes: 8192 }));
+    setPreview(await call<TextPreview>("/api/drive/read", { ...context, itemId: item.id, shareContext: item.shareContext, encoding: "utf8", previewBytes: 8192 }));
   }
   function retain(result: Operation) {
     setOperation(result.operationId);
@@ -92,17 +92,18 @@ export default function DrivePanel() {
   }
   const items = matches ?? listing?.items ?? [];
   return <section className="dashboard-card drive-panel" aria-labelledby="drive-title">
-    <div className="card-heading"><div className="card-icon"><Folder size={22} aria-hidden="true" /></div><div><h2 id="drive-title">iCloud Drive</h2><p>Browse and transfer ordinary files in your private Drive. Agent tools can also rename and move items.</p></div></div>
+    <div className="card-heading"><div className="card-icon"><Folder size={22} aria-hidden="true" /></div><div><h2 id="drive-title">iCloud Drive</h2><p>Browse your own and shared Drive folders. Transfer files and organise owned items.</p></div></div>
     {!access?.browse ? <p className="fine-print">{access?.enabled ? "Save browsing permission and approve Drive access in Services above." : "Enable iCloud Drive in Services above to get started."}</p> : <>
       <nav className="drive-breadcrumbs" aria-label="Drive folder">{trail.map((entry, index) => <Button variant="ghost" key={`${entry.id}-${index}`} disabled={busy} onClick={() => void run(() => browse(trail.slice(0, index + 1)))}>{entry.name}</Button>)}</nav>
+      {folder.shareContext && <p className="fine-print">Shared folder: browsing and downloads are available. Changes to shared items are not supported.</p>}
       <div className="action-row"><Button variant="outline" disabled={busy} onClick={() => void run(() => browse())}><RefreshCw size={16} />Refresh folder</Button>
-        {access.upload && <><input ref={fileInput} type="file" hidden onChange={event => { const file = event.target.files?.[0]; event.target.value = ""; if (file) void run(() => upload(file)); }} /><Button variant="outline" disabled={busy} onClick={() => fileInput.current?.click()}><Upload size={16} />Upload file (up to {DRIVE_FILE_LIMIT_LABEL})</Button></>}
+        {access.upload && !folder.shareContext && <><input ref={fileInput} type="file" hidden onChange={event => { const file = event.target.files?.[0]; event.target.value = ""; if (file) void run(() => upload(file)); }} /><Button variant="outline" disabled={busy} onClick={() => fileInput.current?.click()}><Upload size={16} />Upload file (up to {DRIVE_FILE_LIMIT_LABEL})</Button></>}
       </div>
       <form className="drive-form" onSubmit={event => { event.preventDefault(); void run(() => find()); }}><label htmlFor="drive-search">Find file or folder names within this folder</label><div className="action-row"><input id="drive-search" value={query} maxLength={200} disabled={busy || !!continuation} onChange={event => setQuery(event.target.value)} /><Button variant="outline" disabled={busy || !query.trim()} type="submit"><Search size={16} />Search</Button>{matches && <Button variant="ghost" disabled={busy} onClick={() => { setMatches(null); setContinuation(null); }}>Clear search</Button>}</div></form>
-      {access.organize && <form className="drive-form" onSubmit={event => { event.preventDefault(); void run(async () => { const operationId = crypto.randomUUID(); setOperation(operationId); retain(await call<Operation>("/api/drive/create-folder", { ...context, parentId: folder.id, name, operationId })); setName(""); await browse(); }); }}><label htmlFor="drive-folder-name">New folder name</label><div className="action-row"><input id="drive-folder-name" value={name} maxLength={255} disabled={busy} onChange={event => setName(event.target.value)} /><Button type="submit" variant="outline" disabled={busy || !name.trim()}><FolderPlus size={16} />Create folder</Button></div></form>}
-      <ul className="drive-items">{items.map(item => <li key={item.id}><span className="drive-item-name">{item.type === "folder" ? <Folder size={18} /> : <File size={18} />}{item.name}</span><span className="fine-print">{item.size === null ? "Folder" : `${Math.ceil(item.size / 1024)} KiB`}</span>{item.type === "folder" ? <Button variant="ghost" disabled={busy} onClick={() => void run(() => browse([...trail, { id: item.id, name: item.name }]))}>Open</Button> : access.contents && <><Button variant="ghost" disabled={busy || (item.size ?? Infinity) > DRIVE_FILE_BYTES} onClick={() => void run(() => previewText(item))}><FileText size={16} />Preview text</Button><Button variant="ghost" disabled={busy || (item.size ?? Infinity) > DRIVE_FILE_BYTES} onClick={() => void run(() => download(item))}><Download size={16} />Download</Button></>}</li>)}</ul>
+      {access.organize && !folder.shareContext && <form className="drive-form" onSubmit={event => { event.preventDefault(); void run(async () => { const operationId = crypto.randomUUID(); setOperation(operationId); retain(await call<Operation>("/api/drive/create-folder", { ...context, parentId: folder.id, name, operationId })); setName(""); await browse(); }); }}><label htmlFor="drive-folder-name">New folder name</label><div className="action-row"><input id="drive-folder-name" value={name} maxLength={255} disabled={busy} onChange={event => setName(event.target.value)} /><Button type="submit" variant="outline" disabled={busy || !name.trim()}><FolderPlus size={16} />Create folder</Button></div></form>}
+      <ul className="drive-items">{items.map(item => <li key={`${item.id}|${item.shareContext ?? ""}`}><span className="drive-item-name">{item.type === "folder" ? <Folder size={18} /> : <File size={18} />}{item.name}</span><span className="fine-print">{item.size === null ? "Folder" : `${Math.ceil(item.size / 1024)} KiB`}</span>{item.type === "folder" ? <Button variant="ghost" disabled={busy} onClick={() => void run(() => browse([...trail, { id: item.id, name: item.name, shareContext: item.shareContext }]))}>Open</Button> : access.contents && <><Button variant="ghost" disabled={busy || (item.size ?? Infinity) > DRIVE_FILE_BYTES} onClick={() => void run(() => previewText(item))}><FileText size={16} />Preview text</Button><Button variant="ghost" disabled={busy || (item.size ?? Infinity) > DRIVE_FILE_BYTES} onClick={() => void run(() => download(item))}><Download size={16} />Download</Button></>}</li>)}</ul>
       {preview && <div className="drive-preview"><h3>Text preview: {preview.item.name}</h3><p className="fine-print">Read {preview.bytesRead} leading bytes. {preview.truncated ? "This preview is truncated; download the file for its full contents." : "The preview contains the file's text."} Previews support UTF-8 text and do not extract PDF or Office document contents.</p><pre>{preview.content}</pre><Button variant="ghost" onClick={() => setPreview(null)}>Close preview</Button></div>}
-      {listing && !items.length && <p className="fine-print">{matches ? "No matches in the folders checked so far." : "This folder is empty."}</p>}
+      {listing && !items.length && <p className="fine-print">{matches ? "No matches in the folders checked so far." : listing.complete ? "This folder is empty." : "No supported items are visible in this incomplete listing."}</p>}
       {listing && !listing.complete && matches === null && <p className="fine-print">This listing is incomplete. Some items are outside the supported scope or response budget.</p>}
       {matches && <p className="fine-print">{searchComplete ? "Finished this supported folder-tree search." : "Search is incomplete."} {continuation && <Button variant="outline" disabled={busy} onClick={() => void run(() => find(true))}>Continue search</Button>}</p>}
     </>}
