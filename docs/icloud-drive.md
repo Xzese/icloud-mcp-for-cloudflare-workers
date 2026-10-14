@@ -229,9 +229,9 @@ traversal continuation.
 
 Protocol references: [rclone’s unmerged shared-folder PR #9487](https://github.com/rclone/rclone/pull/9487), [pyicloud's shareID request and owner-scoped download implementation](https://github.com/timlaing/pyicloud/blob/1b340462f3e3c8177b907e612d4713543bb1201b/pyicloud/services/drive.py)
 and [iFetch's descendant-context regression notes](https://github.com/roshanlam/iFetch/blob/master/docs/shared-folder-validation.md).
-The shared-folder behavior is covered by synthetic client, service and Worker tests. Live
-shared-folder protocol verification remains pending. Existing live evidence below covers
-owned-item operations only.
+The shared-folder behavior is covered by synthetic client, service and Worker tests. The deeper
+live pass below also verifies shared metadata listing and traversal. Owner-scoped shared
+content downloads and `docws` fallback remain covered by synthetic tests rather than that pass.
 
 ## File transfer limits and client support
 
@@ -487,3 +487,23 @@ logging names or identities. The final listing correctly remained incomplete bec
 root's upstream omissions and the configured scan limits. Drive and Reminders stayed ready,
 and no Apple data writes were made. Shared-context retention beyond ten minutes and traversal
 beyond 1,000 items are covered by synthetic regressions rather than this live pass.
+
+A deeper metadata-only pass inspected 3,850 items across 500 folders and 169 recursive pages,
+including 55 shared items and paths up to depth 5. Independent immediate-child listings of all
+500 folders reproduced all 3,850 identities, names, types, parent references and relative paths
+without mismatches. Parent-path checks covered 3,849 items and eight exact file lookups passed;
+the independent reconciliation also covered the item whose provider parent reference did not
+directly match a connector parent ID. The scan deliberately used a 500-folder discovery budget,
+so its final result stayed incomplete with `traversal_folder_limit` and four upstream-incomplete
+folder diagnostics; it is not a complete account inventory.
+
+A 494-item source folder returned the same immediate contents with seven-item pages (71 pages)
+and 200-item pages (three pages), fetching its parent once per traversal. Case-insensitive name
+filtering, no-match search and live HTTP/MCP result parity passed. Depth, folder and item limits
+were enforced. Four changed continuation scopes were refused without consuming the original
+cursor; two concurrent advances produced one success and one conflict. Used and invented
+cursors and invalid inputs were rejected. A separate pass certified an empty folder and a
+five-file folder complete, with five one-item pages and no parent refetch, and matched the
+root's incomplete counts to its direct listing. Drive and Reminders stayed ready and no Apple
+data writes were made. No names, identities or file contents were logged. Package archives,
+shared-context retention beyond ten minutes and induced upstream failures remain synthetic-only.
