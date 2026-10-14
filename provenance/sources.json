@@ -140,6 +140,28 @@
           ]
         }
       ]
+    },
+    {
+      "repository": "https://github.com/timlaing/pyicloud",
+      "revision": "1b340462f3e3c8177b907e612d4713543bb1201b",
+      "license": "MIT",
+      "copyright": "PyiCloud Authors",
+      "role": "Shared Drive shareID inheritance and owner-scoped download protocol reference; no Python runtime",
+      "files": [
+        {
+          "path": "pyicloud/services/drive.py",
+          "sha256": "e37654f10e17f3a80a651cea4a604063ae7425f21909405dd74da331713ce29c",
+          "destinations": [
+            "src/icloud/drive.ts",
+            "src/transport/drive-http.ts"
+          ]
+        },
+        {
+          "path": "tests/test_cov_drive_calendar.py",
+          "sha256": "5a32ad2eb564b1d6440cdbfcb78e338d0493203ae4555e03da3c427abdb1356e",
+          "role": "Request and owner-resolution test reference"
+        }
+      ]
     }
   ],
   "fixtureGenerator": "tests/fixtures/generate.py",

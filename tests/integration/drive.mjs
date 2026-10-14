@@ -22,6 +22,9 @@ const driveConnection = {
 const uploadedId = "FILE::com.apple.CloudDocs::synthetic-upload";
 const uploadedDocId = "synthetic-upload";
 const uploadedName = "synthetic-large.bin";
+const sharedDescriptor = { recordName: "synthetic-shared-record" };
+const sharedFolder = { drivewsid: "FOLDER::com.apple.CloudDocs::shared-root", docwsid: "shared-root", zone: "com.apple.CloudDocs", name: "Shared Fixture", type: "FOLDER", etag: "shared-etag", parentId: DRIVE_ROOT, shareID: sharedDescriptor, owner: { ownerRecordName: "synthetic-owner" } };
+const sharedChild = { drivewsid: "FOLDER_IN_SHARED_FOLDER::com.apple.CloudDocs::shared-child", docwsid: "shared-child", zone: "com.apple.CloudDocs", name: "01", type: "FOLDER", etag: "child-etag", parentId: sharedFolder.drivewsid };
 const fileItem = (size, etag = "synthetic-upload-etag") => ({
   drivewsid: uploadedId, docwsid: uploadedDocId, zone: "com.apple.CloudDocs", name: uploadedName, type: "FILE", etag,
   parentId: DRIVE_ROOT, size, dateModified: 1_800_000_000_000,
@@ -62,9 +65,14 @@ export async function verifyDrive(options) {
     if (url.hostname === "p01-drivews.icloud.com" && ["/retrieveItemDetailsInFolders", "/retrieveItemDetails"].includes(url.pathname)) {
       const payload = await request.clone().json();
       const lookup = Array.isArray(payload) ? payload[0] : payload;
-      const { drivewsid } = lookup.items?.[0] ?? lookup;
-      assert.equal(url.pathname, drivewsid === DRIVE_ROOT ? "/retrieveItemDetailsInFolders" : "/retrieveItemDetails");
-      if (drivewsid === DRIVE_ROOT) return json([{ drivewsid: DRIVE_ROOT, docwsid: "root", zone: "com.apple.CloudDocs", name: "root", type: "FOLDER", etag: "synthetic-root-etag", parentId: null, items: uploaded ? [fileItem(payloadBytes.length)] : [], directChildrenCount: uploaded ? 1 : 0 }]);
+      const entry = lookup.items?.[0] ?? lookup;
+      const { drivewsid } = entry;
+      assert.equal(url.pathname, drivewsid === uploadedId ? "/retrieveItemDetails" : "/retrieveItemDetailsInFolders");
+      if (drivewsid === DRIVE_ROOT) return json([{ drivewsid: DRIVE_ROOT, docwsid: "root", zone: "com.apple.CloudDocs", name: "root", type: "FOLDER", etag: "synthetic-root-etag", parentId: null, items: [sharedFolder, ...(uploaded ? [fileItem(payloadBytes.length)] : [])], directChildrenCount: uploaded ? 2 : 1 }]);
+      if (drivewsid === sharedFolder.drivewsid || drivewsid === sharedChild.drivewsid) {
+        assert.deepEqual(entry.shareID, sharedDescriptor);
+        return json([{ ...(drivewsid === sharedFolder.drivewsid ? sharedFolder : sharedChild), items: drivewsid === sharedFolder.drivewsid ? [sharedChild] : [], directChildrenCount: drivewsid === sharedFolder.drivewsid ? 1 : 0 }]);
+      }
       assert.equal(drivewsid, uploadedId, "post-commit and metadata reads must look up the exact uploaded identity");
       assert.equal(uploaded, true, "the exact file lookup is available only after the synthetic commit");
       return json({ items: [fileItem(payloadBytes.length)] });
@@ -170,6 +178,25 @@ export async function verifyDrive(options) {
     const listedTools = await mcp("tools/list", {});
     assert.ok(listedTools.result.tools.some(tool => tool.name === "list_icloud_drive_items" && tool.outputSchema.properties.items));
     assert.ok(listedTools.result.tools.some(tool => tool.name === "get_icloud_drive_item" && tool.outputSchema.properties.item));
+    assert.ok(listedTools.result.tools.some(tool => tool.name === "resolve_icloud_drive_folder_path" && tool.outputSchema.properties.parentListing));
+    const missingPath = await mcp("tools/call", { name: "resolve_icloud_drive_folder_path", arguments: { expectedGeneration: generation, path: "Documents/Snap Heaven/01/FY 2026" } });
+    assert.equal(missingPath.result.isError, undefined, JSON.stringify(missingPath));
+    assert.equal(missingPath.result.structuredContent.status, "not_found");
+    assert.equal(missingPath.result.structuredContent.reason, "folder_not_found");
+    assert.equal(missingPath.result.structuredContent.parentListing.complete, true);
+    const httpPath = await request("/api/drive/resolve-folder-path", { method: "POST", body: JSON.stringify({ expectedGeneration: generation, path: "Documents" }) });
+    assert.equal(httpPath.status, 200);
+    assert.equal((await httpPath.json()).status, "not_found");
+    const resolvedShare = await mcp("tools/call", { name: "resolve_icloud_drive_folder_path", arguments: { expectedGeneration: generation, path: "Shared Fixture/01" } });
+    assert.equal(resolvedShare.result.isError, undefined, JSON.stringify(resolvedShare));
+    const sharedItem = resolvedShare.result.structuredContent.folder;
+    assert.equal(resolvedShare.result.structuredContent.status, "resolved");
+    assert.equal(sharedItem.id, sharedChild.drivewsid);
+    assert.ok(sharedItem.shareContext);
+    assert.ok(!JSON.stringify(resolvedShare.result.structuredContent).includes("synthetic-shared-record"));
+    const sharedListing = await request("/api/drive/list", { method: "POST", body: JSON.stringify({ folderId: sharedItem.id, shareContext: sharedItem.shareContext }) });
+    assert.equal(sharedListing.status, 200);
+    assert.equal((await sharedListing.json()).complete, true);
 
     const limitIntent = { operationId: randomUUID(), parentId: DRIVE_ROOT, name: "limit-boundary.bin", size: 64 * 1024 * 1024, sha256: "a".repeat(64), contentType: "application/octet-stream" };
     const acceptedLimit = await request("/api/drive/prepare-upload", { method: "POST", body: JSON.stringify(limitIntent) });
@@ -198,6 +225,8 @@ export async function verifyDrive(options) {
 
     const listCall = await mcp("tools/call", { name: "list_icloud_drive_items", arguments: { expectedGeneration: generation, folderId: DRIVE_ROOT } });
     assert.equal(listCall.result.isError, undefined, JSON.stringify(listCall));
+    assert.deepEqual(listCall.result.structuredContent.reasons, []);
+    assert.equal(listCall.result.structuredContent.counts.returned, 2);
     const typedItem = listCall.result.structuredContent.items.find(item => item.id === uploadedId);
     assert.equal(typedItem.documentId, uploadedDocId);
     assert.equal(typedItem.size, payloadBytes.length);
@@ -241,7 +270,7 @@ export async function verifyDrive(options) {
     assert.equal(revokedReadBody.error.code, "FORBIDDEN");
     assert.equal(downloads, 2, "revoked content access must not issue another Apple content request");
     return {
-      checks: ["signed-owner-origin", "300-KiB-streaming-upload", "exact-document-commit-and-idempotent-replay", "typed-MCP-metadata", "private-single-use-download", "64-KiB-inline-guidance-and-8-KiB-preview", "contents-permission-revocation"],
+      checks: ["signed-owner-origin", "300-KiB-streaming-upload", "exact-document-commit-and-idempotent-replay", "typed-MCP-metadata", "shared-path-and-persisted-private-context", "private-single-use-download", "64-KiB-inline-guidance-and-8-KiB-preview", "contents-permission-revocation"],
       uploadedBytes: payloadBytes.length, operationId, metadataTools: 2,
       outboundTransferBytes: observedUpload?.byteLength ?? 0, appleUploadRequests: allocations + transfers + finalizations, downloads,
     };

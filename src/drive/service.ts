@@ -13,16 +13,21 @@ import { requireServicePermission, type ServicePermission } from "../services/se
 import { DriveOperationRepository, type DriveOperation, type DriveOperationData, type DriveScope } from "../persistence/drive-operations.ts";
 import { DriveClient, DRIVE_ROOT, DriveItemSchema, UploadReceiptSchema, type DriveItem } from "../icloud/drive.ts";
 import { DriveHTTP } from "../transport/drive-http.ts";
+import { DriveSharedContext } from "./shared.ts";
+import { resolveDriveFolderPath } from "./folder-path.ts";
+import { DriveFolderListingDiagnostics, type DriveSearchReason } from "./listing.ts";
 import { accountScope } from "../lib/canonical.ts";
 import { b64, unb64, hex } from "../crypto/bytes.ts";
 import type { RuntimeEnv } from "../platform/sites.ts";
-import { ListDrive, GetDriveItem, SearchDrive, ReadDrive, DownloadDrive, UploadDrive, UploadDriveMetadata, CreateDriveFolder, RenameDriveItem, MoveDriveItem, GetDriveOperation, OperationId, INLINE_FILE_BYTES, DRIVE_FILE_BYTES, INLINE_UPLOAD_GUIDANCE } from "./schemas.ts";
+import { ListDrive, GetDriveItem, SearchDrive, ResolveDriveFolderPath, ReadDrive, DownloadDrive, UploadDrive, UploadDriveMetadata, CreateDriveFolder, RenameDriveItem, MoveDriveItem, GetDriveOperation, OperationId, INLINE_FILE_BYTES, DRIVE_FILE_BYTES, INLINE_UPLOAD_GUIDANCE } from "./schemas.ts";
 
 type Saved = Awaited<ReturnType<AppleSessionRepository["load"]>>;
 type Upload = z.infer<typeof UploadDriveMetadata>;
 interface Context { scope: DriveScope; permission: ServicePermission; saved: Saved; fence: ResumeFence; http: AppleAuthHTTP; client: DriveClient; access: { rejected: boolean }; }
 const Allocation = z.object({ documentId: z.string().min(1).max(256), url: z.string().url() }).strict();
-const SearchState = z.object({ root: z.string(), query: z.string(), queue: z.array(z.string()).max(1000), seen: z.array(z.string()).max(1000), pending: z.array(DriveItemSchema).max(1000), visited: z.number().int().min(0).max(1000), incomplete: z.boolean() }).strict();
+const SearchFolder = z.object({ id: z.string(), shareContext: z.string().uuid().optional() }).strict();
+const folderKey = (folder: { id: string; shareContext?: string }) => folder.shareContext ? `${folder.id}|${folder.shareContext}` : folder.id;
+const SearchState = z.object({ root: z.string(), rootContext: z.string().uuid().optional(), query: z.string(), queue: z.array(z.union([z.string().transform((id): z.infer<typeof SearchFolder> => ({ id })), SearchFolder])).max(1000), seen: z.array(z.string()).max(1000), pending: z.array(DriveItemSchema).max(1000), visited: z.number().int().min(0).max(1000), incomplete: z.boolean(), incompleteFolders: z.array(DriveFolderListingDiagnostics).max(1000).default([]), budgetExhausted: z.boolean().default(false) }).strict();
 function parse<S extends z.ZodTypeAny>(schema: S, input: unknown): z.infer<S> {
   const result = schema.safeParse(input);
   if (!result.success) throw new AppError("VALIDATION_ERROR", "The Drive request is invalid.", 400);
@@ -31,12 +36,13 @@ function parse<S extends z.ZodTypeAny>(schema: S, input: unknown): z.infer<S> {
 function unknownOutcome(id: string): AppError { return new AppError("WRITE_OUTCOME_UNKNOWN", `The outcome of Drive operation ${id} is uncertain. Retain this operation ID and inspect it; do not issue a new operation key.`, 503); }
 function conflict(message: string): never { throw new AppError("CONFLICT", message, 409); }
 function mutable(item: DriveItem) {
+  if (item.shareContext || item.id.includes("_IN_SHARED_FOLDER::")) throw new AppError("UNSUPPORTED_FEATURE", "Shared Drive items support browsing and reads only.", 409);
   if (item.id === DRIVE_ROOT || item.documentId === "root") throw new AppError("UNSUPPORTED_FEATURE", "The native Drive root cannot be changed.", 409);
 }
 function ordinaryFile(item: DriveItem, limit: number) {
   if (item.type !== "file" || item.size === null || item.size > limit) throw new AppError("UNSUPPORTED_FEATURE", `Select an ordinary file within the ${limit} byte content limit.`, 409);
 }
-function exact(a: DriveItem, b: DriveItem) { return a.id === b.id && a.documentId === b.documentId && a.etag === b.etag && a.type === b.type && a.size === b.size && a.parentId === b.parentId && a.name === b.name; }
+function exact(a: DriveItem, b: DriveItem) { return a.id === b.id && a.documentId === b.documentId && a.etag === b.etag && a.type === b.type && a.size === b.size && a.parentId === b.parentId && a.name === b.name && a.shareContext === b.shareContext; }
 
 export class DriveService {
   private readonly env: RuntimeEnv;
@@ -89,7 +95,7 @@ export class DriveService {
         return response;
       };
       const http = AppleAuthHTTP.restore(saved.session.auth, send);
-      return { scope, permission, saved, fence, http, client: new DriveClient(http.http, connection), access };
+      return { scope, permission, saved, fence, http, client: new DriveClient(http.http, connection, { save: context => this.operations.saveSharedContext(context, scope), load: async id => parse(DriveSharedContext, await this.operations.loadSharedContext(id, scope)) }), access };
     } catch (error) { await this.sessions.releaseResume(fence); throw error; }
   }
   private async finish(context: Context) {
@@ -131,40 +137,57 @@ export class DriveService {
   }
   async list(input: unknown) {
     const request = parse(ListDrive, input);
-    return this.metadata("drive.browse", request.expectedGeneration, async c => ({ ...await c.client.listItems(request.folderId), generation: c.scope.generation }));
+    return this.metadata("drive.browse", request.expectedGeneration, async c => ({ ...await c.client.listItems(request.folderId, request.shareContext), generation: c.scope.generation }));
   }
   async get(input: unknown) {
     const request = parse(GetDriveItem, input);
-    return this.metadata("drive.browse", request.expectedGeneration, async c => ({ item: await c.client.getItem(request.itemId), generation: c.scope.generation }));
+    return this.metadata("drive.browse", request.expectedGeneration, async c => ({ item: await c.client.getItem(request.itemId, request.shareContext), generation: c.scope.generation }));
+  }
+  async resolveFolderPath(input: unknown) {
+    const request = parse(ResolveDriveFolderPath, input);
+    return this.metadata("drive.browse", request.expectedGeneration, async c => ({
+      ...await resolveDriveFolderPath(c.client, request.folderId, request.path, request.shareContext), generation: c.scope.generation,
+    }));
   }
   async search(input: unknown) {
     const request = parse(SearchDrive, input);
     return this.metadata("drive.browse", request.expectedGeneration, async c => {
-      const state = request.continuation ? parse(SearchState, await this.operations.consumeHandle(request.continuation, "search", c.scope)) : { root: request.folderId, query: request.query, queue: [request.folderId], seen: [] as string[], pending: [] as DriveItem[], visited: 0, incomplete: false };
-      if (state.root !== request.folderId || state.query !== request.query) conflict("Repeat the original root and query when continuing a Drive search.");
+      const state = request.continuation ? parse(SearchState, await this.operations.consumeHandle(request.continuation, "search", c.scope)) : parse(SearchState, { root: request.folderId, rootContext: request.shareContext, query: request.query, queue: [{ id: request.folderId, shareContext: request.shareContext }], seen: [], pending: [], visited: 0, incomplete: false });
+      if (state.root !== request.folderId || state.rootContext !== request.shareContext || state.query !== request.query) conflict("Repeat the original root and query when continuing a Drive search.");
       const matches: DriveItem[] = [];
       let foldersRead = 0;
       while (matches.length < 200) {
         if (state.pending.length) {
           const item = state.pending.shift()!;
           if (item.name.toLocaleLowerCase().includes(request.query.toLocaleLowerCase())) matches.push(item);
-          if (item.type === "folder" && !state.seen.includes(item.id) && !state.queue.includes(item.id) && state.queue.length + state.seen.length < 1000) state.queue.push(item.id);
+          if (item.type === "folder" && !state.seen.includes(folderKey(item)) && !state.queue.some(folder => folderKey(folder) === folderKey(item))) {
+            if (state.queue.length + state.seen.length < 1000) state.queue.push({ id: item.id, shareContext: item.shareContext });
+            else state.budgetExhausted = true;
+          }
           continue;
         }
         if (!state.queue.length || foldersRead >= 3 || state.visited >= 1000) break;
-        const id = state.queue.shift()!;
-        if (state.seen.includes(id)) continue;
-        state.seen.push(id);
-        const page = await c.client.listItems(id);
+        const folder = state.queue.shift()!;
+        const key = folderKey(folder);
+        if (state.seen.includes(key)) continue;
+        state.seen.push(key);
+        const page = await c.client.listItems(folder.id, folder.shareContext);
         foldersRead++;
         const available = 1000 - state.visited;
         state.pending = page.items.slice(0, available);
         state.visited += state.pending.length;
-        state.incomplete ||= !page.complete || page.items.length > available;
+        state.incomplete ||= !page.complete;
+        if (!page.complete) state.incompleteFolders.push({ folderId: page.folder.id, shareContext: page.folder.shareContext, complete: page.complete, reasons: page.reasons, counts: page.counts });
+        state.budgetExhausted ||= page.items.length > available;
       }
       const canContinue = state.pending.length > 0 || state.queue.length > 0 && state.visited < 1000;
       const continuation = canContinue ? (await this.operations.handle("search", state, c.scope)).id : null;
-      return { items: matches, complete: !state.incomplete && !state.queue.length && !state.pending.length, continuation, scope: "selected-folder-tree", consistency: "live-pages-not-snapshot", foldersRead, visited: state.visited, generation: c.scope.generation };
+      const reasons = new Set<z.infer<typeof DriveSearchReason>>(state.incompleteFolders.flatMap(folder => folder.reasons));
+      // Older ten-minute handles may predate per-folder diagnostics.
+      if (state.incomplete && !state.incompleteFolders.length) reasons.add("listing_details_unavailable");
+      if (canContinue) reasons.add("continuation_required");
+      if (state.budgetExhausted || state.queue.length > 0 && state.visited >= 1000) reasons.add("search_item_limit");
+      return { items: matches, complete: reasons.size === 0, reasons: [...reasons], incompleteFolders: state.incompleteFolders, continuation, scope: "selected-folder-tree", consistency: "live-pages-not-snapshot", foldersRead, visited: state.visited, generation: c.scope.generation };
     });
   }
   private async transferClient(scope: DriveScope, permission: ServicePermission, auth: Saved["session"]["auth"]) {
@@ -221,7 +244,7 @@ export class DriveService {
     if (request.previewBytes !== undefined && request.encoding !== "utf8") throw new AppError("VALIDATION_ERROR", "Text previews require UTF-8 encoding. Use an authenticated download for binary files.", 400);
     const c = await this.open("drive.contents", request.expectedGeneration);
     try {
-      const item = await c.client.getItem(request.itemId);
+      const item = await c.client.getItem(request.itemId, request.shareContext);
       ordinaryFile(item, DRIVE_FILE_BYTES);
       if (request.previewBytes === undefined && item.size! > INLINE_FILE_BYTES) throw new AppError("UNSUPPORTED_FEATURE", `This file exceeds the 64 KiB inline read limit. Request a UTF-8 preview with previewBytes (up to 8192), or use download_icloud_drive_file / dashboard Download for full contents up to ${DRIVE_FILE_LIMIT_LABEL}.`, 409);
       const response = await this.content(item, c);
@@ -255,7 +278,7 @@ export class DriveService {
   async download(input: unknown) {
     const request = parse(DownloadDrive, input);
     return this.metadata("drive.contents", request.expectedGeneration, async c => {
-      const item = await c.client.getItem(request.itemId);
+      const item = await c.client.getItem(request.itemId, request.shareContext);
       ordinaryFile(item, DRIVE_FILE_BYTES);
       const handle = await this.operations.handle("download", { item }, c.scope);
       return { handleId: handle.id, url: `/api/drive/downloads/${handle.id}`, expiresAt: handle.expiresAt, item, generation: c.scope.generation };
@@ -266,13 +289,14 @@ export class DriveService {
     const c = await this.open("drive.contents");
     try {
       const saved = parse(z.object({ item: DriveItemSchema }).strict(), await this.operations.consumeHandle(handleId, "download", c.scope));
-      const current = await c.client.getItem(saved.item.id);
+      const current = await c.client.getItem(saved.item.id, saved.item.shareContext);
       if (!exact(current, saved.item)) conflict("The Drive file changed after its download handle was created. Request a fresh download.");
       return await this.content(current, c, signal);
     } finally { await this.close(c); }
   }
   private async destination(c: Context, parentId: string, name: string, excludedId?: string) {
     const listing = await c.client.listItems(parentId);
+    if (listing.folder.shareContext) throw new AppError("UNSUPPORTED_FEATURE", "Shared Drive destinations support browsing and reads only.", 409);
     if (!listing.complete) throw new AppError("UNSUPPORTED_FEATURE", "The destination listing is incomplete; absence of a filename collision cannot be proved.", 409);
     if (listing.items.some(item => item.id !== excludedId && item.name.normalize("NFC").toLocaleLowerCase() === name.normalize("NFC").toLocaleLowerCase())) conflict("The destination already contains that filename. Drive writes never overwrite existing files.");
     return listing.folder;

@@ -122,6 +122,29 @@ export class DriveOperationRepository {
     try { return await this.envelopes.decrypt(EnvelopeSchema.parse(JSON.parse(row.envelope)), this.context(id, scope.account, scope.generation, kind)); }
     catch { throw new AppError("PROTOCOL_CHANGED", "The Drive continuation failed verification.", 503); }
   }
+  async saveSharedContext(data: unknown, scope: DriveScope): Promise<string> {
+    await this.requireSchema();
+    // Repeated listings reuse one encrypted context per share in this scope.
+    const hash = await fingerprint(["drive-share-v1", this.owner, scope.account, scope.generation, scope.permissionRevision, data]);
+    const id = `${hash.slice(0, 8)}-${hash.slice(8, 12)}-4${hash.slice(13, 16)}-8${hash.slice(17, 20)}-${hash.slice(20, 32)}`;
+    await this.db.prepare("DELETE FROM drive_handles WHERE owner_id = ? AND expires_at <= ?").bind(this.owner, Date.now()).run();
+    const expires = Math.min(scope.expiresAt, Date.now() + 10 * 60_000);
+    const envelope = JSON.stringify(await this.envelopes.encrypt(data, this.context(id, scope.account, scope.generation, "share")));
+    const result = await this.db.prepare(`INSERT INTO drive_handles (owner_id,handle_id,account_scope,generation,permission_revision,kind,expires_at,envelope)
+      SELECT ?,?,?,?,?,?,?,? WHERE (SELECT COUNT(*) FROM drive_handles WHERE owner_id = ?) < 128 OR EXISTS (SELECT 1 FROM drive_handles WHERE owner_id = ? AND handle_id = ?)
+      ON CONFLICT(owner_id,handle_id) DO UPDATE SET expires_at = excluded.expires_at, envelope = excluded.envelope`)
+      .bind(this.owner, id, scope.account, scope.generation, scope.permissionRevision, "share", expires, envelope, this.owner, this.owner, id).run();
+    if (!result.meta.changes) throw new AppError("RATE_LIMITED", "Too many active Drive contexts. Wait for older handles to expire.", 429, true);
+    return id;
+  }
+  async loadSharedContext(id: string, scope: DriveScope): Promise<unknown> {
+    await this.requireSchema();
+    const row = await this.db.prepare("SELECT envelope FROM drive_handles WHERE owner_id = ? AND handle_id = ? AND kind = 'share' AND account_scope = ? AND generation = ? AND permission_revision = ? AND expires_at > ?")
+      .bind(this.owner, id, scope.account, scope.generation, scope.permissionRevision, Date.now()).first<{ envelope: string }>();
+    if (!row) throw new AppError("CONFLICT", "The shared Drive context expired or belongs to different settings/account. Browse its shared parent again.", 409);
+    try { return await this.envelopes.decrypt(EnvelopeSchema.parse(JSON.parse(row.envelope)), this.context(id, scope.account, scope.generation, "share")); }
+    catch { throw new AppError("PROTOCOL_CHANGED", "The shared Drive context failed verification.", 503); }
+  }
   async clearBeforeGeneration(generation: number) {
     if (!await this.available()) return;
     await this.db.batch([
