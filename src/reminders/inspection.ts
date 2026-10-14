@@ -39,7 +39,13 @@ const check = (status: ReminderActionCheck["status"], reason: string, affectedRe
 // private field names or opaque payload paths, so they are not response data.
 function reason(error: unknown, fallback: string): string {
   if (error instanceof AppError && error.code === "CONFLICT") return "The exact participants changed or could not be resolved. Read the reminder and list again before a new request.";
-  if (error instanceof AppError && error.code === "PROTOCOL_CHANGED") return "Apple returned an unrecognized relationship or field shape. This inspection cannot establish support.";
+  if (error instanceof AppError && error.code === "PROTOCOL_CHANGED") {
+    if (/response.*byte budget|more data than.*response budget/i.test(error.message)) return "Apple's relationship response exceeded the bounded transport size. This inspection cannot establish support.";
+    if (/without its source-proven List relationship/.test(error.message)) return "Apple returned a reminder without its expected List relationship. This inspection cannot establish support.";
+    if (/ParentReminder/.test(error.message)) return "Apple returned an unrecognized ParentReminder relationship. This inspection cannot establish support.";
+    if (/List relationship|linked to a different list|reminder from another list/.test(error.message)) return "Apple returned a reminder outside the selected List. This inspection cannot establish support.";
+    return "Apple returned an unrecognized relationship or field shape. This inspection cannot establish support.";
+  }
   return fallback;
 }
 function propagateReadFailure(error: unknown) {
@@ -150,6 +156,10 @@ export async function inspectReminder(client: CloudKitRemindersClient, current: 
   const pages = new Map<string, ReturnType<CloudKitRemindersClient["queryRemindersPage"]>>();
   const familyClient = {
     lookup: (ids: string[]) => { const key = JSON.stringify(ids); if (!lookups.has(key)) lookups.set(key, client.lookup(ids)); return lookups.get(key)!; },
+    lookupRelationshipRecords: (ids: string[]) => {
+      const key = `relationships:${JSON.stringify(ids)}`;
+      if (!lookups.has(key)) lookups.set(key, client.lookupRelationshipRecords(ids)); return lookups.get(key)!;
+    },
     queryRemindersPage: (input: Parameters<CloudKitRemindersClient["queryRemindersPage"]>[0]) => {
       const key = JSON.stringify(input); if (!pages.has(key)) pages.set(key, client.queryRemindersPage(input)); return pages.get(key)!;
     },

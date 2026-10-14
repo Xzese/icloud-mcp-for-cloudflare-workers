@@ -1,6 +1,6 @@
 import { AppError, WriteOutcomeUnknownError } from "../errors.ts";
 import { b64, utf8 } from "../crypto/bytes.ts";
-import { fingerprint, jsonBytes } from "../lib/canonical.ts";
+import { fingerprint } from "../lib/canonical.ts";
 import { stableNativePresentation } from "../lib/native-presentation.ts";
 import { normalizeList, normalizeReminder, referenceField, intrinsicParentIdentity, isKnownEmptyDeletionCollection, type CloudKitRecord, type CloudKitRecordItem } from "../icloud/cloudkit.ts";
 import type { RecurringIntent } from "../persistence/apple-sessions.ts";
@@ -11,6 +11,7 @@ import { RecurrenceCalendarTimeZone, recurrenceEndCalendarLabel } from "./recurr
 import { decodeDocument } from "./crdt.ts";
 import { updateResolutionTokenMap, type CloudKitWriteRecord } from "./writes.ts";
 import type { ListWrite } from "./list-writes.ts";
+import { withinCloudKitRequestBudget } from "../icloud/budgets.ts";
 
 type Fields = CloudKitWriteRecord["fields"];
 export type RecurringOperation = { operationType: "create" | "update" | "delete"; record: {
@@ -305,8 +306,8 @@ async function finishRecurringPlan(plan: Omit<RecurringCompletionPlan, "sourceFi
   for (const guard of guards) expected.push({ id: guard.recordName, type: guard.recordType as RecurringIntent["expected"][number]["type"], hash: await recurringRecordHash(guard, owner, plan.intrinsicParentGuards) });
   const guardedOperations = guards.map(guard => ({ operationType: "update", record: { recordName: guard.recordName, recordType: guard.recordType,
     recordChangeTag: guard.recordChangeTag, fields: { Deleted: { type: "INT64", value: 0 } } } }));
-  if (operations.length + guardedOperations.length > 32 || jsonBytes({ zoneID: { zoneName: "Reminders", zoneType: "REGULAR_CUSTOM_ZONE", ownerRecordName: owner },
-    atomic: true, operations: [...operations, ...guardedOperations] }) > 65_536) throw new AppError("UNSUPPORTED_FEATURE", "The entire recurring occurrence exceeds its atomic request budget.");
+  if (operations.length + guardedOperations.length > 32 || !withinCloudKitRequestBudget({ zoneID: { zoneName: "Reminders", zoneType: "REGULAR_CUSTOM_ZONE", ownerRecordName: owner },
+    atomic: true, operations: [...operations, ...guardedOperations] })) throw new AppError("UNSUPPORTED_FEATURE", "The entire recurring occurrence exceeds its atomic request budget.");
   const sourceFingerprint = await fingerprint([list, ...graph.records].map(record => ({ id: record.recordName, type: record.recordType, version: record.recordChangeTag,
     ...(plan.intrinsicParentGuards ? { parent: retainedIntrinsicIdentity(record, owner) } : record.recordType === "Reminder" ? { parent: intrinsicParentIdentity(record, owner) } : {}),
     fields: stableNativePresentation(record.fields) } )).sort((a, b) => a.id.localeCompare(b.id)));

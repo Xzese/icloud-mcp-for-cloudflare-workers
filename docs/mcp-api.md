@@ -61,6 +61,32 @@ Application errors set `isError: true` and include `error.code`, `message`, `ret
 MCP validation errors. A hosted adapter may label the outer error `INVALID_ARGUMENT`;
 inspect the nested connector error when present.
 
+Failures while decoding a List's `ReminderIDs` include `error.membershipDiagnostics`:
+`fieldType` (`STRING` or `OTHER`), `stringLength` (characters, or null), `jsonShape`
+(`not_inspected`, `invalid`, `array`, `object` or `scalar`) and `arrayLength` (or null).
+These expose only shape and size, never membership values or parser excerpts. Malformed
+fields, JSON, shapes or identities return `PROTOCOL_CHANGED`; exceeding the 131,072-character
+or 2,000-entry inspection limit returns `UNSUPPORTED_FEATURE`. Oversized strings are not
+parsed, so their JSON shape and array length remain unknown. Both failures are nonretryable
+and prevent lifecycle dispatch. A successful list summary deliberately returns
+`reminderIds: null` without inspecting membership; its separate `count` is not an inventory.
+
+Native inventories above 1,000 entries use bounded 200-item pages and exact lookup batches,
+at most 10 query pages and 2,000 distinct reminder identities. These inventory reads project
+`List`, `ParentReminder` and `Deleted`; document content and scheduling graphs do not
+establish parent relationships. Selected lifecycle participants are subsequently resolved
+with full fields and exact versions before planning.
+The relationship projection queries `Reminder` by its List reference directly, including
+completed records, rather than the compound `reminderList` scheduling view. Relationship
+normalization validates only those native links and deletion state; unrelated audit dates
+and document formats cannot stand in for a parent-link check. Owned deleted stubs are ignored.
+Query and exact-lookup phases each cap aggregate data at 8 MiB;
+large exact lookups run in groups of at most four, draining every read before a failure;
+the existing session lease, request deadline and 1 MiB per-response limit remain in force.
+Atomic writes can carry up to 256 KiB when native List ordering requires it; removing only
+those bounded ordering values must leave at most the original 64 KiB of other request data.
+This capacity does not enlarge reminder-content limits or permit splitting a recurring write.
+
 | Result or error | Meaning and next action |
 | --- | --- |
 | `replayed: true` | The retained request was reconciled without another Apple write. It does not mean a fresh operation ran. |

@@ -129,6 +129,56 @@ test("reparent inspection guards both roots, refuses cycles/deeper nesting and r
   await assert.rejects(subtaskParents(clientFor([]), owner, listId, null, parentInput, list), hasCode("CONFLICT"));
 });
 
+test("large native inventories retain complete query and exact-membership child checks", async () => {
+  const ids = Array.from({ length: 1822 }, () => `Reminder/${crypto.randomUUID()}`);
+  const records = ids.map(id => record(id));
+  const root = records[0], hiddenChild = records.at(-1)!;
+  hiddenChild.fields.ParentReminder = { type: "REFERENCE", value: { recordName: root.recordName, action: "VALIDATE" } };
+  const inventory = { ...list, fields: { ...list.fields, ReminderIDs: { type: "STRING", value: JSON.stringify(ids.map(id => id.slice(9))) } } };
+  // The query index omits the committed child. Exact inventory still finds it.
+  const queried = records.slice(0, -1);
+  const pages = Array.from({ length: Math.ceil(queried.length / 200) }, (_, i) => page(queried.slice(i * 200, (i + 1) * 200),
+    (i + 1) * 200 < queried.length ? `page-${i + 1}` : null));
+  const client = clientFor(records, pages), originalLookup = client.lookup;
+  let batches = 0;
+  client.lookup = async names => { assert.ok(names.length <= 200); batches++; return originalLookup(names); };
+  await assert.rejects(requireNoChildren(client, owner, inventory, root.recordName), hasCode("UNSUPPORTED_FEATURE"));
+  assert.equal(client.queries(), 10); assert.equal(batches, 10);
+  await requireNoChildren(clientFor(records, pages), owner, inventory, records[1].recordName);
+  const incomplete = clientFor(records.slice(0, -1), pages);
+  await assert.rejects(requireNoChildren(incomplete, owner, inventory, root.recordName), hasCode("CONFLICT"));
+  const unknown = { ...hiddenChild, fields: { ...hiddenChild.fields, UnknownChildren: { type: "STRING_LIST", value: [] } } };
+  await assert.rejects(requireNoChildren(clientFor([...records.slice(0, -1), unknown], pages), owner, inventory, root.recordName), hasCode("UNSUPPORTED_FEATURE"));
+});
+
+test("large exact inspection bounds concurrency and drains reads before propagating failure", async () => {
+  const ids = Array.from({ length: 1001 }, () => `Reminder/${crypto.randomUUID()}`);
+  const inventory = { ...list, fields: { ...list.fields, ReminderIDs: { type: "STRING", value: JSON.stringify(ids) } } };
+  let started = 0, settled = false;
+  let signalStarted!: () => void, release!: () => void;
+  const firstGroup = new Promise<void>(resolve => { signalStarted = resolve; });
+  const pending = new Promise<void>(resolve => { release = resolve; });
+  const client = {
+    ...clientFor([], [page([])]),
+    lookupRelationshipRecords: async (names: string[]): Promise<CloudKitLookupResult> => {
+      const index = started++;
+      if (started === 4) signalStarted();
+      if (index === 0) throw new AppError("UPSTREAM_UNAVAILABLE", "Synthetic read failure.");
+      await pending;
+      if (index === 1) throw new AppError("REAUTH_REQUIRED", "Synthetic authentication failure.");
+      return { requestedRecordNames: names, records: [], unresolvedRecordNames: [], complete: false,
+        recordErrors: names.map(recordName => ({ recordName, serverErrorCode: "NOT_FOUND", reason: null, raw: {} })) };
+    },
+  };
+  const inspection = requireNoChildren(client, owner, inventory, parent.recordName);
+  const completion = inspection.then(() => { settled = true; }, error => { settled = true; throw error; });
+  await firstGroup;
+  assert.equal(started, 4); assert.equal(settled, false);
+  release();
+  await assert.rejects(completion, hasCode("REAUTH_REQUIRED"));
+  assert.equal(started, 4); assert.equal(settled, true);
+});
+
 test("child inspection covers completed descendants and refuses incomplete, cycling, erroneous and oversized pages", async () => {
   const completeChild = { ...child, fields: { ...child.fields, Completed: { type: "INT64", value: 1 } } };
   await assert.rejects(requireNoChildren(clientFor([parent, completeChild], [page([parent], "next"), page([completeChild])]), owner, list, parent.recordName), hasCode("UNSUPPORTED_FEATURE"));

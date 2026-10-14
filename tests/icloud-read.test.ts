@@ -6,8 +6,9 @@ import { encodeDocument } from "../src/reminders/crdt.ts";
 import { omitField } from "../src/lib/omit-field.ts";
 import { matchesReminderSearch, SearchFilters } from "../src/reminders/search.ts";
 import { AppError } from "../src/errors.ts";
-import { CloudKitRateLimitedError, CloudKitRemindersClient, normalizeList, normalizeReminder, type CloudKitConnection } from "../src/icloud/cloudkit.ts";
+import { CloudKitRateLimitedError, CloudKitRemindersClient, normalizeList, normalizeReminder, normalizeReminderRelationships, type CloudKitConnection } from "../src/icloud/cloudkit.ts";
 import { normalizeReminderTag, normalizeURLAttachment } from "../src/reminders/organization.ts";
+import { toolError } from "../src/mcp/results.ts";
 
 const connection: CloudKitConnection = {
   dsid: "123456789",
@@ -70,6 +71,82 @@ function reminderRecord(title: string) {
     },
   };
 }
+
+test("membership failures expose only bounded shape diagnostics and distinguish size limits from malformed data", () => {
+  const privateValue = "synthetic-private-membership";
+  const cases = [
+    { field: { type: privateValue, value: privateValue }, code: "PROTOCOL_CHANGED", fieldType: "OTHER", stringLength: privateValue.length, jsonShape: "not_inspected", arrayLength: null },
+    { field: { type: "STRING", value: 42 }, code: "PROTOCOL_CHANGED", fieldType: "STRING", stringLength: null, jsonShape: "not_inspected", arrayLength: null },
+    { field: { type: "STRING", value: privateValue }, code: "PROTOCOL_CHANGED", fieldType: "STRING", stringLength: privateValue.length, jsonShape: "invalid", arrayLength: null },
+    { field: { type: "STRING", value: JSON.stringify({ [privateValue]: true }) }, code: "PROTOCOL_CHANGED", fieldType: "STRING", stringLength: JSON.stringify({ [privateValue]: true }).length, jsonShape: "object", arrayLength: null },
+    { field: { type: "STRING", value: "25" }, code: "PROTOCOL_CHANGED", fieldType: "STRING", stringLength: 2, jsonShape: "scalar", arrayLength: null },
+    { field: { type: "STRING", value: JSON.stringify([{}]) }, code: "PROTOCOL_CHANGED", fieldType: "STRING", stringLength: 4, jsonShape: "array", arrayLength: 1 },
+    { field: { type: "STRING", value: " ".repeat(131_073) }, code: "UNSUPPORTED_FEATURE", fieldType: "STRING", stringLength: 131_073, jsonShape: "not_inspected", arrayLength: null },
+    { field: { type: "STRING", value: JSON.stringify(Array(2001).fill("REM-1")) }, code: "UNSUPPORTED_FEATURE", fieldType: "STRING", stringLength: JSON.stringify(Array(2001).fill("REM-1")).length, jsonShape: "array", arrayLength: 2001 },
+  ];
+  for (const { field, code, ...diagnostics } of cases) {
+    const record = { ...listRecord(), raw: {}, fields: { ...listRecord().fields, ReminderIDs: field } };
+    let failure: unknown;
+    try { normalizeList(record); } catch (error) { failure = error; }
+    assert.ok(failure instanceof AppError);
+    const result = toolError(failure);
+    assert.equal(result.isError, true);
+    assert.equal(result.structuredContent.error_code, code);
+    assert.equal(result.structuredContent.error.code, code);
+    assert.equal(result.structuredContent.error.retryable, false);
+    assert.deepEqual(result.structuredContent.error.membershipDiagnostics, diagnostics);
+    assert.deepEqual(JSON.parse(result.content[0].text), result.structuredContent);
+    assert.equal(JSON.stringify(result).includes(privateValue), false);
+    assert.equal(normalizeList(record, false).reminderIds, null);
+  }
+  for (const value of [undefined, null, "[]", '["REM-1","Reminder/REM-2"]']) {
+    const record = { ...listRecord(), raw: {}, fields: { ...listRecord().fields, ReminderIDs: { type: "STRING", value } } };
+    assert.deepEqual(normalizeList(record).reminderIds, value == null ? null : value === "[]" ? [] : ["Reminder/REM-1", "Reminder/REM-2"]);
+  }
+  const ids = Array.from({ length: 1822 }, () => crypto.randomUUID());
+  const membership = JSON.stringify(ids);
+  assert.equal(membership.length, 71_059);
+  const record = { ...listRecord(), raw: {}, fields: { ...listRecord().fields, ReminderIDs: { type: "STRING", value: membership } } };
+  assert.deepEqual(normalizeList(record).reminderIds, ids.map(id => `Reminder/${id}`));
+});
+
+test("relationship inventory query and lookup project parent links without reminder documents", async () => {
+  const projected = { ...reminderRecord("Synthetic large document"), recordChangeTag: "relationship-version" };
+  const reply = (request: CapturedRequest) => {
+    assert.deepEqual(request.body.desiredKeys, ["List", "ParentReminder", "Deleted"]);
+    if (request.url.pathname.endsWith("/records/query")) {
+      const query = request.body.query as { recordType: string; filterBy: { fieldName: string }[] };
+      assert.equal(query.recordType, "Reminder");
+      assert.deepEqual(query.filterBy.map(field => field.fieldName), ["List"]);
+    }
+    return { records: [{ ...projected, fields: { List: projected.fields.List, Deleted: { type: "INT64", value: 0 },
+      ParentReminder: { type: "REFERENCE", value: { recordName: "Reminder/PARENT", action: "VALIDATE" } } } }] };
+  };
+  const { api, requests } = clientWith([{ body: reply }, { body: reply }]);
+  const page = await api.queryRemindersPage({ listId: "List/LIST-A", includeCompleted: true, limit: 100, projection: "relationships" });
+  const found = await api.lookupRelationshipRecords(["Reminder/REM-1"]);
+  assert.equal(page.complete, true); assert.equal(found.complete, true);
+  for (const record of [page.records[0], found.records[0]]) {
+    assert.ok("recordType" in record);
+    assert.equal(record.fields.TitleDocument, undefined);
+    assert.equal(normalizeReminder(record).parentReminderId, "Reminder/PARENT");
+    assert.equal(record.recordChangeTag, "relationship-version");
+  }
+  await assert.rejects(api.lookupRelationshipRecords(["List/LIST-A"]), error => error instanceof AppError && error.code === "VALIDATION_ERROR");
+  assert.equal(requests.length, 2);
+});
+
+test("relationship inspection ignores unrelated audit/document formats but validates native links and deletion state", () => {
+  const record = { ...reminderRecord("Synthetic"), raw: { created: { timestamp: "unclassified-audit-date" } },
+    fields: { ...reminderRecord("Synthetic").fields, Deleted: { type: "INT64", value: 0 }, TitleDocument: { type: "STRING", value: "unclassified-document" } } };
+  assert.throws(() => normalizeReminder(record), AppError);
+  assert.deepEqual(normalizeReminderRelationships(record, "__defaultOwner__"), { id: record.recordName, listId: "List/LIST-A", deleted: false, parentReminderId: null });
+  const detached = { ...record, fields: { ...record.fields, List: { type: "REFERENCE", value: null } } };
+  assert.throws(() => normalizeReminderRelationships(detached, "__defaultOwner__"), AppError);
+  assert.equal(normalizeReminderRelationships({ ...detached, fields: { ...detached.fields, Deleted: { type: "INT64", value: 1 } } }, "__defaultOwner__").deleted, true);
+  const foreign = { ...record, fields: { ...record.fields, ParentReminder: { type: "REFERENCE", value: { recordName: "Reminder/PARENT", action: "VALIDATE", zoneID: { zoneName: "Reminders", ownerRecordName: "foreign" } } } } };
+  assert.throws(() => normalizeReminderRelationships(foreign, "__defaultOwner__"), AppError);
+});
 
 test("Reminders zone discovery and list query use the pinned private CloudKit request shape", async () => {
   const { api, requests } = clientWith([
