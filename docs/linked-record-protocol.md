@@ -537,3 +537,20 @@ Recurrence edits, date clearing and all-day conversion keep the stricter ordinar
 rule reader; this preservation recipe does not enable those operations or other
 unverified `SetPositions` patterns. Rejected payloads identify a field path or an
 identity mismatch without disclosing private account metadata or payload values.
+
+## Explicit ordinary-month marker
+
+A read-only inspection on 15 October 2026 identified a native absolute-date trigger
+containing `isLeapMonth: false` alongside the existing Gregorian date/time fields.
+The previous strict decoder rejected this extra field before a date move could be
+prepared. Apple's Foundation documentation defines the flag as whether the month
+is a leap month: <https://developer.apple.com/documentation/foundation/datecomponents/isleapmonth>.
+
+The decoder now accepts only an absent marker or Boolean `false`. A true marker,
+null, numeric/string substitutes, unknown fields and other calendar semantics
+remain unsupported. Date-pair comparisons account for the marker, and date moves
+and fresh active/history pairs preserve its explicit presence alongside an optional
+zero nanosecond. The due date, stored time zone, exact backlinks, resolution nonce
+and version checks are unchanged. Synthetic Worker acceptance covers a date move
+and interval-two completion with this marker, including lost-acknowledgement
+reconciliation. No live Apple mutation is implied by the read-only observation.

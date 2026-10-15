@@ -1,6 +1,6 @@
 {
   "d1": "DB",
-  "r2": null,
+  "r2": "BUCKET",
   "capabilities": [
     "mcp"
   ]

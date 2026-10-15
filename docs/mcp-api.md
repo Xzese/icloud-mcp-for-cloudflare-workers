@@ -623,14 +623,19 @@ active-series deletion recipes below. Independent history instead uses its suppo
 ordinary lifecycle recipe. Early reminders are excluded except for the exact completion-only
 monthly recipe below; that exception does not authorize recurring deletion or reopening.
 
-- **Timed weekly:** childless interval-one root in its stored IANA zone, zero or one supported
-  absolute-date pair. A supported end must be on an exact weekly occurrence and local clock.
+Completion supports intervals **1–999** for the recipes below, using calendar days, weeks
+or months and preserving the rule. This does not add hourly/yearly completion or arbitrary
+day patterns. An ended all-day daily rule must end on the same interval cadence; unsupported
+ends fail before dispatch. Recurring deletion retains its separate interval-one recipes.
+
+- **Timed weekly:** childless root in its stored IANA zone, zero or one supported
+  absolute-date pair. A supported end must be on an exact occurrence on its interval cadence and local clock.
   Earlier occurrences advance with history; the final completes/reopens in place.
-- **Timed daily completion:** non-ended childless interval-one root in its stored IANA
+- **Timed daily completion:** non-ended childless root in its stored IANA
   zone with exactly one absolute-date pair. Advancement preserves the local clock across
   daylight-saving changes; missing or repeated next local times are refused. Active-series
   reopening, ended completion and timed daily deletion require separate evidence.
-- **All-day daily:** childless interval-one root at midnight UTC, without stored zone/alarms.
+- **All-day daily:** childless root at midnight UTC, without stored zone/alarms.
   Inclusive end interpretation without
   `recurrenceCalendarTimeZone` requires a midnight-UTC end. With an explicit valid IANA zone,
   the raw end instant is interpreted as that zone's calendar date, even when the instant is
@@ -639,17 +644,17 @@ monthly recipe below; that exception does not authorize recurring deletion or re
   without stored zone/alarms, using the observed no-end rule with native month days
   `[28,29,30,31]` and set position `[-1]`, advancing actual month ends and creating history.
   This is distinct from an arbitrary monthly recurrence or a guessed hidden anchor.
-- **Ordinary timed monthly:** a childless no-end interval-one monthly rule without
-  explicit day, weekday, month or set-position patterns advances one calendar month
+- **Ordinary timed monthly:** a childless no-end monthly rule without
+  explicit day, weekday, month or set-position patterns advances its interval in calendar months
   from its current due date. A native date edit from the 13th to the 18th therefore
-  advances to the 18th of the following month. It requires a stored IANA zone and
+  advances to the 18th of the target month. It requires a stored IANA zone and
   one absolute date pair; either no early alert or the supported one-day early
   alert is accepted. Local clock, active identity and rule are preserved, with
   independent completed history at the old due date. Missing month days and
   ambiguous/missing local times are refused rather than guessing a fallback.
   This follows the owner's native Monthly/date-edit observation; it is distinct
   from an explicit calendar day pattern.
-- **Timed monthly with one-day early alert:** the observed no-end interval-one rule with
+- **Timed monthly with one-day early alert:** the observed no-end rule with
   native month days `[28,29]` and set position `[-1]`, a stored IANA zone, exactly one
   absolute-date pair and one early alert of one day. Final selection chooses
   day 29, falling back to February 28 in nonleap years. A moved earlier occurrence may

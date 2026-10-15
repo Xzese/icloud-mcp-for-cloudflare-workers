@@ -24,6 +24,7 @@ test("local Drive relay accepts only the existing metadata and signed content UR
 test("signed content headers preserve multipart framing without forwarding Apple credentials", () => {
   const headers = localAppleContentHeaders({
     "Content-Type": "multipart/form-data; boundary=synthetic-boundary",
+    "Content-Length": "2147483904",
     Cookie: "synthetic-apple-cookie",
     Authorization: "synthetic-apple-authorization",
     "Proxy-Authorization": "synthetic-proxy-authorization",
@@ -32,10 +33,16 @@ test("signed content headers preserve multipart framing without forwarding Apple
   });
   assert.equal(headers.get("content-type"), "multipart/form-data; boundary=synthetic-boundary");
   assert.equal(headers.get("accept"), "application/json");
+  assert.equal(headers.get("content-length"), "2147483904");
   assert.equal(headers.has("cookie"), false);
   assert.equal(headers.has("authorization"), false);
   assert.equal(headers.has("proxy-authorization"), false);
   assert.equal(headers.has("x-apple-session-id"), false);
+});
+
+test("local signed-content framing refuses malformed or oversized declared lengths", () => {
+  for (const length of ["-1", "12.5", "abc", "9007199254740992", String(2 * 1024 ** 3 + 16_385)])
+    assert.throws(() => localAppleContentHeaders({ "content-length": length }), /invalid declared length/);
 });
 
 test("local content relay preserves validated range framing and 330 destinations", () => {

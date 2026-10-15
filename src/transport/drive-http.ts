@@ -1,3 +1,4 @@
+import { retainVerifiedUploadBody } from "./drive-upload-socket.ts";
 import { AppError } from "../errors.ts";
 import type { AppleHTTP } from "./apple-http.ts";
 import { DRIVE_FILE_BYTES, DRIVE_TRANSFER_TIMEOUT_MS } from "../drive/limits.ts";
@@ -97,6 +98,21 @@ export interface DriveByteRange { start: number; end: number; total?: number; }
 const READ_RETRY_STATUSES = new Set([408, 429, 500, 502, 503, 504]);
 const METADATA_BUDGET_MS = 8000;
 
+export function uploadResponseDiagnostics(headers: Headers, bytes: Uint8Array = new Uint8Array()) {
+  const server = (headers.get("server") ?? "").toLowerCase();
+  const type = (headers.get("content-type") ?? "").toLowerCase();
+  const text = new TextDecoder().decode(bytes).toLowerCase();
+  // Classifications only: error pages may echo signed URLs or account IDs.
+  // Never return header values, body fragments, or arbitrary upstream codes.
+  return { responseServer: server.startsWith("applehttpserver") ? "apple" : server === "cloudflare" ? "cloudflare" : server.startsWith("nginx") ? "nginx" : server ? "other" : "missing",
+    responseFormat: type.includes("json") ? "json" : type.includes("html") ? "html" : type ? "other" : "missing",
+    responseHasCloudflareRay: headers.has("cf-ray"), responseHasVia: headers.has("via"),
+    responseMentionsQuota: /quota|storage.{0,16}(?:full|limit|exceed)/.test(text),
+    responseMentionsSize: /too large|entity.{0,8}large|body.{0,16}(?:limit|exceed)|max.{0,16}(?:size|length)|size.{0,16}(?:limit|exceed)/.test(text),
+    responseMentionsCloudflare: text.includes("cloudflare"),
+  };
+}
+
 function delayFor(headers: Headers, attempt: number): number {
   const raw = headers.get("retry-after");
   if (raw !== null) {
@@ -169,8 +185,9 @@ export class DriveHTTP {
     } finally { clearTimeout(timer); init.signal?.removeEventListener("abort", cancel); }
   }
 
-  async download(urlValue: string, signal?: AbortSignal, range?: DriveByteRange): Promise<Response> {
+  async download(urlValue: string, signal?: AbortSignal, range?: DriveByteRange, expectedSize?: number): Promise<Response> {
     let url = driveContentURL(urlValue, "download");
+    if (expectedSize !== undefined && (!Number.isSafeInteger(expectedSize) || expectedSize < 0 || expectedSize > DRIVE_MAX_TRANSFER_BYTES)) throw new AppError("VALIDATION_ERROR", "The expected Drive file size is invalid.", 400);
     if (range && (!Number.isSafeInteger(range.start) || !Number.isSafeInteger(range.end) || range.start < 0 || range.end < range.start || range.end >= DRIVE_MAX_TRANSFER_BYTES)) throw new AppError("VALIDATION_ERROR", "The Drive byte range is invalid.", 400);
     const budget = timeoutSignal(signal), deadline = Date.now() + METADATA_BUDGET_MS;
     const visited = new Set([url.href]);
@@ -179,7 +196,7 @@ export class DriveHTTP {
       let response: Response;
       for (;;) {
         if (budget.signal.aborted) throw budget.signal.reason;
-        const headers = new Headers({ Accept: "*/*", ...(range ? { Range: `bytes=${range.start}-${range.end}` } : {}) });
+        const headers = new Headers({ Accept: "*/*", "Accept-Encoding": "identity", ...(range ? { Range: `bytes=${range.start}-${range.end}` } : {}) });
         try { response = await this.http.send(url, { method: "GET", headers, redirect: "manual", signal: budget.signal }); }
         catch (error) {
           if (error instanceof AppError || budget.signal.aborted || attempt >= 2 || Date.now() + 250 * 2 ** attempt >= deadline) throw error;
@@ -210,17 +227,30 @@ export class DriveHTTP {
         await response.body?.cancel();
         throw new AppError(response.status === 429 ? "RATE_LIMITED" : "UPSTREAM_UNAVAILABLE", "The iCloud Drive file content could not be downloaded.", response.status === 429 ? 429 : 502, READ_RETRY_STATUSES.has(response.status));
       }
-      const limit = range ? range.end - range.start + 1 : DRIVE_MAX_TRANSFER_BYTES;
+      const limit = range ? range.end - range.start + 1 : expectedSize ?? DRIVE_MAX_TRANSFER_BYTES;
       const length = response.headers.get("content-length");
       try {
         if (range) {
           const match = /^bytes (\d+)-(\d+)\/(\d+)$/.exec(response.headers.get("content-range") ?? "");
           if (response.status !== 206 || !match || Number(match[1]) !== range.start || Number(match[2]) !== range.end || !Number.isSafeInteger(Number(match[3])) || Number(match[3]) <= range.end || Number(match[3]) > DRIVE_MAX_TRANSFER_BYTES || range.total !== undefined && Number(match[3]) !== range.total) protocol("Apple returned a different or unsupported download byte range.");
         } else if (response.status === 206 || response.headers.has("content-range")) protocol("Apple returned an unsolicited partial download.");
-        if (length !== null && (!/^\d+$/.test(length) || Number(length) > limit || range && Number(length) !== limit)) protocol("The iCloud Drive file exceeded its transfer byte budget or range.");
+        if (length !== null && (!/^\d+$/.test(length) || Number(length) > limit || (range || expectedSize !== undefined) && Number(length) !== limit)) protocol("The iCloud Drive file exceeded its transfer byte budget or range.");
       } catch (error) { await response.body?.cancel(); throw error; }
-      if (!response.body) { budget.dispose(); return new Response(null, { status: response.status, headers: safeContentHeaders(response.headers) }); }
-      return new Response(boundedStream(response.body, limit, budget.signal, budget.dispose), { status: response.status, headers: safeContentHeaders(response.headers) });
+      const exactLength = range ? limit : expectedSize;
+      const framedLength = length !== null ? Number(length) : exactLength;
+      if (!response.body) {
+        if ((framedLength ?? 0) > 0) protocol("Apple returned no bytes for a nonempty file.");
+        budget.dispose(); return new Response(null, { status: response.status, headers: safeContentHeaders(response.headers) });
+      }
+      if (framedLength !== undefined && typeof FixedLengthStream === "function") {
+        // Keep the native network stream native. A JS pull for each small CDN
+        // chunk exhausted hosted CPU on multi-gigabyte downloads. Fixed framing
+        // enforces the declared bound and preserves native BYOB bulk reads.
+        const fixed = new FixedLengthStream(framedLength);
+        void response.body.pipeTo(fixed.writable, { signal: budget.signal }).catch(() => {}).finally(budget.dispose);
+        return new Response(fixed.readable, { status: response.status, headers: safeContentHeaders(response.headers) });
+      }
+      return new Response(boundedStream(response.body, limit, budget.signal, budget.dispose, exactLength), { status: response.status, headers: safeContentHeaders(response.headers) });
     } catch (error) {
       budget.dispose();
       if (error instanceof AppError) throw error;
@@ -231,51 +261,111 @@ export class DriveHTTP {
   async upload(urlValue: string, dsid: string, body: ReadableStream<Uint8Array>, expectedSize: number, filename: string, contentType: string, signal?: AbortSignal): Promise<Uint8Array> {
     const url = driveContentURL(urlValue, "upload", dsid);
     if (!Number.isSafeInteger(expectedSize) || expectedSize < 0 || expectedSize > DRIVE_MAX_TRANSFER_BYTES) throw new AppError("VALIDATION_ERROR", "The upload size is outside the supported byte budget.");
-    const boundary = `----iCloudDrive${crypto.randomUUID().replace(/-/g, "")}`;
-    const escapedName = filename.replace(/\\/g, "\\\\").replace(/"/g, "\\\"");
-    const prefix = new TextEncoder().encode(`--${boundary}\r\nContent-Disposition: form-data; name="${escapedName}"; filename="${escapedName}"\r\nContent-Type: ${contentType}\r\n\r\n`);
-    const suffix = new TextEncoder().encode(`\r\n--${boundary}--\r\n`);
-    let total = 0;
+    if (!filename || /[\u0000-\u001f\u007f]/.test(filename) || !/^[a-zA-Z0-9!#$&^_.+-]+\/[a-zA-Z0-9!#$&^_.+-]+$/.test(contentType)) throw new AppError("VALIDATION_ERROR", "The upload filename or content type is invalid.");
+    let total = 0, complete = false;
+    let sourceFailure: unknown;
+    let stopped: { reason: unknown } | undefined, cancellation: Promise<void> | undefined;
     const reader = body.getReader();
-    const multipart = new ReadableStream<Uint8Array>({
-      start(controller) { controller.enqueue(prefix); },
+    const stop = (reason: unknown) => {
+      if (complete) return Promise.resolve();
+      stopped ??= { reason };
+      return cancellation ??= reader.cancel(stopped.reason).catch(() => {});
+    };
+    const checkStopped = () => { if (stopped) throw stopped.reason; };
+    const raw = new ReadableStream<Uint8Array>({
       async pull(controller) {
         try {
           const chunk = await reader.read();
+          // cancel() resolves pending reads as EOF. That is transport cleanup,
+          // not evidence that the caller supplied a truncated file.
+          checkStopped();
           if (chunk.done) {
             if (total !== expectedSize) throw new AppError("VALIDATION_ERROR", "The upload stream length did not match its declared size.");
-            controller.enqueue(suffix);
             controller.close();
+            complete = true;
             reader.releaseLock();
             return;
           }
           total += chunk.value.byteLength;
           if (total > expectedSize || total > DRIVE_MAX_TRANSFER_BYTES) throw new AppError("VALIDATION_ERROR", "The upload stream exceeded its declared byte budget.");
+          if (total === expectedSize) {
+            // A fixed-length consumer can stop pulling at exactly Content-Length.
+            // Verify EOF (including the caller's final hash check) before releasing
+            // the final bytes, so an early receipt cannot bypass verification.
+            const end = await reader.read();
+            checkStopped();
+            if (!end.done) throw new AppError("VALIDATION_ERROR", "The upload stream exceeded its declared byte budget.");
+            complete = true;
+            reader.releaseLock();
+            controller.enqueue(chunk.value);
+            controller.close();
+            return;
+          }
           controller.enqueue(chunk.value);
         } catch (error) {
-          await reader.cancel(error).catch(() => {});
+          if (!stopped) sourceFailure ??= error;
+          await stop(error);
           controller.error(error);
         }
       },
-      async cancel(reason) { await reader.cancel(reason).catch(() => {}); },
+      cancel: stop,
     });
     const budget = timeoutSignal(signal);
+    // Apple's current web client posts the native File bytes, without multipart
+    // form framing. Workers needs FixedLengthStream to preserve Content-Length
+    // on streaming fetch bodies without buffering the file.
+    const length = expectedSize;
+    let framed = raw;
+    const pumpAbort = new AbortController();
+    let pump: Promise<void> | undefined, framingFailed = false;
+    if (typeof FixedLengthStream === "function") {
+      const fixed = new FixedLengthStream(length);
+      pump = raw.pipeTo(fixed.writable, { signal: pumpAbort.signal });
+      void pump.catch(() => { framingFailed = true; });
+      framed = fixed.readable;
+    }
+    const releaseBodyProof = retainVerifiedUploadBody(framed, length, () => complete);
+    let stage: "request" | "response" | "completion" = "request", upstreamStatus: number | null = null;
+    let responseDiagnostic: ReturnType<typeof uploadResponseDiagnostics> | undefined;
+    let failure: AppError | undefined;
     try {
-      const response = await this.http.send(url, { method: "POST", headers: { "Content-Type": `multipart/form-data; boundary=${boundary}`, Accept: "application/json" }, body: multipart, redirect: "manual", signal: budget.signal, duplex: "half" } as RequestInit);
+      if (budget.signal.aborted) throw new AppError("CONFLICT", "The iCloud Drive upload was cancelled before dispatch.", 409);
+      const response = await this.http.send(url, { method: "POST", headers: { "Content-Type": contentType, "Content-Length": String(length), Accept: "application/json" }, body: framed, redirect: "manual", signal: budget.signal, duplex: "half" } as RequestInit);
+      stage = "response"; upstreamStatus = response.status;
+      responseDiagnostic = uploadResponseDiagnostics(response.headers);
       if ([301, 302, 303, 307, 308].includes(response.status)) {
         await response.body?.cancel();
         throw new AppError("PROTOCOL_CHANGED", "The iCloud Drive upload server requested a redirect.");
       }
       if (response.status < 200 || response.status >= 300) {
-        await response.body?.cancel();
+        const diagnosticBudget = new AbortController();
+        const diagnosticTimer = setTimeout(() => diagnosticBudget.abort(), 2000);
+        try { responseDiagnostic = uploadResponseDiagnostics(response.headers, await readBounded(response, 8192, AbortSignal.any([budget.signal, diagnosticBudget.signal]))); }
+        catch { /* The original HTTP rejection remains authoritative. */ }
+        finally { clearTimeout(diagnosticTimer); await response.body?.cancel().catch(() => {}); }
         throw new AppError("UPSTREAM_UNAVAILABLE", "The iCloud Drive upload server rejected the content transfer.", 502, false);
       }
-      return await readBounded(response, DRIVE_MAX_METADATA_BYTES, budget.signal);
+      const receipt = await readBounded(response, DRIVE_MAX_METADATA_BYTES, budget.signal);
+      stage = "completion";
+      if (!complete) throw new AppError("PROTOCOL_CHANGED", "The upload server responded before consuming the complete upload body.");
+      await pump;
+      return receipt;
     } catch (error) {
-      await reader.cancel(error).catch(() => {});
-      if (error instanceof AppError) throw error;
-      throw new AppError("UPSTREAM_UNAVAILABLE", "The iCloud Drive upload could not complete within its transfer budget.", 503, true);
-    } finally { budget.dispose(); }
+      const cause = sourceFailure ?? error;
+      failure = cause instanceof AppError ? cause : new AppError("UPSTREAM_UNAVAILABLE", "The iCloud Drive upload could not complete within its transfer budget.", 503, false);
+      // Numeric counters and fixed codes only. Signed URLs, raw fetch errors,
+      // filenames, Apple receipts and request headers remain private.
+      console.error({ event: "drive-upload-failed", stage: sourceFailure ? "source" : stage, upstreamStatus,
+        bytesRead: total, expectedSize, requestBodySize: length, sourceComplete: complete, framingFailed, aborted: budget.signal.aborted, code: failure.code, ...responseDiagnostic });
+      throw failure;
+    } finally {
+      releaseBodyProof();
+      await stop(failure ?? new AppError("CONFLICT", "The upload transport finished before its source.", 409));
+      pumpAbort.abort(failure);
+      await pump?.catch(() => {});
+      try { reader.releaseLock(); } catch { /* The source may already be released. */ }
+      budget.dispose();
+    }
   }
 }
 
@@ -288,7 +378,7 @@ function safeContentHeaders(headers: Headers): Headers {
   return safe;
 }
 
-function boundedStream(source: ReadableStream<Uint8Array>, max: number, signal: AbortSignal, dispose: () => void): ReadableStream<Uint8Array> {
+function boundedStream(source: ReadableStream<Uint8Array>, max: number, signal: AbortSignal, dispose: () => void, exactLength?: number): ReadableStream<Uint8Array> {
   const reader = source.getReader();
   let total = 0;
   let ended = false;
@@ -314,7 +404,10 @@ function boundedStream(source: ReadableStream<Uint8Array>, max: number, signal: 
       }
       try {
         const next = await reader.read();
-        if (next.done) { ended = true; reader.releaseLock(); finish(); controller.close(); return; }
+        if (next.done) {
+          if (exactLength !== undefined && total !== exactLength) throw new AppError("PROTOCOL_CHANGED", "The Apple download ended before its expected size.");
+          ended = true; reader.releaseLock(); finish(); controller.close(); return;
+        }
         total += next.value.byteLength;
         if (total > max) {
           await reader.cancel().catch(() => {});

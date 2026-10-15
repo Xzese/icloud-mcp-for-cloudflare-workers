@@ -96,7 +96,7 @@ export async function inspectReminder(client: CloudKitRemindersClient, current: 
     const locations = inspectLocationAlarms(graph, owner);
     if (locations.locations.length) schedule.locationAlarm = locationSummary(locations.locations[0].trigger);
     if (normalizeReminder(locations.dateGraph.reminder, owner).alarmIds?.length) {
-      if (reminder.parentReminderId === null && !locations.dateGraph.schedulingParent && schedule.recurrence?.frequency === "monthly" && schedule.recurrence.interval === 1 && schedule.recurrence.endDate === null &&
+      if (reminder.parentReminderId === null && !locations.dateGraph.schedulingParent && schedule.recurrence?.frequency === "monthly" && schedule.recurrence.endDate === null &&
         ((JSON.stringify(schedule.recurrence.monthDays) === "[28,29]" && JSON.stringify(schedule.recurrence.setPositions) === "[-1]" &&
           schedule.earlyReminder?.unit === "days" && schedule.earlyReminder.count === 1) ||
           (!schedule.recurrence.monthDays && !schedule.recurrence.weekdays && !schedule.recurrence.ordinalWeekday && !schedule.recurrence.months && !schedule.recurrence.setPositions &&

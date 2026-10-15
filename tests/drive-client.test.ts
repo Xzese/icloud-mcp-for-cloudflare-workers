@@ -146,9 +146,7 @@ test("Drive download streams bounded bytes without forwarding the Apple cookie",
   const emptyResponse = makeClient((url) => url.hostname === "p01-docws.icloud.com"
     ? json({ data_token: { url: syntheticDownloadURL() } })
     : new Response(null, { status: 200, headers: { "content-type": "application/octet-stream" } }));
-  const noBody = await emptyResponse.download({ id: file.drivewsid, documentId: file.docwsid, zone: "com.apple.CloudDocs", name: "note.txt", type: "file", etag: file.etag, size: 3, parentId: folder.drivewsid, modifiedAt: null });
-  assert.equal(noBody.body, null);
-  assert.equal(noBody.headers.get("content-type"), "application/octet-stream");
+  await assert.rejects(emptyResponse.download({ id: file.drivewsid, documentId: file.docwsid, zone: "com.apple.CloudDocs", name: "note.txt", type: "file", etag: file.etag, size: 3, parentId: folder.drivewsid, modifiedAt: null }), { code: "PROTOCOL_CHANGED" });
 
   const limit = 64 * 1024 * 1024, chunk = new Uint8Array(64 * 1024).fill(65);
   let remaining = limit, requests = 0;
@@ -167,8 +165,8 @@ test("Drive download streams bounded bytes without forwarding the Apple cookie",
   assert.equal(await sha256Stream(largeResponse.body!), expected.digest("hex"));
   assert.equal(remaining, 0);
   const beforeOversize = requests;
-  await assert.rejects(largeClient.download({ ...largeItem, size: limit + 1 }), { code: "UNSUPPORTED_FEATURE" });
-  assert.equal(requests, beforeOversize, "64 MiB plus one is refused before contacting Apple");
+  await assert.rejects(largeClient.download({ ...largeItem, size: 2 * 1024 ** 3 + 1 }), { code: "UNSUPPORTED_FEATURE" });
+  assert.equal(requests, beforeOversize, "2 GiB plus one is refused before contacting Apple");
 });
 
 test("streamed browser hashing handles empty files, split bytes and source failures", async () => {
@@ -199,12 +197,12 @@ test("synthetic create, upload, finalize, rename and move journey uses observed 
       const headers = new Headers(init.headers);
       assert.equal(headers.has("cookie"), false);
       assert.equal(headers.has("authorization"), false);
-      assert.match(headers.get("content-type") ?? "", /^multipart\/form-data; boundary=/);
+      assert.equal(headers.get("content-type"), "application/octet-stream");
+      assert.equal(headers.get("content-length"), "0");
       const reader = (init.body as ReadableStream<Uint8Array>).getReader();
       let body = "";
       for (;;) { const part = await reader.read(); if (part.done) break; body += new TextDecoder().decode(part.value); }
-      assert.match(body, /name="empty\.bin"; filename="empty\.bin"/);
-      assert.match(body, /Content-Type: application\/octet-stream\r\n\r\n\r\n--/);
+      assert.equal(body, "");
       return json({ singleFile: { referenceChecksum: "synthetic-reference", size: 0, fileChecksum: "synthetic-checksum", wrappingKey: "synthetic-wrap", receipt: "synthetic-receipt" } });
     }
     if (url.pathname.endsWith("update/documents")) {

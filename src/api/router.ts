@@ -11,6 +11,9 @@ import { z } from "zod";
 import { ServiceSettingsRepository } from "../persistence/service-settings.ts";
 import { ServiceSettingsSchema } from "../services/settings.ts";
 import { DriveService } from "../drive/service.ts";
+import { probeDriveContentSocket } from "../transport/drive-socket-probe.ts";
+import { driveUploadSocket } from "../drive/upload-socket.ts";
+import { authorizeDriveTransfer, driveTransferRoute } from "../drive/transfer-capability.ts";
 import { DriveConsent, INLINE_REQUEST_BYTES, INLINE_UPLOAD_GUIDANCE } from "../drive/schemas.ts";
 
 async function readJSON(request: Request, limit = 12_288): Promise<unknown> {
@@ -19,12 +22,28 @@ async function readJSON(request: Request, limit = 12_288): Promise<unknown> {
   catch { throw new AppError("VALIDATION_ERROR", "Provide a valid JSON request.", 400); }
 }
 
-const json = (data: unknown, status = 200) => Response.json(data, { status, headers: { "cache-control": "private, no-store", "x-content-type-options": "nosniff" } });
+const json = (data: unknown, status = 200) => Response.json(data, { status, headers: { "cache-control": "private, no-store", "x-content-type-options": "nosniff", "x-robots-tag": "noindex, nofollow, noarchive, nosnippet", "referrer-policy": "no-referrer" } });
 export async function applicationRoute(request: Request, env: RuntimeEnv, credentialJS?: string): Promise<Response | null> {
   const path = new URL(request.url).pathname;
   if (path !== "/mcp" && path !== "/connect/apple" && !path.startsWith("/api/")) return null;
   const requestId = crypto.randomUUID();
   try {
+    const transfer = driveTransferRoute(path);
+    if (transfer) {
+      const claim = await authorizeDriveTransfer(request, env, transfer);
+      const service = new DriveService(env, claim.owner);
+      if (transfer.kind === "upload" && request.headers.get("x-drive-transfer-action") === "diagnose") {
+        await service.streamUploadStatus(claim.id, claim);
+        return json(await probeDriveContentSocket());
+      }
+      const response = transfer.kind === "upload"
+        ? await driveUploadSocket(request, env, service, claim.id, claim)
+        : await service.downloadContent(claim.id, request.signal, request.headers.get("range"), claim);
+      response.headers.set("X-Robots-Tag", "noindex, nofollow, noarchive, nosnippet");
+      response.headers.set("Referrer-Policy", "no-referrer");
+      response.headers.set("Cache-Control", "private, no-store");
+      return response;
+    }
     if (path === "/api/bootstrap/identity" && request.method === "GET") {
       // An administrator can provision this exact site-scoped ID. Never claim it automatically.
       const user = request.headers.get("oai-authenticated-user-id");
@@ -45,6 +64,8 @@ export async function applicationRoute(request: Request, env: RuntimeEnv, creden
       return await handleMCP(request, env, owner);
     }
     if (request.method === "GET") {
+      const streamUpload = /^\/api\/drive\/uploads\/([a-f0-9-]{36})\/stream$/i.exec(path);
+      if (streamUpload) return await driveUploadSocket(request, env, new DriveService(env, owner), z.string().uuid().parse(streamUpload[1]).toLowerCase());
       if (path === "/api/settings") return json(await new ServiceSettingsRepository(env, owner).load());
       const download = /^\/api\/drive\/downloads\/([a-f0-9-]{36})$/i.exec(path);
       if (download) return await new DriveService(env, owner).downloadContent(z.string().uuid().parse(download[1]), request.signal, request.headers.get("range"));
@@ -58,16 +79,19 @@ export async function applicationRoute(request: Request, env: RuntimeEnv, creden
       }
     }
     if (request.method === "POST") {
+      const uploadPart = /^\/api\/drive\/uploads\/([a-f0-9-]{36})\/parts\/([1-9]\d{0,3})$/i.exec(path);
       const uploadContent = /^\/api\/drive\/uploads\/([a-f0-9-]{36})\/content$/i.exec(path);
-      if (uploadContent) {
+      if (uploadContent || uploadPart) {
         // Binary transfers retain the owner/origin checks without the JSON-only
         // content type restriction used by ordinary dashboard actions.
         if (!env.APP_ORIGIN || request.headers.get("origin") !== env.APP_ORIGIN || new URL(request.url).origin !== env.APP_ORIGIN) throw new AppError("FORBIDDEN", "Use the private application origin for uploads.", 403);
         if (request.headers.get("content-type") !== "application/octet-stream") throw new AppError("VALIDATION_ERROR", "Upload an application/octet-stream body.", 400);
         const body = request.body ?? new ReadableStream<Uint8Array>({ start(controller) { controller.close(); } });
-        return json(await new DriveService(env, owner).uploadContent(z.string().uuid().parse(uploadContent[1]), body, request.signal));
+        if (uploadPart) return json(await new DriveService(env, owner).uploadPart(z.string().uuid().parse(uploadPart[1]), Number(uploadPart[2]), request.headers.get("x-content-sha256") ?? "", body, request.signal));
+        return json(await new DriveService(env, owner).uploadContent(z.string().uuid().parse(uploadContent![1]), body, request.signal));
       }
       requireSameOrigin(request, env);
+      if (path === "/api/drive/complete-multipart-upload") return json(await new DriveService(env, owner).completeMultipartUpload(await readJSON(request), request.signal));
       if (path === "/api/settings") {
         const value = z.object({ expectedRevision: z.number().int().nonnegative().safe(), settings: ServiceSettingsSchema }).strict().safeParse(await readJSON(request));
         if (!value.success) throw new AppError("VALIDATION_ERROR", "Provide valid service preferences and their current revision.", 400);
@@ -79,7 +103,7 @@ export async function applicationRoute(request: Request, env: RuntimeEnv, creden
         const connection = new AppleConnectionService(env, owner);
         return json(await (path === "/api/drive/approve" ? connection.approveDrive(value.data.expectedGeneration, value.data.restartApproval) : connection.approveReminders(value.data.expectedGeneration, value.data.restartApproval)));
       }
-      const driveActions = { list: "list", lookup: "get", search: "search", traverse: "traverse", "resolve-folder-path": "resolveFolderPath", read: "read", download: "download", upload: "upload", "prepare-upload": "prepareUpload", "create-folder": "createFolder", rename: "rename", move: "move", operation: "operation" } as const;
+      const driveActions = { list: "list", lookup: "get", search: "search", traverse: "traverse", "resolve-folder-path": "resolveFolderPath", read: "read", download: "download", upload: "upload", "prepare-upload": "prepareUpload", "prepare-stream-upload": "prepareStreamUpload", "prepare-multipart-upload": "prepareMultipartUpload", "discard-multipart-upload": "discardMultipartUpload", "create-folder": "createFolder", rename: "rename", move: "move", operation: "operation" } as const;
       const driveAction = path.startsWith("/api/drive/") ? path.slice("/api/drive/".length) : "";
       if (Object.hasOwn(driveActions, driveAction)) {
         const method = driveActions[driveAction as keyof typeof driveActions];

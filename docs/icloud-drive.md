@@ -67,8 +67,10 @@ accepts folder names and returns an exact ID when it can verify every parent.
 | `traverse_icloud_drive` | Optional `folderId`, `shareContext`, `query`, `limit`, `maxItems`, `maxFolders`, `maxDepth`, `continuation` | Recursive `items` with `relativePath` and `depth`, `progress`, `complete`, `reasons`, cumulative `incompleteFolders`, next `continuation` |
 | `resolve_icloud_drive_folder_path` | `path`, optional starting `folderId` (Drive root by default), `shareContext` | `status`, `reason`, resolved `folder` or `choices`, `resolvedPath`, `remainingSegments`, `parentListing`, `foldersRead` |
 | `read_icloud_drive_file` | `itemId`, optional `shareContext`, optional `encoding`: `utf8` (default) or `base64`, optional `previewBytes`: 1–8192 for UTF-8 previews | `item`, `encoding`, `content`, `bytesRead`, `truncated` |
-| `download_icloud_drive_file` | `itemId`, optional `shareContext` | `item`, private `url`, `handleId`, `expiresAt` |
-| `upload_icloud_drive_file` | `parentId`, `name`, `operationId`, `size`, `sha256`, `contentBase64`, optional `contentType` | Operation status |
+| `prepare_icloud_drive_upload` | `parentId`, `name`, `operationId`, exact `size`, `sha256`, optional `contentType` | Metadata-only setup; absolute `transfer.url`, private `transfer.headers`, protocol, size and expiry |
+| `prepare_icloud_drive_download` | `itemId`, optional `shareContext` | Exact file version; absolute HTTPS `transfer.url`, private credential headers and expiry |
+| `download_icloud_drive_file` | `itemId`, optional `shareContext` | Exact `item`, single-use `transfer.url`, required `transfer.headers`, `handleId`, `expiresAt` |
+| `upload_icloud_drive_file` | `parentId`, `name`, `operationId`, `size`, `sha256`, optional `contentBase64` and `contentType` | Operation status; metadata-only calls include a scoped `transfer` plan |
 | `create_icloud_drive_folder` | `parentId`, `name`, `operationId` | Operation status |
 | `rename_icloud_drive_item` | `itemId`, current `etag`, `name`, `operationId` | Operation status |
 | `move_icloud_drive_item` | `itemId`, current `etag`, `destinationId`, `operationId` | Operation status |
@@ -212,7 +214,7 @@ when provider item IDs coincide.
 Content reads use Apple's owner-scoped download endpoint for indirectly shared files when
 Apple supplies an owner. Missing owner metadata fails explicitly instead of attempting an
 unscoped download. Supported package tokens download complete ZIP archives under the same
-64 MiB streamed-byte cap. Packages expose `package: true` when Apple identifies their type;
+2 GiB streamed-byte cap. Packages expose `package: true` when Apple identifies their type;
 inline reads, previews and range downloads are unavailable for archives. Shared access is read-only in this
 connector: uploads, folder creation, renames and moves involving shared items are refused.
 Successful path resolution never bypasses the complete destination listing required for
@@ -237,15 +239,68 @@ content downloads and `docws` fallback remain covered by synthetic tests rather 
 
 | Transfer | Limit | How |
 | --- | --- | --- |
-| MCP full read/upload | 64 KiB of decoded file bytes | UTF-8/base64 response or base64 upload input |
-| Text preview | Up to 8 KiB of leading UTF-8 bytes | Set `previewBytes` on the read tool/HTTP route; file must be within 64 MiB |
-| Dashboard/HTTP upload | 64 MiB | Prepare metadata, then stream binary bytes |
-| Private download | 64 MiB | Authenticated same-origin URL, single use, ten-minute lifetime |
+| MCP inline read/upload | 64 KiB of decoded file bytes | UTF-8/base64 response or base64 upload input |
+| MCP-authorized upload | 2 GiB | Metadata through MCP, then capability-authenticated WebSocket bytes without another login or R2 |
+| Text preview | Up to 8 KiB of leading UTF-8 bytes | Set `previewBytes` on the read tool/HTTP route; file must be within 2 GiB |
+| Direct HTTP upload | 64 MiB | Prepare metadata, then stream binary bytes |
+| Dashboard/multipart upload | 2 GiB | Stage 8 MiB parts in private R2, then stream to Apple |
+| Experimental direct stream | 2 GiB | Browser WebSocket relays bytes to Apple without R2; no byte resume |
+| Private download | 2 GiB | MCP returns a capability-authenticated URL and headers; single use, ten-minute lifetime |
 
-An MCP download result is an application-relative authenticated URL. It is not a public share
-link or an attachment automatically imported into ChatGPT. A client must retain the owner's
-deployment authentication to fetch it. If your MCP client cannot do that, use the dashboard
-download button. Never send Apple cookies or sign-in credentials as tool arguments.
+MCP is the authenticated control endpoint for both transfer directions. Upload metadata without
+`contentBase64` (or with an empty string for a nonempty file) authorizes an exact retained upload
+intent without sending file bytes to Apple. The returned `transfer` supplies an absolute WebSocket
+URL, subprotocol, required headers, size, checksum and expiry. A transfer client sends file bytes
+directly from disk/network to that endpoint. It needs neither a browser session nor another sign-in.
+The server requests exact binary frames of at most 8 MiB and returns a confirmed operation receipt.
+An interrupted stream cannot resume bytes; inspect the original operation through MCP and never
+automatically mint a replacement operation for an uncertain Apple write.
+
+For downloads, `prepare_icloud_drive_download` (or the compatible `download_icloud_drive_file`) authorizes an exact current item/version and returns
+an absolute HTTPS `transfer.url` plus `transfer.headers`. GET with those headers streams the file
+outside the conversation. The handle is consumed once; current item/version, permissions and account
+state must still match. Ordinary files have an exact `transfer.size`; package archives use null because
+their unpacked item size is not the ZIP byte length. The server still enforces the 2 GiB byte budget.
+Dashboard download URLs continue to require the signed-in browser.
+
+Each endpoint uses an independent random UUID, separate from the operation or download handle ID.
+Agents should use `prepare_icloud_drive_upload` to start a large transfer, rather than infer
+streaming support from the inline upload tool. Supply only metadata, not base64 file contents.
+A successful preparation returns a `wss://` upload endpoint and private headers; it does not
+upload the file. The transfer client follows the returned WebSocket protocol. For downloads,
+`prepare_icloud_drive_download` returns an `https://` endpoint for GET with its required headers.
+Neither flow needs an authenticated dashboard session. Existing upload/download tool names
+remain compatible, but a client with a cached catalog may need a refreshed or new session to
+see newly published tools. Do not guess route URLs or put credentials in chat.
+
+The UUID alone grants no access. An AES-256-GCM sealed bearer capability binds the configured
+owner and origin, Apple account/generation, permission revision, direction, original operation/handle,
+exact input fingerprint and expiry. Its authentication tag detects tampering; a separate HMAC is not
+needed. Upload bytes are independently checked against the authorized size and SHA-256 before
+finalization. Tokens appear only in headers, never URL query parameters. Responses deny caching,
+indexing, following, archives/snippets and referrers with `Cache-Control`, `X-Robots-Tag` and
+`Referrer-Policy`. The credentials, rather than crawler cooperation or URL secrecy, enforce access.
+Transfer capabilities are rejected by ordinary API/MCP routes and grant no Apple credentials.
+
+On a private ChatGPT Site, configure `DRIVE_TRANSFER_SITES_GATEWAY_TOKEN` as a runtime secret
+using the Site's existing service-access credential. MCP includes it as the additional
+`OAI-Sites-Authorization` header so the client can pass the platform privacy gate. This platform
+credential is broader than one transfer: it passes the Site gate but supplies no owner identity.
+The independent application capability is still required for each exact transfer; normal owner APIs
+remain closed. Treat **all** returned headers as credentials and keep them out of chat, files, logs
+and command arguments. Never forward them across redirects or origins. Do not rotate the platform
+credential or change the Site's audience merely to run a transfer. Standalone Workers verify these
+exact transfer routes independently of the normal Access JWT adapter; if Access also gates ingress,
+configure its path policy so only `/api/drive/transfers/upload/*` and `/api/drive/transfers/download/*`
+reach this capability verifier without an interactive Access session. All other routes retain Access.
+
+The repository includes `scripts/drive-transfer.mjs`. Run `metadata /absolute/file` to compute metadata,
+then call the upload MCP tool with those fields and an original operation UUID. Run
+`node scripts/drive-transfer.mjs upload /absolute/file` and supply the returned MCP structured result
+as one JSON line on hidden stdin. For the reverse direction, pass the download MCP result on stdin
+to `node scripts/drive-transfer.mjs download /absolute/new-file`. The client never follows redirects,
+overwrites existing local files, logs headers, or retries an Apple write automatically. It reports a
+download SHA-256 for verification. Never send Apple cookies or sign-in credentials as tool arguments.
 
 The dashboard can browse owned and shared folders, search names, preview text and download files.
 Folder creation and uploads are available in owned folders.
@@ -261,22 +316,132 @@ replaced. A preview validates only the decoded prefix and does not verify the un
 or full content length. Use an authenticated download for the complete file. Invalid UTF-8
 prefixes fail explicitly; base64 previews are not supported.
 
-Files above 64 MiB remain eligible for ordinary metadata browsing, search, rename and move,
+Files above 2 GiB remain eligible for ordinary metadata browsing, search, rename and move,
 but content reads, previews and transfers refuse them. The MCP JSON upload request budget is
 96 KiB to accommodate base64 and metadata; the file-byte cap remains 64 KiB. Oversized inline
-requests direct clients to dashboard Upload or the HTTP prepare-upload/binary flow.
+requests direct clients to a metadata-only MCP transfer, dashboard Upload or the HTTP binary flow.
 
 Uploads require exact byte size and lowercase SHA-256. The server verifies both before
-finalizing the new file. File bodies are streamed and are never persisted in D1. Metadata
-responses are bounded. Each content transfer has a five-minute timeout; upload operations
-have a six-minute exclusive lease, capped by the saved session deadline. The dashboard hashes
-file chunks before sending the file, without buffering the complete file for hashing.
-Downloads are attachments, with no caching or forwarded Apple response headers. Signed Apple
-URLs and upload receipts stay private.
+finalizing the new file. File bodies are never persisted in D1. Transfers have a 30-minute
+budget; the exclusive Apple upload lease lasts 31 minutes, capped by the saved session.
+The browser hashes files incrementally and never loads a complete large file into memory.
+Downloads are streamed attachments with exact Workers fixed-length framing, no caching,
+and no forwarded Apple credentials, signed URLs or private receipt fields.
+Full transfers coalesce small network chunks into at most 16 MiB authorization blocks.
+Before releasing each block, one primary D1 snapshot checks the pinned account/session version
+and permission revision. A changed session is decrypted and revalidated before any more bytes
+are released; a changed generation or revoked permission stops the transfer. This avoids
+per-socket-chunk queries while keeping a 2 GiB invocation below D1's 1,000-query paid limit.
+Text reads/previews retain 4 KiB blocks so a preview never consumes a large transfer block.
 
-The 64 MiB cap is 67,108,864 bytes, below Cloudflare Free/Pro’s 100 MB incoming-request
-limit. Other hosting platforms may impose different limits. These are streamed transfers,
-not bundled static assets. See [Cloudflare’s limits](https://developers.cloudflare.com/workers/platform/limits/).
+### Multi-gigabyte transfers on Workers and Sites
+
+The dashboard also offers **Stream file directly (experimental)**. This sends the browser's
+file through an authenticated, same-origin WebSocket into Apple's existing single-request
+upload. It creates no R2 object and works without a `BUCKET` binding. The existing Upload
+button retains resumable R2 staging.
+
+Direct streaming first hashes the file incrementally and saves its original operation UUID
+and metadata in tab-local session storage. `POST /api/drive/prepare-stream-upload` prepares a
+distinct `stream-upload` intent and returns its same-origin `socketPath`. Connect using
+WebSocket subprotocol `icloud-drive-upload-v2` (legacy v1 clients retain 1 MiB credits), with no query parameters. The server sends
+`{type:"pull", operationId, offset, bytes}` for each frame; send exactly the requested binary
+bytes (up to 8 MiB), once per credit. Credits follow consumption by the Apple upload stream,
+so the browser cannot queue the complete file in Worker memory. The existing 16 MiB
+authorization blocks, exact length/full SHA-256 checks and encrypted mutation ledger apply.
+Apple credentials, allocation URLs and private receipts remain server-side.
+
+The server returns `{type:"result", operationId, operation}` only after saving the result;
+errors use `{type:"failed", operationId, error}`. Keep the page open during streaming and
+finalization. A disconnect, malformed frame, checksum failure or uncertain Apple response
+retains the original operation ID and never automatically resends the Apple upload. Reselect
+the original file to recover only a safe allocated intent or a durably saved receipt. An
+`unknown`/`uploading`/`committing` outcome must first be inspected, not retried under a new key.
+This mode has no byte-level resume or durable file copy. WebSocket gateway behavior and live
+Apple transfers remain subject to live acceptance; local synthetic success does not prove them.
+
+Run `DRIVE_LARGE_TEST_TRANSPORT=stream npm run test:drive:large` after building either target
+for the 2 GiB direct-stream boundary journey without an R2 binding. Standard Worker journeys
+also cover malformed frames, disconnects and full-file checksum failures without unsafe replay.
+
+The current 2 GiB application ceiling matches the live-verified file size. Larger transfers
+are intentionally refused while their runtime limits remain unverified.
+Both targets use the same R2 `BUCKET` binding. Sites provisions it from the logical
+`r2: "BUCKET"` manifest entry. For standalone Workers, create a private R2 bucket and replace
+`bucket_name` in ignored `wrangler.production.toml`; the generator retains this binding.
+Existing metadata, downloads and direct uploads still work without R2. Multipart preparation
+fails with an actionable configuration error when the binding is missing.
+
+A large upload uses these authenticated, same-origin steps:
+
+1. Hash the file, retain one operation UUID, and POST metadata to
+   `/api/drive/prepare-multipart-upload`. The result includes `partBytes`, `uploadedParts`,
+   the operation phase and its expiry. No Apple allocation or mutation happens yet.
+2. POST each numbered part to `/api/drive/uploads/<operationId>/parts/<partNumber>` with
+   `Content-Type: application/octet-stream` and lowercase `X-Content-SHA256`. Every part is
+   exactly 8 MiB except the final part. Each request is bounded to one part, with a 60-second
+   receive deadline; it does not hold an Apple metadata lease while awaiting the client.
+3. Repeat preparation with the exact original metadata to resume after interruption. Parts
+   may arrive out of order. Replaying an acknowledged part with identical bytes is safe;
+   different bytes under an acknowledged number are refused. Account generation, settings
+   revision, exact size, full-file hash and intent remain pinned by the encrypted ledger.
+4. POST `{ "operationId": "<original UUID>" }` to `/api/drive/complete-multipart-upload`.
+   The server seals R2 and streams its object to Apple with backpressure and full SHA-256
+   verification before finalization. Keep the request connected. This Apple byte transfer
+   is a single request, not resumable Apple multipart. A timeout, crash or lost Apple
+   acknowledgment retains `unknown`; inspect the operation instead of starting a new key.
+
+The dashboard retains the original metadata and operation UUID in this tab's session storage.
+Reselect the same file in its original folder to resume staging after refresh. It reports
+part progress, preserves the operation ID on errors, and offers **Discard staged data**.
+The discard endpoint is `/api/drive/discard-multipart-upload`; it removes R2 data without
+replaying or erasing the retained Apple mutation receipt. Only a confirmed result clears
+staged bytes automatically. Completed Apple transfers can be replayed for their confirmed
+receipt without allocating, uploading or committing again.
+Discarding an uncertain Apple transfer keeps its browser record and reports that its outcome
+is unresolved. It does not silently issue a replacement operation ID. Invalid or unavailable
+browser storage fails explicitly before a new staged request is sent.
+
+Staging introduces a temporary server-side copy encrypted at rest by R2. Its private object
+key and multipart IDs remain in the encrypted operation envelope, never public responses.
+Staging shares the operation expiry (at most 24 hours, or the earlier Apple session deadline).
+New multipart preparations sweep up to 20 expired complete objects. R2 automatically aborts
+incomplete uploads after seven days; a crash can leave an orphan until then. On a standalone
+bucket, configure a one-day object expiration rule for `drive-staging/v1/` and an incomplete
+multipart cleanup rule. On Sites, explicit discard and request-driven sweeping work without
+bucket administration. If no requests arrive, expired complete objects can remain stored
+until the next sweep; authorization still refuses expired operations.
+
+Each incoming file request stays at 8 MiB, below Cloudflare's documented account-plan body
+limits; streaming a single giant incoming request would not bypass those limits. Outbound
+R2-to-Apple transfers and downloads do not buffer gigabytes into the 128 MB Worker isolate.
+Hashing still consumes CPU: provision a paid Workers plan and appropriate CPU allowance (for paid
+Workers, up to `limits.cpu_ms = 300000` in deployment configuration). Local workerd does not
+prove production CPU, bandwidth, gateway timeout or runtime-restart behavior. Sites does not
+publish a per-request transfer ceiling in its current documentation, so its live gateway and
+CPU limits must be tested separately. No external queue, cron or background service is required.
+
+For interrupted ordinary downloads, obtain a fresh handle and request one `Range`. Compare
+the returned item identity, etag and size with the original before appending bytes. A changed
+file must be restarted; each handle is single-use. The dashboard uses a native streaming
+browser download, not an in-memory Blob. Automatic browser resume to the same consumed URL
+is not supported. Package archives still require a complete transfer without byte ranges.
+
+References: [Workers limits](https://developers.cloudflare.com/workers/platform/limits/),
+[R2 multipart bindings](https://developers.cloudflare.com/r2/api/workers/workers-api-reference/#r2multipartupload-definition),
+[ChatGPT Sites storage and usage](https://learn.chatgpt.com/docs/sites?surface=web).
+
+Run `npm run test:drive:large` after building either target to exercise the complete **2 GiB**
+application boundary through real local workerd D1/R2 bindings and synthetic Apple endpoints.
+The fixture generates, streams and hashes bytes incrementally, verifies the complete
+upload/download SHA-256, checks final-byte ranges, safe part replay, durable resume, confirmed
+replay and R2 cleanup. The earlier 2 GiB plus 17-byte journey passed before the application cap
+was lowered; requests above the current limit are now explicitly rejected before Apple dispatch.
+Unit coverage additionally streams a fragmented 2 GiB download under a 1,000-query budget.
+Set `DRIVE_LARGE_TEST_BYTES` to a smaller size to shorten a diagnostic run. The standard bundle
+journeys also exercise a smaller actual R2 multipart transfer on both targets. These synthetic
+tests never contact Apple. The live 2 GiB upload and complete matching download recorded below
+provide the separate production evidence.
 
 ## HTTP API
 
@@ -292,11 +457,17 @@ owner authentication; knowing a handle does not grant access.
 | `/api/drive/list`, `/lookup`, `/search`, `/traverse`, `/resolve-folder-path`, `/read`, `/download` | POST corresponding tool input |
 | `/api/drive/upload`, `/create-folder`, `/rename`, `/move`, `/operation` | POST corresponding tool input |
 | `/api/drive/prepare-upload` | POST upload metadata without `contentBase64`; returns `operationId`, `uploadPath` |
+| `/api/drive/prepare-stream-upload` | POST upload metadata; returns `operationId`, `phase`, `socketPath` for direct streaming |
+| `/api/drive/uploads/<operationId>/stream` | GET WebSocket upgrade, same origin and `icloud-drive-upload-v1` subprotocol; binary frames only on server credit |
 | `/api/drive/uploads/<operationId>/content` | POST raw bytes, `Content-Type: application/octet-stream`, configured application `Origin` |
+| `/api/drive/prepare-multipart-upload` | POST upload metadata; returns phase, part size and acknowledged part numbers |
+| `/api/drive/uploads/<operationId>/parts/<partNumber>` | POST one binary part with `X-Content-SHA256` and configured application `Origin` |
+| `/api/drive/complete-multipart-upload`, `/discard-multipart-upload` | POST `{operationId, expectedGeneration?}` |
 | `/api/drive/downloads/<handleId>` | GET a prepared download once |
 
-For large uploads, compute the digest first, retain the operation UUID, prepare the metadata,
-and POST the bytes to `uploadPath`. Do not invent another UUID after a timeout. Application
+For direct uploads up to 64 MiB, compute the digest first, retain the operation UUID, prepare
+the metadata, and POST the bytes to `uploadPath`. For larger files use the multipart flow above.
+Do not invent another UUID after a timeout. Application
 errors contain sanitized codes/messages and a request ID; inspect operation status for recovery.
 
 ## Read recovery and download compatibility
@@ -317,7 +488,7 @@ Private download GETs accept one HTTP `Range: bytes=start-end`, open-ended, or s
 They return 206 with an exact `Content-Range` and validate Apple's range and total against the
 pinned file metadata. Invalid/unsatisfiable ranges return 416; package ranges are refused.
 Each request consumes its download handle, including invalid ranges: request a fresh handle
-for each part or retry. Files still must fit the 64 MiB file cap. Apple servers that ignore the
+for each part or retry. Files still must fit the 2 GiB file cap. Apple servers that ignore the
 range fail explicitly instead of returning different bytes.
 
 Only Apple's nonstandard 330 content redirect is followed, with at most three hops, loop
@@ -507,3 +678,69 @@ five-file folder complete, with five one-item pages and no parent refetch, and m
 root's incomplete counts to its direct listing. Drive and Reminders stayed ready and no Apple
 data writes were made. No names, identities or file contents were logged. Package archives,
 shared-context retention beyond ten minutes and induced upstream failures remain synthetic-only.
+
+## Diagnosing an interrupted direct upload
+
+`DRIVE_LARGE_TEST_NETWORK=1 DRIVE_LARGE_TEST_TRANSPORT=stream npm run test:drive:large`
+adds a real local HTTP server behind the production Worker and the local relay's header
+filter. Apple's content service receives a raw binary POST with the file's content type
+and byte length, matching the current iCloud web client. It receives no form boundary or
+filename framing. The final bytes are withheld until EOF and the full input integrity check
+have passed. It verifies that the raw file request has the exact `Content-Length`
+and is not silently converted to chunked encoding. The local Apple relay preserves this
+validated framing while stripping account cookies and authorization headers.
+
+Add `DRIVE_LARGE_TEST_DELAY_MS=1500` to pause the synthetic receiver after each 32 MiB,
+exercising backpressure and a transfer longer than the previous live failure. The payload
+remains 2 GiB unless `DRIVE_LARGE_TEST_BYTES` is explicitly set. Use
+`DRIVE_LARGE_TEST_FAULT=reject` or `early-success` for a peer returning 413 or a premature
+200; the upload must remain uncertain, perform no document commit, and refuse a second
+transfer under the original operation ID. These tests never contact Apple.
+
+For uploads above 64 MiB, the production transfer client uses Cloudflare's supported TLS
+socket API to post the same raw HTTP/1.1 request directly to the validated Apple content
+host. This avoids the hosted HTTP fetch path that returned a Cloudflare 413 during the
+live 2 GiB test. TLS certificate verification stays enabled. The sender accepts only Apple
+content-upload hosts and paths, sends no account cookies, bounds and validates the receipt's
+HTTP framing, and never retries or switches transport after dispatch. Account/settings
+checks and full SHA-256 verification still run on the same streamed bytes. Workers uses
+its native `crypto.DigestStream` for incremental hashing; JavaScript hashing exceeded the
+hosted 32-second CPU budget during a live transfer near 1 GiB. A portable incremental
+fallback remains for runtimes without DigestStream. Native BYOB bulk reads avoid JavaScript
+work per small CDN chunk. Version-two WebSocket credits use 8 MiB frames; version-one
+clients retain their 1 MiB frame support. Permission checks use byte windows
+without copying incoming chunks into aggregate buffers; this avoids the CPU cost that also
+interrupted a live download. Incoming WebSocket Blob frames pipe into a native fixed-length
+stream, and the verified outgoing stream pipes directly to the TLS socket. This avoids
+materializing those network bytes in JavaScript a second time. The sender still withholds
+the final file chunk until exact EOF and the full digest pass. R2 completion uses this
+same sender.
+
+`DRIVE_UPLOAD_TRANSPORT=fetch` explicitly selects the ordinary fetch transport for a runtime
+whose egress accepts the full file size. The synthetic Worker harness uses this setting to
+route to its fake Apple HTTP server; a separate socket sender test checks exact raw framing
+and SHA-256 at the 2 GiB limit. The capability-protected upload URL accepts
+`X-Drive-Transfer-Action: diagnose` without a WebSocket upgrade for a read-only, fixed Apple
+HEAD probe of TLS socket availability. The probe never allocates or uploads a file.
+
+The transport cancels a pending source read when the request fails. Cancellation is not
+normal EOF and must not be reported as a caller-supplied length mismatch. Original source
+failures, including permission revocation, survive a wrapping fetch error. Successful HTTP
+headers alone cannot accept an unconsumed body. Cleanup stops the upload pump and source
+on every outcome; mutation requests are never automatically repeated.
+
+Failure diagnostics contain a fixed stage/code, upstream status when available, expected
+size, source bytes read, completion/abort/framing flags, and fixed response classifications
+(server family, response format, quota/size wording and proxy-header presence). Source bytes read and browser
+progress are not acknowledgements that Apple received those bytes. Signed content URLs,
+headers, filenames, account identifiers and receipt fields are excluded. In particular,
+the previous live 2 GiB attempt's last 512 MiB browser progress report does not establish
+an Apple or Sites size cutoff. Its original operation remains uncertain; synthetic passes
+do not establish that the original live cause has been resolved.
+
+The 2026-10-15 live transfer check confirmed a real 2 GiB file through MCP authorization
+and the private Site transfer endpoint. The native pipeline used approximately 9.3 seconds
+of Worker CPU, below the observed 32-second hosted ceiling. This is live evidence for
+the current 2 GiB application maximum for uploads. A full download matched the original
+SHA-256. Larger files are intentionally refused for now; hosting CPU and transfer-time
+limits will need further validation before raising this cap.

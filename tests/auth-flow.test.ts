@@ -179,16 +179,22 @@ test("Apple sign-in sends a lowercase account identifier in preflight and both S
   assert.equal((harness.requests[3].body as { accountName: string }).accountName, srp.account);
 });
 
-test("Apple account security locks accept numeric or string codes and stop before verification or persistence", async () => {
+test("Apple security rejections identify the failed step without requiring recovery or repeating the proof", async () => {
   for (const code of [-20209, "-20209"]) {
-    const harness = scriptedHTTP([{ body: {} }, { body: { federated: false } }, { body: challenge }, { status: 403, body: { serviceErrors: [{ code, message: "private account detail" }] } }]);
-    const flow = new AppleSignInFlow(harness.http, new AbortController().signal, async () => { assert.fail("A locked account must not persist a session."); });
-    await flow.start(startMessage);
-    await assert.rejects(flow.advance(proofMessage), (error: any) => error.code === "UNSUPPORTED_AUTH" &&
-      error.message.includes("account security lock") && !error.message.includes("private account detail"));
-    assert.equal(harness.requests.length, 4);
-    await assert.rejects(flow.advance(proofMessage), (error: any) => error.code === "RESTART_REQUIRED");
-    assert.equal(harness.requests.length, 4);
+    const prefix: Reply[] = [{ body: {} }, { body: { federated: false } }, { body: challenge }];
+    const steps = ["sign-in initialization", "account preflight", "password challenge", "password verification"];
+    for (const [index, step] of steps.entries()) {
+      const harness = scriptedHTTP([...prefix.slice(0, index), { status: 403, body: { serviceErrors: [{ code, message: "private account detail" }] } }]);
+      const flow = new AppleSignInFlow(harness.http, new AbortController().signal, async () => { assert.fail("A rejected sign-in must not persist a session."); });
+      const attempt = async () => { await flow.start(startMessage); await flow.advance(proofMessage); };
+      await assert.rejects(attempt(), (error: any) => error.code === "UNSUPPORTED_AUTH" &&
+        error.message.includes(`during ${step} (security response -20209)`) &&
+        error.message.includes("If a fresh sign-in at iCloud.com works with the same Apple Account, account recovery may not be needed") &&
+        !error.message.includes("private account detail") && !error.message.includes(srp.account));
+      assert.equal(harness.requests.length, index + 1);
+      await assert.rejects(flow.advance(proofMessage), (error: any) => error.code === "RESTART_REQUIRED");
+      assert.equal(harness.requests.length, index + 1);
+    }
   }
 });
 

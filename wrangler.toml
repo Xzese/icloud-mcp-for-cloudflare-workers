@@ -15,6 +15,11 @@ binding = "DB"
 database_name = "icloud-reminders"
 database_id = "replace-with-your-d1-database-id"
 
+# Optional for metadata/reads; required for resumable uploads above 64 MiB.
+[[r2_buckets]]
+binding = "BUCKET"
+bucket_name = "replace-with-your-private-staging-bucket"
+
 [vars]
 TEAM_DOMAIN = "https://your-team.cloudflareaccess.com"
 POLICY_AUD = "replace-with-your-access-application-aud"

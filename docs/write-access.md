@@ -53,7 +53,7 @@ nonrecurring families use the composite recipe described above. A lost
 acknowledgement returns uncertainty; the original stale arguments cannot dispatch again.
 Read the exact reminder and related records before considering a different action.
 
-Recurring completion has separate root-only recipes: interval-one timed weekly recurrence
+Recurring completion supports intervals 1–999 through separate root-only recipes: timed weekly recurrence
 in an IANA zone, with zero or one absolute date alarm; non-ended timed daily recurrence in
 a stored IANA zone with exactly one absolute-date pair; all-day daily recurrence without a
 stored time zone; and the observed all-day last-day monthly rule. Calendar advancement
@@ -128,8 +128,9 @@ active graph directly. Ended weekly retirement changes only the current Rule/pai
 Deleted markers, retains their backlinks and due/end fields, and creates no new
 pair or history. The five-record recipe/terminal intent preserves earlier layouts.
 
-An all-day daily interval-one root without a stored time zone or alarms supports an inclusive
-end calendar date. Omitting `recurrenceCalendarTimeZone` retains the midnight-UTC end recipe
+An all-day daily root without a stored time zone or alarms supports an inclusive
+end calendar date. Completion and final reopening support intervals 1–999 when that end
+aligns with the interval cadence; deletion retains its interval-one recipe. Omitting `recurrenceCalendarTimeZone` retains the midnight-UTC end recipe
 and refuses nonmidnight instants. Supplying an explicit IANA zone interprets the raw `EndDate`
 instant as a Gregorian calendar date in that zone, including when the instant is midnight UTC.
 The all-day due date remains a UTC calendar label. The connector never infers this zone or

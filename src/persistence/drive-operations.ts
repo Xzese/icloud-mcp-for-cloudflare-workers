@@ -5,6 +5,7 @@ import { fingerprint } from "../lib/canonical.ts";
 import type { RuntimeEnv } from "../platform/sites.ts";
 import { DRIVE_UPLOAD_LEASE_MS } from "../drive/limits.ts";
 import { DriveSharedContext } from "../drive/shared.ts";
+import { UploadStaging, type UploadStagingData } from "../drive/staging.ts";
 
 export interface DriveScope { account: string; generation: number; permissionRevision: number; expiresAt: number; }
 export type DrivePhase = "prepared" | "allocating" | "allocated" | "uploading" | "uploaded" | "committing" | "confirmed" | "unknown" | "failed";
@@ -13,9 +14,9 @@ export interface DriveOperation {
   input_hash: string; kind: string; phase: DrivePhase; revision: number; lease_id: string | null;
   lease_until: number; expires_at: number; envelope: string | null;
 }
-export interface DriveOperationData { input: Record<string, unknown>; allocation?: unknown; receipt?: unknown; result?: unknown; itemId?: string; }
+export interface DriveOperationData { input: Record<string, unknown>; allocation?: unknown; receipt?: unknown; result?: unknown; itemId?: string; staging?: UploadStagingData; }
 const EnvelopeSchema = z.object({ version: z.literal(1), keyId: z.string(), iv: z.string(), ciphertext: z.string() }).strict();
-const DataSchema = z.object({ input: z.record(z.unknown()), allocation: z.unknown().optional(), receipt: z.unknown().optional(), result: z.unknown().optional(), itemId: z.string().optional() }).strict();
+const DataSchema = z.object({ input: z.record(z.unknown()), allocation: z.unknown().optional(), receipt: z.unknown().optional(), result: z.unknown().optional(), itemId: z.string().optional(), staging: UploadStaging.optional() }).strict();
 const conflict = () => new AppError("CONFLICT", "The Drive operation changed or is already running. Inspect its operation ID before retrying.", 409);
 const canonicalOperationId = (value: string) => {
   const parsed = z.string().uuid().safeParse(value);
@@ -84,7 +85,7 @@ export class DriveOperationRepository {
     if (row.permission_revision !== scope.permissionRevision) throw new AppError("CONFLICT", "Service settings changed after this operation began. Inspect the retained operation; do not replay it.", 409);
     const now = Date.now(), lease = crypto.randomUUID();
     const next = await this.db.prepare("UPDATE drive_operations SET lease_id = ?, lease_until = ?, revision = revision + 1 WHERE owner_id = ? AND operation_id = ? AND revision = ? AND lease_until <= ? AND expires_at > ? RETURNING *")
-      .bind(lease, Math.min(now + (row.kind === "upload" ? DRIVE_UPLOAD_LEASE_MS : 150_000), row.expires_at), this.owner, row.operation_id, row.revision, now, now).first<DriveOperation>();
+      .bind(lease, Math.min(now + (["upload", "stream-upload"].includes(row.kind) ? DRIVE_UPLOAD_LEASE_MS : 150_000), row.expires_at), this.owner, row.operation_id, row.revision, now, now).first<DriveOperation>();
     if (!next) throw conflict();
     return next;
   }

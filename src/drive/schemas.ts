@@ -3,7 +3,7 @@ import { INLINE_FILE_BYTES, TEXT_PREVIEW_BYTES, DRIVE_FILE_BYTES, DRIVE_FILE_LIM
 import { SharedContextId } from "./shared.ts";
 export { INLINE_FILE_BYTES, TEXT_PREVIEW_BYTES, INLINE_REQUEST_BYTES, DRIVE_FILE_BYTES } from "./limits.ts";
 
-export const INLINE_UPLOAD_GUIDANCE = `Inline uploads allow at most 64 KiB of file bytes. Use dashboard Upload or /api/drive/prepare-upload followed by its authenticated binary uploadPath for files up to ${DRIVE_FILE_LIMIT_LABEL}.`;
+export const INLINE_UPLOAD_GUIDANCE = `Inline uploads allow at most 64 KiB of file bytes. For files up to ${DRIVE_FILE_LIMIT_LABEL}, omit contentBase64 (or pass an empty string for a nonempty file) to authorize a direct transfer and receive its short-lived URL and headers. Stream bytes to that endpoint without another browser sign-in. The dashboard Upload and authenticated multipart HTTP flow remain available.`;
 export const OwnedDriveId = z.string().max(512).regex(/^(?:FOLDER|FILE)::com\.apple\.CloudDocs::[A-Za-z0-9._-]{1,256}$/)
   .describe("Exact owned item ID returned by Drive listing; never a local path or URL.");
 export const DriveId = z.string().max(512).regex(/^(?:(?:FOLDER|FILE)(?:_IN_SHARED_FOLDER)?|SHARED_FOLDER)::com\.apple\.CloudDocs::[A-Za-z0-9._-]{1,256}$/)
@@ -40,11 +40,14 @@ export const DownloadDrive = GetDriveItem;
 export const CreateDriveFolder = z.object({ ...common, parentId: OwnedDriveId, name: DriveName, operationId: OperationId.describe("Stable operation key; retain after uncertain outcomes.") }).strict();
 export const RenameDriveItem = z.object({ ...common, itemId: OwnedDriveId, etag: z.string().min(1).max(512), name: DriveName, operationId: OperationId }).strict();
 export const MoveDriveItem = z.object({ ...common, itemId: OwnedDriveId, etag: z.string().min(1).max(512), destinationId: OwnedDriveId, operationId: OperationId }).strict();
-export const UploadDriveMetadata = z.object({ ...common, parentId: OwnedDriveId, name: DriveName, operationId: OperationId,
-  size: z.number().int().nonnegative().max(DRIVE_FILE_BYTES), sha256: z.string().regex(/^[a-f0-9]{64}$/),
+export const UploadDriveMetadata = z.object({ ...common, parentId: OwnedDriveId, name: DriveName, operationId: OperationId.describe("Stable UUID for this exact file and destination. Retain it and the original metadata after an uncertain outcome."),
+  size: z.number().int().nonnegative().max(DRIVE_FILE_BYTES).describe(`Exact original file size in bytes, up to ${DRIVE_FILE_LIMIT_LABEL}; not the base64 length.`),
+  sha256: z.string().regex(/^[a-f0-9]{64}$/).describe("Lowercase SHA-256 of every original file byte. Compute it locally; never invent a digest."),
   contentType: z.string().max(128).regex(/^[a-zA-Z0-9!#$&^_.+-]+\/[a-zA-Z0-9!#$&^_.+-]+$/).default("application/octet-stream"),
 }).strict();
-export const UploadDrive = UploadDriveMetadata.extend({ size: z.number().int().nonnegative().max(INLINE_FILE_BYTES, INLINE_UPLOAD_GUIDANCE),
-  contentBase64: z.string().max(Math.ceil(INLINE_FILE_BYTES / 3) * 4, INLINE_UPLOAD_GUIDANCE) });
+export const UploadDrive = UploadDriveMetadata.extend({
+  contentBase64: z.string().max(Math.ceil(INLINE_FILE_BYTES / 3) * 4, INLINE_UPLOAD_GUIDANCE).optional()
+    .describe("Inline bytes up to 64 KiB. Omit, or pass an empty string for a nonempty file, to prepare a capability-authorized streaming transfer instead."),
+});
 export const GetDriveOperation = z.object({ ...common, operationId: OperationId }).strict();
 export const DriveConsent = z.object({ expectedGeneration: z.number().int().nonnegative().safe(), restartApproval: z.boolean().optional() }).strict();

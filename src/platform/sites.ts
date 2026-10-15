@@ -1,6 +1,7 @@
 import { AppError, requireValue } from "../errors.ts";
 export interface RuntimeEnv {
   DB?: D1Database;
+  BUCKET?: R2Bucket;
   REMINDERS_OWNER_ID?: string;
   APP_ORIGIN?: string;
   ENCRYPTION_KEY_ID?: string;
@@ -12,6 +13,8 @@ export interface RuntimeEnv {
   APPLE_SESSION_RENEWAL_ENABLED?: string;
   APPLE_SESSION_CHECK_INTERVAL_MS?: string;
   LOCAL_REMINDER_EVIDENCE_ENABLED?: string;
+  DRIVE_TRANSFER_SITES_GATEWAY_TOKEN?: string;
+  DRIVE_UPLOAD_TRANSPORT?: "fetch" | "tls";
 }
 export function requireOwner(request: Request, env: RuntimeEnv): string {
   // The Sites dispatcher or standalone Access adapter must authenticate and

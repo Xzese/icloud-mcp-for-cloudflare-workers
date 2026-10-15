@@ -10,6 +10,7 @@ import { Envelopes } from "../../src/crypto/envelopes.ts";
 import { loginAssurance } from "../../src/auth/apple/policy.ts";
 import { DRIVE_ROOT } from "../../src/icloud/drive.ts";
 import { DEFAULT_SERVICE_SETTINGS } from "../../src/services/settings.ts";
+import { verifyMultipartDrive } from "./drive-large.mjs";
 
 const root = resolve(new URL("../..", import.meta.url).pathname);
 const origin = "https://drive-private.example.test";
@@ -40,6 +41,12 @@ async function bytesOf(stream) {
 }
 
 export async function verifyDrive(options) {
+  await verifyMultipartDrive(options);
+  await verifyMultipartDrive(options, { transport: "stream" });
+  await verifyMultipartDrive(options, { transport: "stream", legacyProtocol: true });
+  await verifyMultipartDrive(options, { transport: "stream", capability: true });
+  await verifyMultipartDrive(options, { transport: "stream", capability: true, fault: "disconnect" });
+  for (const fault of ["disconnect", "frame", "checksum"]) await verifyMultipartDrive(options, { transport: "stream", fault });
   const secret = randomBytes(32).toString("base64");
   const payloadBytes = randomBytes(300 * 1024);
   payloadBytes.fill(65, 0, 8192); // A valid text prefix; the preview never validates its unread suffix.
@@ -99,7 +106,8 @@ export async function verifyDrive(options) {
       try {
         body = await bytesOf(request.body);
         binaryOffset = Buffer.from(body).indexOf(Buffer.from(payloadBytes.subarray(0, 32)));
-        assert.notEqual(binaryOffset, -1, "the multipart transfer body must be consumed and contain the exact uploaded bytes");
+        assert.equal(binaryOffset, 0, "The raw transfer starts with the file bytes");
+        assert.equal(body.length, payloadBytes.length, "The raw upload has no form framing");
         assert.ok(binaryOffset + payloadBytes.length <= body.length);
         assert.ok(Buffer.from(body.subarray(binaryOffset, binaryOffset + payloadBytes.length)).equals(Buffer.from(payloadBytes)));
         observedUpload = { byteLength: body.length, fileByteLength: payloadBytes.length, fileHash: createHash("sha256").update(body.subarray(binaryOffset, binaryOffset + payloadBytes.length)).digest("hex") };
@@ -144,6 +152,7 @@ export async function verifyDrive(options) {
       ...options,
       name: "drive-acceptance",
       d1Persist: false,
+      r2Buckets: ["BUCKET"], r2Persist: false,
       d1Databases: { DB: "drive-acceptance-db" },
       bindings: {
         ...options.bindings,
@@ -221,7 +230,23 @@ export async function verifyDrive(options) {
     assert.equal(sharedPage.folder.shareContext, sharedItem.shareContext);
     assert.equal(JSON.stringify(sharedPage).includes("private-docws"), false);
 
-    const limitIntent = { operationId: randomUUID(), parentId: DRIVE_ROOT, name: "limit-boundary.bin", size: 64 * 1024 * 1024, sha256: "a".repeat(64), contentType: "application/octet-stream" };
+    const catalog = (await mcp("tools/list", {})).result.tools;
+    const uploadTool = catalog.find(tool => tool.name === "prepare_icloud_drive_upload");
+    const downloadTool = catalog.find(tool => tool.name === "prepare_icloud_drive_download");
+    assert.ok(uploadTool && downloadTool, "explicit transfer tools are registered, permitted and exported");
+    assert.equal(uploadTool.inputSchema.properties.size.maximum, 2 ** 31);
+    assert.equal(Object.hasOwn(uploadTool.inputSchema.properties, "contentBase64"), false);
+    assert.ok(uploadTool.outputSchema.properties.transfer);
+    const preparedTransfer = await mcp("tools/call", { name: "prepare_icloud_drive_upload", arguments: {
+      operationId: randomUUID(), parentId: DRIVE_ROOT, name: "metadata-only.bin", size: 2 ** 31, sha256: "a".repeat(64),
+    } });
+    assert.equal(preparedTransfer.result.isError, undefined, JSON.stringify(preparedTransfer));
+    assert.equal(preparedTransfer.result.structuredContent.phase, "prepared");
+    assert.match(preparedTransfer.result.structuredContent.transfer.url, /^wss:\/\//);
+    assert.ok(preparedTransfer.result.structuredContent.transfer.headers.Authorization);
+    assert.deepEqual([allocations, transfers, finalizations], [0, 0, 0], "MCP preparation sends no file bytes or write to Apple");
+
+    const limitIntent = { operationId: randomUUID(), parentId: DRIVE_ROOT, name: "limit-boundary.bin", size: 2 * 1024 ** 3, sha256: "a".repeat(64), contentType: "application/octet-stream" };
     const acceptedLimit = await request("/api/drive/prepare-upload", { method: "POST", body: JSON.stringify(limitIntent) });
     assert.equal(acceptedLimit.status, 200);
     const rejectedLimit = await request("/api/drive/prepare-upload", { method: "POST", body: JSON.stringify({ ...limitIntent, operationId: randomUUID(), size: limitIntent.size + 1 }) });
@@ -280,16 +305,17 @@ export async function verifyDrive(options) {
     assert.equal(getCall.result.structuredContent.item.documentId, uploadedDocId);
     assert.equal(getCall.result.structuredContent.item.etag, "synthetic-upload-etag");
 
-    const preparedDownload = await mcp("tools/call", { name: "download_icloud_drive_file", arguments: { expectedGeneration: generation, itemId: typedItem.id } });
+    const preparedDownload = await mcp("tools/call", { name: "prepare_icloud_drive_download", arguments: { expectedGeneration: generation, itemId: typedItem.id } });
     assert.equal(preparedDownload.result.structuredContent.item.documentId, uploadedDocId);
-    assert.equal(preparedDownload.result.structuredContent.url, `/api/drive/downloads/${preparedDownload.result.structuredContent.handleId}`);
+    assert.match(preparedDownload.result.structuredContent.url, /\/api\/drive\/transfers\/download\/[a-f0-9-]{36}$/);
     assert.equal(JSON.stringify(preparedDownload.result.structuredContent).includes("icloud-content"), false);
-    const downloadResponse = await request(preparedDownload.result.structuredContent.url);
+    const delegated = (value, range) => worker.dispatchFetch(value.url, { headers: { ...value.transfer.headers, ...(range ? { range } : {}) } });
+    const downloadResponse = await delegated(preparedDownload.result.structuredContent);
     assert.equal(downloadResponse.status, 200);
     assert.equal(downloadResponse.headers.get("set-cookie"), null);
     assert.match(downloadResponse.headers.get("content-disposition"), /attachment/);
     assert.ok(Buffer.from(await downloadResponse.arrayBuffer()).equals(Buffer.from(payloadBytes)));
-    assert.equal((await request(preparedDownload.result.structuredContent.url)).status, 409, "download handles are single-use");
+    assert.equal((await delegated(preparedDownload.result.structuredContent)).status, 409, "download handles are single-use");
     assert.equal(downloads, 1);
 
     const oversizedRead = await mcp("tools/call", { name: "read_icloud_drive_file", arguments: { expectedGeneration: generation, itemId: typedItem.id } });
@@ -305,14 +331,14 @@ export async function verifyDrive(options) {
 
     const rangeHandle = await mcp("tools/call", { name: "download_icloud_drive_file", arguments: { itemId: typedItem.id } });
     redirectDownload = true;
-    const rangeResponse = await request(rangeHandle.result.structuredContent.url, { range: "bytes=2-5" });
+    const rangeResponse = await delegated(rangeHandle.result.structuredContent, "bytes=2-5");
     assert.equal(rangeResponse.status, 206);
     assert.equal(rangeResponse.headers.get("content-range"), `bytes 2-5/${payloadBytes.length}`);
     assert.ok(Buffer.from(await rangeResponse.arrayBuffer()).equals(Buffer.from(payloadBytes.subarray(2, 6))));
-    assert.equal((await request(rangeHandle.result.structuredContent.url, { range: "bytes=2-5" })).status, 409);
+    assert.equal((await delegated(rangeHandle.result.structuredContent, "bytes=2-5")).status, 409);
     redirectDownload = false; packageDownload = true;
     const packageHandle = await mcp("tools/call", { name: "download_icloud_drive_file", arguments: { itemId: typedItem.id } });
-    const archive = await request(packageHandle.result.structuredContent.url);
+    const archive = await delegated(packageHandle.result.structuredContent);
     assert.equal(archive.status, 200);
     assert.equal(archive.headers.get("content-length"), null);
     assert.ok(archive.headers.get("content-disposition").includes(".zip"));
@@ -332,7 +358,7 @@ export async function verifyDrive(options) {
     assert.equal(revokedReadBody.error.code, "FORBIDDEN");
     assert.equal(downloads, downloadsBeforeRevocation, "revoked content access must not issue another Apple content request");
     return {
-      checks: ["signed-owner-origin", "300-KiB-streaming-upload", "exact-document-commit-and-idempotent-replay", "typed-MCP-metadata", "recursive-HTTP-MCP-listing-search-and-cursor-rotation", "shared-path-and-persisted-private-context", "private-single-use-download", "docws-shared-fallback", "validated-330-and-byte-ranges", "bounded-package-archive", "64-KiB-inline-guidance-and-8-KiB-preview", "contents-permission-revocation"],
+      checks: ["signed-owner-origin", "R2-multipart-staging-resume-and-confirmed-cleanup", "300-KiB-streaming-upload", "exact-document-commit-and-idempotent-replay", "typed-MCP-metadata", "recursive-HTTP-MCP-listing-search-and-cursor-rotation", "shared-path-and-persisted-private-context", "private-single-use-download", "docws-shared-fallback", "validated-330-and-byte-ranges", "bounded-package-archive", "64-KiB-inline-guidance-and-8-KiB-preview", "contents-permission-revocation"],
       uploadedBytes: payloadBytes.length, operationId, metadataTools: 2,
       outboundTransferBytes: observedUpload?.byteLength ?? 0, appleUploadRequests: allocations + transfers + finalizations, downloads,
     };

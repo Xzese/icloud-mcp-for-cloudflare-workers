@@ -114,8 +114,12 @@ files and folders. It excludes deletion, content replacement, sharing, packages 
 operations. Search is bounded and explicitly reports incomplete results.
 
 - Inline MCP full reads/uploads: **64 KiB** of decoded bytes, UTF-8 or base64.
-- Text previews: **8 KiB** of leading UTF-8 bytes, with explicit truncation, for files up to 64 MiB.
-- Dashboard/HTTP uploads and private downloads: **64 MiB** (67,108,864 bytes), with a five-minute transfer timeout.
+- MCP-authorized uploads/downloads: **2 GiB**. MCP returns a short-lived transfer URL and
+  required credential headers; an agent streams file bytes without another browser login.
+  Metadata-only uploads use direct WebSocket streaming without R2.
+- Text previews: **8 KiB** of leading UTF-8 bytes, with explicit truncation, for files up to **2 GiB**.
+- Dashboard/multipart uploads and private downloads: **2 GiB**, with a 30-minute transfer budget.
+  Uploads above **64 MiB** use resumable **8 MiB** parts in private R2; direct HTTP uploads remain capped at 64 MiB.
 - Downloads require owner authentication. A returned URL is not a public share or an attachment
   automatically available to every MCP client; use the dashboard if the client cannot fetch it.
 - Retain each write's UUID `operationId`. After a timeout or `WRITE_OUTCOME_UNKNOWN`, inspect
@@ -123,6 +127,7 @@ operations. Search is bounded and explicitly reports incomplete results.
 
 **Drive is experimental.** Live checks on one retained Apple account verified browsing,
 name search, reads, uploads/downloads, folder creation, rename and move on 13 October 2026.
+Multi-gigabyte transfers are verified synthetically, not yet against live Apple or the Sites gateway.
 Read [the Drive guide](docs/icloud-drive.md) for measured live transfer boundaries, every tool,
 exact HTTP transfer steps, consent troubleshooting, limits, migration and
 rollback instructions. The [extension research/design](docs/icloud-services-plan.md) records
@@ -140,6 +145,7 @@ native behaviour from connector safeguards and links the supporting live evidenc
 | `connection_status` | Report account/service readiness, saved permissions, session generation and tool availability; does not contact Apple. |
 | `list_icloud_drive_items`, `get_icloud_drive_item`, `search_icloud_drive` | Browse exact metadata and search names within a selected folder tree. |
 | `traverse_icloud_drive` | Recursively list or filter a folder tree with relative paths, encrypted resumable pages, configurable limits and explicit completeness. |
+| `prepare_icloud_drive_upload`, `prepare_icloud_drive_download` | Start a transfer up to 2 GiB and receive its absolute endpoint and private credential headers, without a dashboard sign-in. |
 | `read_icloud_drive_file`, `download_icloud_drive_file` | Read bounded text/base64 or prepare a private authenticated download. |
 | `upload_icloud_drive_file`, `create_icloud_drive_folder` | Add new files or folders using retained operation UUIDs. |
 | `rename_icloud_drive_item`, `move_icloud_drive_item` | Organise owned items using current etags. |
@@ -270,7 +276,7 @@ ordinary members can have one supported absolute-date pair. Direct deletion
 detaches the selected reminder from its List and parent; parent deletion soft-deletes its
 children while preserving their native links and completion state. Exact reads of a detached
 deleted reminder return `listId: null`. No hard-delete or restore tool is exposed.
-Root-only recurring completion supports interval-one timed weekly recurrence, optionally with
+Root-only recurring completion supports intervals 1–999 for timed weekly recurrence, optionally with
 one absolute date alarm, non-ended timed daily recurrence with exactly one absolute-date
 pair in a stored IANA zone, all-day daily recurrence and the observed last-day monthly pattern.
 The active ID remains open at its next calendar due date; `completedOccurrence` returns fresh
@@ -278,7 +284,7 @@ completed history at the old date. Supported weekly and timed daily alarm pairs 
 separately for the active
 record and history. Retain the original ID/tag arguments: durable occurrence intents reconcile
 uncertain acknowledgements by exact reads without creating another history. An all-day daily
-interval-one root with an inclusive end calendar date, or a timed interval-one weekly root
+root with an inclusive end calendar date on its interval cadence, or a timed weekly root
 ending on its exact local cadence, completes its final occurrence in place, returning no
 history, and can reopen at that same date. Daily end instants outside midnight UTC require
 the explicit `recurrenceCalendarTimeZone`; timed weekly rules use their stored zone.
@@ -320,12 +326,13 @@ includes a command that creates, edits, completes, reopens and deletes only its 
 | --- | --- | --- |
 | Worker and HTTPS origin | Created and managed by Sites | Create a Worker; use its Access-protected hostname or a custom domain. |
 | D1 database, binding `DB` | Declared in `.openai/hosting.json`; Sites provisions it and applies the packaged current schema. | Create D1, configure its UUID and execute `schema.sql`. |
+| Large-file staging, binding `BUCKET` | Sites provisions private R2 from the hosting manifest. | Create a private R2 bucket and configure the binding in the ignored production config. |
 | Owner authentication | Sites' dispatch-owned ChatGPT sign-in and Site-scoped identity | Cloudflare Access application, restrictive policy and Managed OAuth; Worker verifies Access JWTs. |
 | Encryption | Operator-provided Worker secret | Operator-provided Worker secret |
 | MCP registration | Site-hosted plugin at `/mcp` | Register `/mcp` as a custom OAuth MCP connection. |
 
-No R2 bucket, Workers KV, Durable Object, Apple developer application or OpenAI API key is
-used by this implementation. Your Cloudflare plan must support the CPU/memory needs of login
+R2 is used for resumable uploads above 64 MiB. Workers KV, Durable Objects, an Apple developer
+application and an OpenAI API key are not required. Your Cloudflare plan must support the CPU/memory needs of login
 cryptography, streamed file hashing and your Access configuration; validate those limits in your deployment.
 
 | Runtime setting | Purpose |

@@ -2,7 +2,7 @@ import { AppError, WriteOutcomeUnknownError } from "../errors.ts";
 import { canonicalJSON, jsonBytes } from "../lib/canonical.ts";
 import { stableNativePresentation } from "../lib/native-presentation.ts";
 import { intrinsicParentIdentity, isKnownEmptyDeletionCollection, normalizeList, normalizeReminder, referenceField, type CloudKitRecord } from "../icloud/cloudkit.ts";
-import { dateComponents, decodeDateComponents, dueDateNonce } from "./linked-date.ts";
+import { dateComponentsForSource, decodeDateComponents, dueDateNonce } from "./linked-date.ts";
 import type { SchedulingGraph } from "./linked-records.ts";
 import { assertOwnedReminder, ReminderTargetInput, updateResolutionTokenMap, type CloudKitWriteRecord, type ReminderTargetInputData } from "./writes.ts";
 import type { ListWrite } from "./list-writes.ts";
@@ -118,7 +118,7 @@ export function validateAbsoluteDatePair(root: CloudKitRecord, records: CloudKit
     field(trigger, "Type", "STRING") !== "Date") throw new AppError("UNSUPPORTED_FEATURE", "The lifecycle graph is not exactly the observed bidirectional absolute-date pair.");
   for (const record of [root, alarm, trigger]) validateDateAlarmParticipant(record, owner);
   const components = decodeDateComponents(field(trigger, "DateComponentsData", "BYTES"));
-  if (canonicalJSON(components) !== canonicalJSON(dateComponents(reminder.dueDate, reminder.timeZone, Object.hasOwn(components, "nanosecond"))) ||
+  if (canonicalJSON(components) !== canonicalJSON(dateComponentsForSource(reminder.dueDate, reminder.timeZone, components)) ||
     field(alarm, "DueDateResolutionTokenAsNonce", "DOUBLE") !== dueDateNonce(field(root, "ResolutionTokenMap", "STRING")))
     throw new AppError("CONFLICT", "The reminder due date, resolution nonce and absolute alarm components disagree.", 409);
   return [alarm, trigger];

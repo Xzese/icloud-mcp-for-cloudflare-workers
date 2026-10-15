@@ -18,6 +18,12 @@ export function localAppleContentHeaders(input) {
     const value = incoming.get(name);
     if (value !== null) headers.set(name, value);
   }
+  const length = incoming.get("content-length");
+  if (length !== null) {
+    if (!/^\d+$/.test(length) || !Number.isSafeInteger(Number(length)) || Number(length) > DRIVE_MAX_TRANSFER_BYTES + 16_384)
+      throw new Error("The local content request has an invalid declared length.");
+    headers.set("content-length", length);
+  }
   const range = incoming.get("range");
   if (range !== null && /^bytes=\d+-\d+$/.test(range)) headers.set("range", range);
   return headers;

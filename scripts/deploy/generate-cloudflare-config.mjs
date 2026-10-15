@@ -23,6 +23,8 @@ Object.assign(output, requestDrivenConfig(configured));
 delete output.triggers;
 delete output.queues;
 delete output.services;
-delete output.r2_buckets;
+// Build-time placeholders must never become deployment bucket names.
+if (configured.r2_buckets?.length) output.r2_buckets = configured.r2_buckets;
+else delete output.r2_buckets;
 await writeFile("wrangler.generated.toml", stringify(output) + "\n", { mode: 0o600 });
 console.log(checking ? "Prepared non-deploying bundle-check configuration." : "Prepared ignored Cloudflare deployment configuration.");
