@@ -17,6 +17,7 @@
     "typecheck": "tsc --noEmit",
     "test": "node --experimental-strip-types --test tests/*.test.ts",
     "test:worker": "node tests/integration/worker.mjs",
+    "test:drive:large": "node tests/integration/drive-large.mjs",
     "test:local": "node tests/integration/local-icloud.mjs",
     "test:icloud-write": "node scripts/dev/validate-local-reminder-writes.mjs",
     "evidence:reminder": "node scripts/dev/capture-reminder-evidence.mjs",

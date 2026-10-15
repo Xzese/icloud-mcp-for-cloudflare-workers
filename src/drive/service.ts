@@ -1,5 +1,6 @@
 import { z } from "zod";
-import { DRIVE_FILE_LIMIT_LABEL, DRIVE_UPLOAD_MINIMUM_LEASE_MS } from "./limits.ts";
+import { DRIVE_FILE_LIMIT_LABEL, DRIVE_DIRECT_UPLOAD_BYTES, DRIVE_UPLOAD_PART_BYTES, DRIVE_UPLOAD_MINIMUM_LEASE_MS, DRIVE_TRANSFER_BLOCK_BYTES } from "./limits.ts";
+import { DriveStaging } from "./staging.ts";
 import { sha256 } from "@noble/hashes/sha2.js";
 import { AppError } from "../errors.ts";
 import { AppleAuthHTTP } from "../auth/apple/http.ts";
@@ -225,27 +226,53 @@ export class DriveService {
     const send: typeof fetch = async (input, init) => { await this.guard(scope, permission); return fetch(input, init); };
     return AppleAuthHTTP.restore(auth, send);
   }
-  private checkedStream(source: ReadableStream<Uint8Array>, scope: DriveScope, permission: ServicePermission, size: number | null, signal?: AbortSignal, hash?: string) {
+  private checkedStream(source: ReadableStream<Uint8Array>, scope: DriveScope, permission: ServicePermission, size: number | null, signal?: AbortSignal, hash?: string, blockBytes = DRIVE_TRANSFER_BLOCK_BYTES) {
     const reader = source.getReader(), digest = sha256.create();
     let count = 0;
-    const guard = () => this.guard(scope, permission);
+    let saved: Saved | undefined, pending: Uint8Array | undefined, ended = false;
+    const guard = async () => {
+      if (Date.now() >= scope.expiresAt) throw new AppError("AUTH_EXPIRED", "The Drive request's account session expired.", 409);
+      for (let attempt = 0; attempt < 3; attempt++) {
+        saved ??= await this.guard(scope, permission);
+        if (await this.sessions.driveTransferCurrent(saved.fence, scope.permissionRevision)) {
+          if (Date.now() >= scope.expiresAt) throw new AppError("AUTH_EXPIRED", "The Drive request's account session expired.", 409);
+          return;
+        }
+        saved = undefined;
+      }
+      conflict("The Apple session is busy updating. Resume this Drive request after inspecting its operation.");
+    };
     let verified = false;
     const stream = new ReadableStream<Uint8Array>({
       async pull(controller) {
         try {
           if (signal?.aborted) throw signal.reason ?? new AppError("CONFLICT", "The Drive transfer was cancelled.", 409);
-          await guard();
-          const next = await reader.read();
+          // Network/R2 chunks can be only a few KiB. Authorize bounded blocks,
+          // not every socket chunk, to stay within D1's per-invocation budget.
+          const bytes = new Uint8Array(Math.min(blockBytes, size === null ? blockBytes : Math.max(1, size - count)));
+          let length = 0;
+          while (length < bytes.length && !ended) {
+            if (!pending?.byteLength) {
+              const next = await reader.read();
+              if (next.done) { ended = true; break; }
+              pending = next.value;
+            }
+            const take = Math.min(bytes.length - length, pending.byteLength);
+            bytes.set(pending.subarray(0, take), length); length += take;
+            pending = pending.subarray(take);
+          }
           if (signal?.aborted) throw signal.reason ?? new AppError("CONFLICT", "The Drive transfer was cancelled.", 409);
           await guard();
-          if (next.done) {
+          if (signal?.aborted) throw signal.reason ?? new AppError("CONFLICT", "The Drive transfer was cancelled.", 409);
+          if (!length && ended) {
             if (size !== null && count !== size || hash !== undefined && hex(digest.digest()) !== hash) throw new AppError("VALIDATION_ERROR", "The Drive content length or SHA-256 digest did not match its metadata.", 400);
             verified = true; reader.releaseLock(); controller.close(); return;
           }
-          count += next.value.byteLength;
+          count += length;
           if (size !== null && count > size || count > DRIVE_FILE_BYTES) throw new AppError("VALIDATION_ERROR", "The Drive content exceeded its declared size.", 400);
-          if (hash !== undefined) digest.update(next.value);
-          controller.enqueue(next.value);
+          const block = bytes.subarray(0, length);
+          if (hash !== undefined) digest.update(block);
+          controller.enqueue(block);
         } catch (error) { await reader.cancel(error).catch(() => {}); controller.error(error); }
       },
       async cancel(reason) { await reader.cancel(reason).catch(() => {}); },
@@ -265,14 +292,22 @@ export class DriveService {
     catch (error) { await response.body?.cancel(error).catch(() => {}); throw error; }
     const source = response.body ?? new ReadableStream<Uint8Array>({ start(controller) { controller.close(); } });
     const size = range ? range.end - range.start + 1 : item.size!;
-    const checked = this.checkedStream(source, c.scope, "drive.contents", packaged ? null : size, signal);
+    const checked = this.checkedStream(source, c.scope, "drive.contents", packaged ? null : size, signal, undefined, inline ? 4096 : DRIVE_TRANSFER_BLOCK_BYTES);
     const headers = new Headers({ "Content-Type": response.headers.get("content-type") ?? "application/octet-stream", "Cache-Control": "private, no-store", "X-Content-Type-Options": "nosniff" });
     if (!packaged) { headers.set("Content-Length", String(size)); headers.set("Accept-Ranges", "bytes"); }
     if (range) headers.set("Content-Range", `bytes ${range.start}-${range.end}/${item.size}`);
     const encodedName = encodeURIComponent(new TextDecoder().decode(new TextEncoder().encode(packaged ? `${item.name}.zip` : item.name))).replace(/['()*]/g, character => `%${character.charCodeAt(0).toString(16).toUpperCase()}`);
     headers.set("Content-Disposition", `attachment; filename="download"; filename*=UTF-8''${encodedName}`);
+    // workerd derives Content-Length from the body, ignoring the header on an
+    // arbitrary JS stream. Preserve exact framing without buffering the file.
+    let body = checked.stream;
+    if (!packaged && typeof FixedLengthStream === "function") {
+      const fixed = new FixedLengthStream(size);
+      void body.pipeTo(fixed.writable).catch(() => {});
+      body = fixed.readable;
+    }
     // Never forward CDN headers, signed addresses, or Apple receipt fields.
-    return new Response(checked.stream, { status: range ? 206 : 200, headers });
+    return new Response(body, { status: range ? 206 : 200, headers });
   }
   async read(input: unknown) {
     const request = parse(ReadDrive, input);
@@ -339,7 +374,8 @@ export class DriveService {
   }
   private publicOperation(row: DriveOperation, data: DriveOperationData) {
     const safe = DriveItemSchema.safeParse(data.result);
-    return { operationId: row.operation_id, phase: row.phase, result: safe.success ? { item: safe.data } : null, generation: row.generation };
+    return { operationId: row.operation_id, phase: row.phase, result: safe.success ? { item: safe.data } : null, generation: row.generation,
+      ...(data.staging ? { staging: { partBytes: DRIVE_UPLOAD_PART_BYTES, uploadedParts: data.staging.parts.map(part => part.partNumber).sort((a, b) => a - b), staged: !!data.staging.objectEtag, cancelled: data.staging.cancelled, expiresAt: row.expires_at } } : {}) };
   }
   private async recover(c: Context, row: DriveOperation, data: DriveOperationData): Promise<DriveOperation> {
     // A lost response is never permission to send another mutation. Only a
@@ -444,12 +480,55 @@ export class DriveService {
   }
   async prepareUpload(input: unknown) {
     const request = parse(UploadDriveMetadata, input);
+    if (request.size > DRIVE_DIRECT_UPLOAD_BYTES) this.requireStagingBucket();
     return this.metadata("drive.upload", request.expectedGeneration, async c => {
       const row = await this.operations.create(request.operationId, "upload", request, c.scope);
       if (row.permission_revision !== c.scope.permissionRevision) conflict("Upload permissions changed since this intent was prepared.");
       if (row.phase === "prepared") await this.destination(c, request.parentId, request.name);
       return { operationId: request.operationId, uploadPath: `/api/drive/uploads/${request.operationId}/content` };
     });
+  }
+  private requireStagingBucket() {
+    if (!this.env.BUCKET) throw new AppError("CONFIGURATION_REQUIRED", "Files above 64 MiB require a private BUCKET R2 binding and the multipart upload flow on Workers or Sites.", 503);
+    return this.env.BUCKET;
+  }
+  private staging(context: Context) {
+    return new DriveStaging(this.requireStagingBucket(), this.operations, context.scope, () => this.guard(context.scope, "drive.upload"));
+  }
+  async prepareMultipartUpload(input: unknown) {
+    const request = parse(UploadDriveMetadata, input);
+    this.requireStagingBucket();
+    if (!request.size) throw new AppError("VALIDATION_ERROR", "Use the direct upload flow for an empty file.", 400);
+    await this.prepareUpload(request);
+    return this.metadata("drive.upload", request.expectedGeneration, c => this.staging(c).prepare(request.operationId));
+  }
+  async uploadPart(operationId: string, partNumber: number, checksum: string, body: ReadableStream<Uint8Array>, signal?: AbortSignal) {
+    try {
+      const context = await this.open("drive.upload");
+      // Client network time must not hold the 30-second Apple metadata lease.
+      try { await this.finish(context); } finally { await this.close(context); }
+      return await this.staging(context).part(parse(OperationId, operationId), partNumber, checksum, body, signal);
+    } finally { await body.cancel().catch(() => {}); }
+  }
+  async completeMultipartUpload(input: unknown, signal?: AbortSignal) {
+    const request = parse(GetDriveOperation, input), bucket = this.requireStagingBucket();
+    const ready = await this.metadata("drive.upload", request.expectedGeneration, async c => {
+      const staging = await this.staging(c).complete(request.operationId);
+      const row = await this.operations.get(request.operationId, c.scope);
+      return { staging, operation: this.publicOperation(row, await this.operations.data(row)) };
+    });
+    if (ready.operation.phase === "confirmed") {
+      await bucket.delete(ready.staging.key); return ready.operation;
+    }
+    const object = await bucket.get(ready.staging.key, { onlyIf: { etagMatches: ready.staging.objectEtag! } });
+    if (!object || !("body" in object)) throw new AppError("CONFLICT", "The staged upload expired or changed. Inspect its operation before continuing.", 409);
+    const result = await this.uploadContent(request.operationId, object.body, signal, true);
+    if (result.phase === "confirmed") await bucket.delete(ready.staging.key);
+    return result;
+  }
+  async discardMultipartUpload(input: unknown) {
+    const request = parse(GetDriveOperation, input);
+    return this.metadata("drive.upload", request.expectedGeneration, c => this.staging(c).discard(request.operationId));
   }
   async upload(input: unknown) {
     const validated = UploadDrive.safeParse(input);
@@ -462,7 +541,7 @@ export class DriveService {
     await this.prepareUpload(metadata);
     return this.uploadContent(request.operationId, new ReadableStream<Uint8Array>({ start(controller) { controller.enqueue(bytes); controller.close(); } }));
   }
-  async uploadContent(operationId: string, body: ReadableStream<Uint8Array>, signal?: AbortSignal) {
+  async uploadContent(operationId: string, body: ReadableStream<Uint8Array>, signal?: AbortSignal, staged = false) {
     operationId = parse(OperationId, operationId);
     let c: Context | null = await this.open("drive.upload");
     const scope = c.scope;
@@ -474,6 +553,8 @@ export class DriveService {
       data = await this.operations.data(row);
       if (row.kind !== "upload") conflict("This operation is not an upload intent.");
       request = parse(UploadDriveMetadata, data.input);
+      if (row.phase !== "confirmed" && (data.staging?.cancelled || staged && !data.staging?.objectEtag)) conflict("This staged upload is unavailable.");
+      if (row.phase !== "confirmed" && !staged && (request.size > DRIVE_DIRECT_UPLOAD_BYTES || data.staging)) throw new AppError("VALIDATION_ERROR", "Use prepare-multipart-upload, numbered parts and complete-multipart-upload for this file. Direct uploads allow at most 64 MiB.", 413);
     } catch (error) {
       await this.close(c);
       await body.cancel(error).catch(() => {});

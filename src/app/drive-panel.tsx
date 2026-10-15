@@ -5,7 +5,7 @@ import { Download, File, FileText, Folder, FolderPlus, RefreshCw, Search, Upload
 import { Button } from "@/components/ui/button";
 import type { DriveItem } from "@/icloud/drive";
 import { DRIVE_FILE_BYTES, DRIVE_FILE_LIMIT_LABEL } from "@/drive/limits";
-import { sha256Stream } from "@/lib/file-digest";
+import { uploadDriveFile, pendingDriveUpload, discardDriveUpload } from "@/lib/drive-upload";
 
 const ROOT = "FOLDER::com.apple.CloudDocs::root";
 interface Connection { generation: number; services: { drive: { enabled: boolean; ready: boolean; browse: boolean; contents: boolean; upload: boolean; organize: boolean } }; }
@@ -29,6 +29,7 @@ export default function DrivePanel() {
   const [continuation, setContinuation] = useState<string | null>(null);
   const [searchComplete, setSearchComplete] = useState(false);
   const [operation, setOperation] = useState<string | null>(null);
+  const [pendingUpload, setPendingUpload] = useState<string | null>(null);
   const [preview, setPreview] = useState<TextPreview | null>(null);
   const fileInput = useRef<HTMLInputElement>(null);
   const folder = trail[trail.length - 1]!;
@@ -44,7 +45,11 @@ export default function DrivePanel() {
     } catch { setConnection(null); setListing(null); setMatches(null); setPreview(null); }
   }, []);
   useEffect(() => {
-    const timer = setTimeout(() => void refreshStatus(), 0);
+    const timer = setTimeout(() => {
+      try { const id = pendingDriveUpload(); setOperation(id); setPendingUpload(id); }
+      catch (cause) { setError(cause instanceof Error ? cause.message : "The retained upload could not be read."); }
+      void refreshStatus();
+    }, 0);
     window.addEventListener("icloud-services-changed", refreshStatus);
     return () => { clearTimeout(timer); window.removeEventListener("icloud-services-changed", refreshStatus); };
   }, [refreshStatus]);
@@ -55,7 +60,11 @@ export default function DrivePanel() {
       setError(cause instanceof Error ? cause.message : "Drive is unavailable.");
       window.dispatchEvent(new Event("icloud-services-changed"));
     }
-    finally { setBusy(false); }
+    finally {
+      setBusy(false);
+      try { setPendingUpload(pendingDriveUpload()); }
+      catch (cause) { setError(cause instanceof Error ? cause.message : "The retained upload could not be read."); }
+    }
   }
   const context = { expectedGeneration: connection?.generation };
   async function browse(nextTrail = trail) {
@@ -82,12 +91,7 @@ export default function DrivePanel() {
   }
   async function upload(file: globalThis.File) {
     if (file.size > DRIVE_FILE_BYTES) throw new Error(`Choose a file no larger than ${DRIVE_FILE_LIMIT_LABEL}.`);
-    const operationId = crypto.randomUUID(); setOperation(operationId);
-    const sha256 = await sha256Stream(file.stream());
-    const prepared = await call<{ uploadPath: string }>("/api/drive/prepare-upload", { ...context, parentId: folder.id, name: file.name, operationId, size: file.size, sha256, contentType: /^[\w.+-]+\/[\w.+-]+$/.test(file.type) ? file.type : "application/octet-stream" });
-    const response = await fetch(prepared.uploadPath, { method: "POST", headers: { "content-type": "application/octet-stream" }, body: file });
-    const result = await response.json() as { error?: { message?: string } } & Operation;
-    if (!response.ok) throw new Error(result.error?.message ?? "Upload interrupted. Inspect the retained operation before trying again.");
+    const result = await uploadDriveFile(file, { ...context, parentId: folder.id }, (text, id) => { setNotice(text); if (id) setOperation(id); });
     retain(result); await browse();
   }
   const items = matches ?? listing?.items ?? [];
@@ -99,6 +103,7 @@ export default function DrivePanel() {
       <div className="action-row"><Button variant="outline" disabled={busy} onClick={() => void run(() => browse())}><RefreshCw size={16} />Refresh folder</Button>
         {access.upload && !folder.shareContext && <><input ref={fileInput} type="file" hidden onChange={event => { const file = event.target.files?.[0]; event.target.value = ""; if (file) void run(() => upload(file)); }} /><Button variant="outline" disabled={busy} onClick={() => fileInput.current?.click()}><Upload size={16} />Upload file (up to {DRIVE_FILE_LIMIT_LABEL})</Button></>}
       </div>
+      {pendingUpload && access.upload && <p className="fine-print">Interrupted a large upload? Reselect the same file in its original folder to resume. <Button variant="ghost" disabled={busy} onClick={() => void run(async () => { await discardDriveUpload(pendingUpload); setNotice("Staged data discarded. Any Apple operation receipt is retained."); })}>Discard staged data</Button></p>}
       <form className="drive-form" onSubmit={event => { event.preventDefault(); void run(() => find()); }}><label htmlFor="drive-search">Find file or folder names within this folder</label><div className="action-row"><input id="drive-search" value={query} maxLength={200} disabled={busy || !!continuation} onChange={event => setQuery(event.target.value)} /><Button variant="outline" disabled={busy || !query.trim()} type="submit"><Search size={16} />Search</Button>{matches && <Button variant="ghost" disabled={busy} onClick={() => { setMatches(null); setContinuation(null); }}>Clear search</Button>}</div></form>
       {access.organize && !folder.shareContext && <form className="drive-form" onSubmit={event => { event.preventDefault(); void run(async () => { const operationId = crypto.randomUUID(); setOperation(operationId); retain(await call<Operation>("/api/drive/create-folder", { ...context, parentId: folder.id, name, operationId })); setName(""); await browse(); }); }}><label htmlFor="drive-folder-name">New folder name</label><div className="action-row"><input id="drive-folder-name" value={name} maxLength={255} disabled={busy} onChange={event => setName(event.target.value)} /><Button type="submit" variant="outline" disabled={busy || !name.trim()}><FolderPlus size={16} />Create folder</Button></div></form>}
       <ul className="drive-items">{items.map(item => <li key={`${item.id}|${item.shareContext ?? ""}`}><span className="drive-item-name">{item.type === "folder" ? <Folder size={18} /> : <File size={18} />}{item.name}</span><span className="fine-print">{item.size === null ? "Folder" : `${Math.ceil(item.size / 1024)} KiB`}</span>{item.type === "folder" ? <Button variant="ghost" disabled={busy} onClick={() => void run(() => browse([...trail, { id: item.id, name: item.name, shareContext: item.shareContext }]))}>Open</Button> : access.contents && <><Button variant="ghost" disabled={busy || item.package || (item.size ?? Infinity) > DRIVE_FILE_BYTES} onClick={() => void run(() => previewText(item))}><FileText size={16} />Preview text</Button><Button variant="ghost" disabled={busy || (item.size ?? Infinity) > DRIVE_FILE_BYTES} onClick={() => void run(() => download(item))}><Download size={16} />{item.package ? "Download archive" : "Download"}</Button></>}</li>)}</ul>

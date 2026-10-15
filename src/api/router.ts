@@ -58,16 +58,19 @@ export async function applicationRoute(request: Request, env: RuntimeEnv, creden
       }
     }
     if (request.method === "POST") {
+      const uploadPart = /^\/api\/drive\/uploads\/([a-f0-9-]{36})\/parts\/([1-9]\d{0,3})$/i.exec(path);
       const uploadContent = /^\/api\/drive\/uploads\/([a-f0-9-]{36})\/content$/i.exec(path);
-      if (uploadContent) {
+      if (uploadContent || uploadPart) {
         // Binary transfers retain the owner/origin checks without the JSON-only
         // content type restriction used by ordinary dashboard actions.
         if (!env.APP_ORIGIN || request.headers.get("origin") !== env.APP_ORIGIN || new URL(request.url).origin !== env.APP_ORIGIN) throw new AppError("FORBIDDEN", "Use the private application origin for uploads.", 403);
         if (request.headers.get("content-type") !== "application/octet-stream") throw new AppError("VALIDATION_ERROR", "Upload an application/octet-stream body.", 400);
         const body = request.body ?? new ReadableStream<Uint8Array>({ start(controller) { controller.close(); } });
-        return json(await new DriveService(env, owner).uploadContent(z.string().uuid().parse(uploadContent[1]), body, request.signal));
+        if (uploadPart) return json(await new DriveService(env, owner).uploadPart(z.string().uuid().parse(uploadPart[1]), Number(uploadPart[2]), request.headers.get("x-content-sha256") ?? "", body, request.signal));
+        return json(await new DriveService(env, owner).uploadContent(z.string().uuid().parse(uploadContent![1]), body, request.signal));
       }
       requireSameOrigin(request, env);
+      if (path === "/api/drive/complete-multipart-upload") return json(await new DriveService(env, owner).completeMultipartUpload(await readJSON(request), request.signal));
       if (path === "/api/settings") {
         const value = z.object({ expectedRevision: z.number().int().nonnegative().safe(), settings: ServiceSettingsSchema }).strict().safeParse(await readJSON(request));
         if (!value.success) throw new AppError("VALIDATION_ERROR", "Provide valid service preferences and their current revision.", 400);
@@ -79,7 +82,7 @@ export async function applicationRoute(request: Request, env: RuntimeEnv, creden
         const connection = new AppleConnectionService(env, owner);
         return json(await (path === "/api/drive/approve" ? connection.approveDrive(value.data.expectedGeneration, value.data.restartApproval) : connection.approveReminders(value.data.expectedGeneration, value.data.restartApproval)));
       }
-      const driveActions = { list: "list", lookup: "get", search: "search", traverse: "traverse", "resolve-folder-path": "resolveFolderPath", read: "read", download: "download", upload: "upload", "prepare-upload": "prepareUpload", "create-folder": "createFolder", rename: "rename", move: "move", operation: "operation" } as const;
+      const driveActions = { list: "list", lookup: "get", search: "search", traverse: "traverse", "resolve-folder-path": "resolveFolderPath", read: "read", download: "download", upload: "upload", "prepare-upload": "prepareUpload", "prepare-multipart-upload": "prepareMultipartUpload", "discard-multipart-upload": "discardMultipartUpload", "create-folder": "createFolder", rename: "rename", move: "move", operation: "operation" } as const;
       const driveAction = path.startsWith("/api/drive/") ? path.slice("/api/drive/".length) : "";
       if (Object.hasOwn(driveActions, driveAction)) {
         const method = driveActions[driveAction as keyof typeof driveActions];

@@ -167,8 +167,8 @@ test("Drive download streams bounded bytes without forwarding the Apple cookie",
   assert.equal(await sha256Stream(largeResponse.body!), expected.digest("hex"));
   assert.equal(remaining, 0);
   const beforeOversize = requests;
-  await assert.rejects(largeClient.download({ ...largeItem, size: limit + 1 }), { code: "UNSUPPORTED_FEATURE" });
-  assert.equal(requests, beforeOversize, "64 MiB plus one is refused before contacting Apple");
+  await assert.rejects(largeClient.download({ ...largeItem, size: 10 * 1024 ** 3 + 1 }), { code: "UNSUPPORTED_FEATURE" });
+  assert.equal(requests, beforeOversize, "10 GiB plus one is refused before contacting Apple");
 });
 
 test("streamed browser hashing handles empty files, split bytes and source failures", async () => {

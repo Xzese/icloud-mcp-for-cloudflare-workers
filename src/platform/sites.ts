@@ -1,6 +1,7 @@
 import { AppError, requireValue } from "../errors.ts";
 export interface RuntimeEnv {
   DB?: D1Database;
+  BUCKET?: R2Bucket;
   REMINDERS_OWNER_ID?: string;
   APP_ORIGIN?: string;
   ENCRYPTION_KEY_ID?: string;

@@ -3,7 +3,7 @@ import { INLINE_FILE_BYTES, TEXT_PREVIEW_BYTES, DRIVE_FILE_BYTES, DRIVE_FILE_LIM
 import { SharedContextId } from "./shared.ts";
 export { INLINE_FILE_BYTES, TEXT_PREVIEW_BYTES, INLINE_REQUEST_BYTES, DRIVE_FILE_BYTES } from "./limits.ts";
 
-export const INLINE_UPLOAD_GUIDANCE = `Inline uploads allow at most 64 KiB of file bytes. Use dashboard Upload or /api/drive/prepare-upload followed by its authenticated binary uploadPath for files up to ${DRIVE_FILE_LIMIT_LABEL}.`;
+export const INLINE_UPLOAD_GUIDANCE = `Inline uploads allow at most 64 KiB of file bytes. Use dashboard Upload for files up to ${DRIVE_FILE_LIMIT_LABEL}, /api/drive/prepare-upload and its binary uploadPath up to 64 MiB, or the authenticated /api/drive/prepare-multipart-upload flow for larger files.`;
 export const OwnedDriveId = z.string().max(512).regex(/^(?:FOLDER|FILE)::com\.apple\.CloudDocs::[A-Za-z0-9._-]{1,256}$/)
   .describe("Exact owned item ID returned by Drive listing; never a local path or URL.");
 export const DriveId = z.string().max(512).regex(/^(?:(?:FOLDER|FILE)(?:_IN_SHARED_FOLDER)?|SHARED_FOLDER)::com\.apple\.CloudDocs::[A-Za-z0-9._-]{1,256}$/)

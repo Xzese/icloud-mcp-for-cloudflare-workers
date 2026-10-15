@@ -566,6 +566,15 @@ export class AppleSessionRepository {
     if (!row) throw new AppError("CONFLICT", "The Apple account changed or the preparation budget expired. No operation may be dispatched.", 409, true);
   }
 
+  async driveTransferCurrent(fence: SessionFence, permissionRevision: number): Promise<boolean> {
+    const row = await this.db.prepare(`SELECT a.generation, a.version, a.state, a.transaction_id, s.revision AS permission_revision
+      FROM apple_session_state a LEFT JOIN owner_service_settings s ON s.owner_id = a.owner_id
+      WHERE a.owner_id = ? AND a.account_id = ?`)
+      .bind(this.owner, ACCOUNT).first<{ generation: number; version: number; state: string; transaction_id: string | null; permission_revision: number | null }>();
+    if (!row || row.generation !== fence.generation) throw new AppError("CONFLICT", "The Apple account changed during this Drive transfer.", 409);
+    return row.permission_revision === permissionRevision && row.version === fence.version && row.transaction_id === null && ["READY", "DEVICE_APPROVAL_PENDING"].includes(row.state);
+  }
+
   async claimRenewal(expectedGeneration: number, expectedVersion: number) {
     const saved = await this.load();
     return saved.state === "READY" ? this.claimRead(expectedGeneration, expectedVersion) : this.claimResume(expectedGeneration, expectedVersion);

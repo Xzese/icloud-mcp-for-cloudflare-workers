@@ -5,6 +5,7 @@ import { fingerprint } from "../lib/canonical.ts";
 import type { RuntimeEnv } from "../platform/sites.ts";
 import { DRIVE_UPLOAD_LEASE_MS } from "../drive/limits.ts";
 import { DriveSharedContext } from "../drive/shared.ts";
+import { UploadStaging, type UploadStagingData } from "../drive/staging.ts";
 
 export interface DriveScope { account: string; generation: number; permissionRevision: number; expiresAt: number; }
 export type DrivePhase = "prepared" | "allocating" | "allocated" | "uploading" | "uploaded" | "committing" | "confirmed" | "unknown" | "failed";
@@ -13,9 +14,9 @@ export interface DriveOperation {
   input_hash: string; kind: string; phase: DrivePhase; revision: number; lease_id: string | null;
   lease_until: number; expires_at: number; envelope: string | null;
 }
-export interface DriveOperationData { input: Record<string, unknown>; allocation?: unknown; receipt?: unknown; result?: unknown; itemId?: string; }
+export interface DriveOperationData { input: Record<string, unknown>; allocation?: unknown; receipt?: unknown; result?: unknown; itemId?: string; staging?: UploadStagingData; }
 const EnvelopeSchema = z.object({ version: z.literal(1), keyId: z.string(), iv: z.string(), ciphertext: z.string() }).strict();
-const DataSchema = z.object({ input: z.record(z.unknown()), allocation: z.unknown().optional(), receipt: z.unknown().optional(), result: z.unknown().optional(), itemId: z.string().optional() }).strict();
+const DataSchema = z.object({ input: z.record(z.unknown()), allocation: z.unknown().optional(), receipt: z.unknown().optional(), result: z.unknown().optional(), itemId: z.string().optional(), staging: UploadStaging.optional() }).strict();
 const conflict = () => new AppError("CONFLICT", "The Drive operation changed or is already running. Inspect its operation ID before retrying.", 409);
 const canonicalOperationId = (value: string) => {
   const parsed = z.string().uuid().safeParse(value);

@@ -114,8 +114,9 @@ files and folders. It excludes deletion, content replacement, sharing, packages 
 operations. Search is bounded and explicitly reports incomplete results.
 
 - Inline MCP full reads/uploads: **64 KiB** of decoded bytes, UTF-8 or base64.
-- Text previews: **8 KiB** of leading UTF-8 bytes, with explicit truncation, for files up to 64 MiB.
-- Dashboard/HTTP uploads and private downloads: **64 MiB** (67,108,864 bytes), with a five-minute transfer timeout.
+- Text previews: **8 KiB** of leading UTF-8 bytes, with explicit truncation, for files up to **10 GiB**.
+- Dashboard/multipart uploads and private downloads: **10 GiB**, with a 30-minute transfer budget.
+  Uploads above **64 MiB** use resumable **8 MiB** parts in private R2; direct HTTP uploads remain capped at 64 MiB.
 - Downloads require owner authentication. A returned URL is not a public share or an attachment
   automatically available to every MCP client; use the dashboard if the client cannot fetch it.
 - Retain each write's UUID `operationId`. After a timeout or `WRITE_OUTCOME_UNKNOWN`, inspect
@@ -123,6 +124,7 @@ operations. Search is bounded and explicitly reports incomplete results.
 
 **Drive is experimental.** Live checks on one retained Apple account verified browsing,
 name search, reads, uploads/downloads, folder creation, rename and move on 13 October 2026.
+Multi-gigabyte transfers are verified synthetically, not yet against live Apple or the Sites gateway.
 Read [the Drive guide](docs/icloud-drive.md) for measured live transfer boundaries, every tool,
 exact HTTP transfer steps, consent troubleshooting, limits, migration and
 rollback instructions. The [extension research/design](docs/icloud-services-plan.md) records
@@ -320,12 +322,13 @@ includes a command that creates, edits, completes, reopens and deletes only its 
 | --- | --- | --- |
 | Worker and HTTPS origin | Created and managed by Sites | Create a Worker; use its Access-protected hostname or a custom domain. |
 | D1 database, binding `DB` | Declared in `.openai/hosting.json`; Sites provisions it and applies the packaged current schema. | Create D1, configure its UUID and execute `schema.sql`. |
+| Large-file staging, binding `BUCKET` | Sites provisions private R2 from the hosting manifest. | Create a private R2 bucket and configure the binding in the ignored production config. |
 | Owner authentication | Sites' dispatch-owned ChatGPT sign-in and Site-scoped identity | Cloudflare Access application, restrictive policy and Managed OAuth; Worker verifies Access JWTs. |
 | Encryption | Operator-provided Worker secret | Operator-provided Worker secret |
 | MCP registration | Site-hosted plugin at `/mcp` | Register `/mcp` as a custom OAuth MCP connection. |
 
-No R2 bucket, Workers KV, Durable Object, Apple developer application or OpenAI API key is
-used by this implementation. Your Cloudflare plan must support the CPU/memory needs of login
+R2 is used for resumable uploads above 64 MiB. Workers KV, Durable Objects, an Apple developer
+application and an OpenAI API key are not required. Your Cloudflare plan must support the CPU/memory needs of login
 cryptography, streamed file hashing and your Access configuration; validate those limits in your deployment.
 
 | Runtime setting | Purpose |

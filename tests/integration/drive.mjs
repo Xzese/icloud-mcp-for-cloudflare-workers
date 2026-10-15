@@ -10,6 +10,7 @@ import { Envelopes } from "../../src/crypto/envelopes.ts";
 import { loginAssurance } from "../../src/auth/apple/policy.ts";
 import { DRIVE_ROOT } from "../../src/icloud/drive.ts";
 import { DEFAULT_SERVICE_SETTINGS } from "../../src/services/settings.ts";
+import { verifyMultipartDrive } from "./drive-large.mjs";
 
 const root = resolve(new URL("../..", import.meta.url).pathname);
 const origin = "https://drive-private.example.test";
@@ -40,6 +41,7 @@ async function bytesOf(stream) {
 }
 
 export async function verifyDrive(options) {
+  await verifyMultipartDrive(options);
   const secret = randomBytes(32).toString("base64");
   const payloadBytes = randomBytes(300 * 1024);
   payloadBytes.fill(65, 0, 8192); // A valid text prefix; the preview never validates its unread suffix.
@@ -144,6 +146,7 @@ export async function verifyDrive(options) {
       ...options,
       name: "drive-acceptance",
       d1Persist: false,
+      r2Buckets: ["BUCKET"], r2Persist: false,
       d1Databases: { DB: "drive-acceptance-db" },
       bindings: {
         ...options.bindings,
@@ -221,7 +224,7 @@ export async function verifyDrive(options) {
     assert.equal(sharedPage.folder.shareContext, sharedItem.shareContext);
     assert.equal(JSON.stringify(sharedPage).includes("private-docws"), false);
 
-    const limitIntent = { operationId: randomUUID(), parentId: DRIVE_ROOT, name: "limit-boundary.bin", size: 64 * 1024 * 1024, sha256: "a".repeat(64), contentType: "application/octet-stream" };
+    const limitIntent = { operationId: randomUUID(), parentId: DRIVE_ROOT, name: "limit-boundary.bin", size: 10 * 1024 ** 3, sha256: "a".repeat(64), contentType: "application/octet-stream" };
     const acceptedLimit = await request("/api/drive/prepare-upload", { method: "POST", body: JSON.stringify(limitIntent) });
     assert.equal(acceptedLimit.status, 200);
     const rejectedLimit = await request("/api/drive/prepare-upload", { method: "POST", body: JSON.stringify({ ...limitIntent, operationId: randomUUID(), size: limitIntent.size + 1 }) });
@@ -332,7 +335,7 @@ export async function verifyDrive(options) {
     assert.equal(revokedReadBody.error.code, "FORBIDDEN");
     assert.equal(downloads, downloadsBeforeRevocation, "revoked content access must not issue another Apple content request");
     return {
-      checks: ["signed-owner-origin", "300-KiB-streaming-upload", "exact-document-commit-and-idempotent-replay", "typed-MCP-metadata", "recursive-HTTP-MCP-listing-search-and-cursor-rotation", "shared-path-and-persisted-private-context", "private-single-use-download", "docws-shared-fallback", "validated-330-and-byte-ranges", "bounded-package-archive", "64-KiB-inline-guidance-and-8-KiB-preview", "contents-permission-revocation"],
+      checks: ["signed-owner-origin", "R2-multipart-staging-resume-and-confirmed-cleanup", "300-KiB-streaming-upload", "exact-document-commit-and-idempotent-replay", "typed-MCP-metadata", "recursive-HTTP-MCP-listing-search-and-cursor-rotation", "shared-path-and-persisted-private-context", "private-single-use-download", "docws-shared-fallback", "validated-330-and-byte-ranges", "bounded-package-archive", "64-KiB-inline-guidance-and-8-KiB-preview", "contents-permission-revocation"],
       uploadedBytes: payloadBytes.length, operationId, metadataTools: 2,
       outboundTransferBytes: observedUpload?.byteLength ?? 0, appleUploadRequests: allocations + transfers + finalizations, downloads,
     };
