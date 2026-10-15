@@ -7,18 +7,19 @@ import { createHash } from "node:crypto";
 import { pathToFileURL } from "node:url";
 import { Readable } from "node:stream";
 import WebSocket from "ws";
+import { DRIVE_FILE_BYTES, DRIVE_FILE_LIMIT_LABEL } from "../src/drive/limits.ts";
 
 const protocols = ["icloud-drive-upload-v1", "icloud-drive-upload-v2"], timeoutMs = 30 * 60_000;
 export async function fileMetadata(path) {
   const info = await stat(path);
-  if (!info.isFile() || !Number.isSafeInteger(info.size) || info.size > 10 * 1024 ** 3) throw new Error("Choose an ordinary file up to 10 GiB.");
+  if (!info.isFile() || !Number.isSafeInteger(info.size) || info.size > DRIVE_FILE_BYTES) throw new Error(`Choose an ordinary file up to ${DRIVE_FILE_LIMIT_LABEL}.`);
   const hash = createHash("sha256");
   for await (const bytes of createReadStream(path)) hash.update(bytes);
   return { name: basename(path), size: info.size, sha256: hash.digest("hex"), contentType: "application/octet-stream" };
 }
 export function validatePlan(value, kind) {
   const plan = value?.transfer ?? value;
-  if (!plan || !(kind === "download" && plan.size === null) && (!Number.isSafeInteger(plan.size) || plan.size < 0 || plan.size > 10 * 1024 ** 3) || !Number.isSafeInteger(plan.expiresAt) || plan.expiresAt <= Date.now()) throw new Error("The transfer plan is invalid or expired. Inspect the original operation through MCP.");
+  if (!plan || !(kind === "download" && plan.size === null) && (!Number.isSafeInteger(plan.size) || plan.size < 0 || plan.size > DRIVE_FILE_BYTES) || !Number.isSafeInteger(plan.expiresAt) || plan.expiresAt <= Date.now()) throw new Error("The transfer plan is invalid or expired. Inspect the original operation through MCP.");
   const url = new URL(plan.url), local = ["127.0.0.1", "localhost"].includes(url.hostname);
   if (url.username || url.password || url.search || url.hash || !new RegExp(`^/api/drive/transfers/${kind}/[a-f0-9-]{36}$`).test(url.pathname)
     || ![kind === "upload" ? "wss:" : "https:", ...(local ? [kind === "upload" ? "ws:" : "http:"] : [])].includes(url.protocol)
@@ -95,7 +96,7 @@ export async function downloadFile(path, value, report = () => {}) {
     if (response.status !== 200 || !response.body) throw new Error(`Download returned HTTP ${response.status}. Request a new read handle through MCP; credentials were not forwarded.`);
     const hash = createHash("sha256"); let size = 0, reported = 0;
     for await (const bytes of Readable.fromWeb(response.body)) {
-      if (size + bytes.length > (plan.size ?? 10 * 1024 ** 3)) throw new Error("Download exceeded the authorized file size.");
+      if (size + bytes.length > (plan.size ?? DRIVE_FILE_BYTES)) throw new Error("Download exceeded the authorized file size.");
       hash.update(bytes);
       let offset = 0;
       while (offset < bytes.length) offset += (await file.write(bytes, offset, bytes.length - offset)).bytesWritten;

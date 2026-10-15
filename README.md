@@ -114,11 +114,11 @@ files and folders. It excludes deletion, content replacement, sharing, packages 
 operations. Search is bounded and explicitly reports incomplete results.
 
 - Inline MCP full reads/uploads: **64 KiB** of decoded bytes, UTF-8 or base64.
-- MCP-authorized uploads/downloads: **10 GiB**. MCP returns a short-lived transfer URL and
+- MCP-authorized uploads/downloads: **2 GiB**. MCP returns a short-lived transfer URL and
   required credential headers; an agent streams file bytes without another browser login.
   Metadata-only uploads use direct WebSocket streaming without R2.
-- Text previews: **8 KiB** of leading UTF-8 bytes, with explicit truncation, for files up to **10 GiB**.
-- Dashboard/multipart uploads and private downloads: **10 GiB**, with a 30-minute transfer budget.
+- Text previews: **8 KiB** of leading UTF-8 bytes, with explicit truncation, for files up to **2 GiB**.
+- Dashboard/multipart uploads and private downloads: **2 GiB**, with a 30-minute transfer budget.
   Uploads above **64 MiB** use resumable **8 MiB** parts in private R2; direct HTTP uploads remain capped at 64 MiB.
 - Downloads require owner authentication. A returned URL is not a public share or an attachment
   automatically available to every MCP client; use the dashboard if the client cannot fetch it.

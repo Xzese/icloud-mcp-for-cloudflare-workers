@@ -16,8 +16,8 @@ function socketFor(reply: string, inspect?: (bytes: Uint8Array) => void) {
   };
 }
 
-test("the large TLS upload sends exact raw bytes beyond 2 GiB, verifies framing and buffers only the receipt", async () => {
-  const size = 2 ** 31 + 17, chunk = new Uint8Array(1024 ** 2).fill(90);
+test("the large TLS upload sends exact raw bytes at the 2 GiB limit, verifies framing and buffers only the receipt", async () => {
+  const size = 2 ** 31, chunk = new Uint8Array(1024 ** 2).fill(90);
   const expected = createHash("sha256"), actual = createHash("sha256");
   for (let left = size; left > 0; left -= chunk.length) expected.update(chunk.subarray(0, Math.min(left, chunk.length)));
   let remaining = size, count = 0, header = false, ended = false;
@@ -90,7 +90,7 @@ test("an early socket rejection cancels pending input and never opens a replacem
 });
 
 test("socket uploads refuse arbitrary origins, account headers, redirects and malformed sizes before connecting", async () => {
-  for (const [target, extra] of [[new URL('https://attacker.example/123/singleFileUpload?tk=synthetic'), {}], [url, { cookie: 'synthetic' }], [url, { 'content-length': '2147483648junk' }]] as const) {
+  for (const [target, extra] of [[new URL('https://attacker.example/123/singleFileUpload?tk=synthetic'), {}], [url, { cookie: 'synthetic' }], [url, { 'content-length': '2147483648junk' }], [url, { 'content-length': '2147483649' }]] as const) {
     await assert.rejects(uploadDriveSocket(target, { method: 'POST', redirect: 'manual', body: new ReadableStream(), headers: { 'content-length': '10', 'content-type': 'application/octet-stream', ...extra } }, () => { assert.fail('Invalid requests must not open a socket'); }), { code: 'PROTOCOL_CHANGED' });
   }
 });

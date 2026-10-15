@@ -6,9 +6,19 @@ import { join } from "node:path";
 import { createServer } from "node:http";
 import { createRequire } from "node:module";
 import { createHash } from "node:crypto";
-import { fileMetadata, uploadFile, downloadFile } from "../scripts/drive-transfer.mjs";
+import { fileMetadata, uploadFile, downloadFile, validatePlan } from "../scripts/drive-transfer.mjs";
 
 const { WebSocketServer } = createRequire(import.meta.url)("ws");
+test("transfer clients accept 2 GiB and reject one byte above the limit before connecting", () => {
+  for (const kind of ["upload", "download"]) {
+    const plan = { url: `${kind === "upload" ? "wss" : "https"}://transfer.example.test/api/drive/transfers/${kind}/${crypto.randomUUID()}`,
+      method: kind === "upload" ? "WEBSOCKET" : "GET", headers: { Authorization: "Bearer c3ludGhldGlj" },
+      expiresAt: Date.now() + 60_000, size: 2 ** 31, protocol: "icloud-drive-upload-v2", sha256: "a".repeat(64) };
+    assert.equal(validatePlan(plan, kind).size, 2 ** 31);
+    assert.throws(() => validatePlan({ ...plan, size: 2 ** 31 + 1 }, kind), /invalid or expired/);
+  }
+});
+
 for (const protocol of ["icloud-drive-upload-v1", "icloud-drive-upload-v2"]) test(`transfer client uses ${protocol} credits, verifies disk bytes, and never reconnects after loss`, async t => {
   const directory = await mkdtemp(join(tmpdir(), "drive-transfer-client-"));
   t.after(() => rm(directory, { recursive: true, force: true }));

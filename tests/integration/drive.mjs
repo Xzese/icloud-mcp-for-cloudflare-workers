@@ -230,7 +230,7 @@ export async function verifyDrive(options) {
     assert.equal(sharedPage.folder.shareContext, sharedItem.shareContext);
     assert.equal(JSON.stringify(sharedPage).includes("private-docws"), false);
 
-    const limitIntent = { operationId: randomUUID(), parentId: DRIVE_ROOT, name: "limit-boundary.bin", size: 10 * 1024 ** 3, sha256: "a".repeat(64), contentType: "application/octet-stream" };
+    const limitIntent = { operationId: randomUUID(), parentId: DRIVE_ROOT, name: "limit-boundary.bin", size: 2 * 1024 ** 3, sha256: "a".repeat(64), contentType: "application/octet-stream" };
     const acceptedLimit = await request("/api/drive/prepare-upload", { method: "POST", body: JSON.stringify(limitIntent) });
     assert.equal(acceptedLimit.status, 200);
     const rejectedLimit = await request("/api/drive/prepare-upload", { method: "POST", body: JSON.stringify({ ...limitIntent, operationId: randomUUID(), size: limitIntent.size + 1 }) });

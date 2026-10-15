@@ -374,7 +374,7 @@ test("streaming permission changes and bad digests prevent upload finalization a
   assert.equal(finalize, 0);
 });
 
-test("a fragmented 10 GiB download uses byte windows without buffer copies or exceeding D1's query budget", async t => {
+test("a fragmented 2 GiB download uses byte windows without buffer copies or exceeding D1's query budget", async t => {
   const current = file("synthetic-maximum.bin", "maximum", DRIVE_ROOT, DRIVE_FILE_BYTES);
   const fragment = new Uint8Array(64 * 1024);
   let remaining = DRIVE_FILE_BYTES;
