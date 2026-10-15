@@ -14,6 +14,8 @@ import { DEFAULT_SERVICE_SETTINGS } from "../src/services/settings.ts";
 import { accountScope } from "../src/lib/canonical.ts";
 import { DRIVE_FILE_BYTES, DRIVE_TRANSFER_BLOCK_BYTES } from "../src/drive/limits.ts";
 import { DriveBucket } from "./helpers/drive-bucket.ts";
+import { authorizeDriveTransfer, driveTransferRoute, DriveTransferPlan } from "../src/drive/transfer-capability.ts";
+import { applicationRoute } from "../src/api/router.ts";
 
 function syntheticDownloadURL() {
   const url = new URL("/B/invented-signature/test.bin", "https://cvws.icloud-content.com");
@@ -33,7 +35,7 @@ const stream = (bytes: Uint8Array) => new ReadableStream<Uint8Array>({ start(con
 async function drain(body: ReadableStream<Uint8Array>) { const reader = body.getReader(); for (;;) { if ((await reader.read()).done) break; } }
 async function fixture(t: TestContext, handler: (url: URL, init: RequestInit) => Promise<Response> | Response) {
   const db = new JobSQLiteD1();
-  const env = { ...db.env(), REMINDERS_OWNER_ID: owner, ENCRYPTION_KEY_ID: "synthetic", ENCRYPTION_KEYS_JSON: JSON.stringify({ synthetic: b64(crypto.getRandomValues(new Uint8Array(32))) }), LIVE_APPLE_CONNECTION_APPROVED: "controlled-device-v2", APPLE_CRYPTO_REVIEW_APPROVED: "device-proof-v2", APPLE_SESSION_RETENTION_WRITES: "absolute-30d-v1" };
+  const env = { ...db.env(), APP_ORIGIN: "https://drive-service.example.test", REMINDERS_OWNER_ID: owner, ENCRYPTION_KEY_ID: "synthetic", ENCRYPTION_KEYS_JSON: JSON.stringify({ synthetic: b64(crypto.getRandomValues(new Uint8Array(32))) }), LIVE_APPLE_CONNECTION_APPROVED: "controlled-device-v2", APPLE_CRYPTO_REVIEW_APPROVED: "device-proof-v2", APPLE_SESSION_RETENTION_WRITES: "absolute-30d-v1" };
   const sessions = new AppleSessionRepository(env, owner), settings = new ServiceSettingsRepository(env, owner);
   const session: AppleSession = { connection: { ...identity, cloudKitURL: "https://p01-ckdatabasews.icloud.com/database/1/com.apple.reminders/production/private" }, login: loginAssurance(), pcs: { consentRequested: true, pcsAttempts: 1, consentChecks: 1, expiresAt: Date.now() + 300_000, nextAttemptAt: 0 }, auth: { clientId: identity.clientId, headers: {}, cookies: [{ name: "X-APPLE-WEBAUTH-VALIDATE", value: "v=1:t=synthetic-validation-token", domain: "icloud.com", hostOnly: false, path: "/", secure: true, expiresAt: null }] }, services: { version: 1, reminders: { state: "DEVICE_APPROVAL_PENDING", pcs: { consentRequested: true, pcsAttempts: 1, consentChecks: 1, expiresAt: Date.now() + 300_000, nextAttemptAt: 0 }, action: "wait-for-reminders-keys" }, drive: { state: "READY", connection } } };
   const begun = await sessions.begin((await sessions.status()).generation);
@@ -47,6 +49,60 @@ async function fixture(t: TestContext, handler: (url: URL, init: RequestInit) =>
 async function uploadInput(name: string, bytes = new TextEncoder().encode("abc")) {
   return { parentId: DRIVE_ROOT, name, operationId: crypto.randomUUID(), size: bytes.length, sha256: hex(await digest(bytes)), contentType: "text/plain", contentBase64: b64(bytes) };
 }
+
+test("MCP metadata-only upload authorizes one large direct transfer without R2 or any Apple write, and cannot reauthorize unknown work", async t => {
+  let reads = 0;
+  const f = await fixture(t, url => {
+    assert.equal(url.pathname, "/retrieveItemDetailsInFolders"); reads++;
+    return json([{ ...root, items: [], directChildrenCount: 0 }]);
+  });
+  const input = { ...await uploadInput("capability-2GiB.bin"), contentBase64: "", size: 2 ** 31 };
+  const prepared = await f.service.upload(input);
+  assert.ok("transfer" in prepared && prepared.transfer);
+  const transfer = DriveTransferPlan.parse(prepared.transfer);
+  assert.equal(prepared.phase, "prepared"); assert.equal(transfer.size, 2 ** 31);
+  const url = transfer.url.replace("wss:", "https:"), route = driveTransferRoute(new URL(url).pathname)!;
+  const claim = await authorizeDriveTransfer(new Request(url, { headers: transfer.headers }), f.env, route);
+  assert.equal((await f.service.streamUploadStatus(input.operationId, claim)).size, 2 ** 31);
+  await assert.rejects(f.service.streamUploadStatus(input.operationId, { ...claim, inputHash: "0".repeat(64) }), { code: "CONFLICT" });
+  f.db.sqlite.prepare("UPDATE drive_operations SET phase = 'unknown' WHERE operation_id = ?").run(input.operationId);
+  const unresolved = await f.service.upload(input);
+  assert.equal(unresolved.phase, "unknown"); assert.ok(!("transfer" in unresolved));
+  await assert.rejects(f.service.streamUploadStatus(input.operationId, claim), { code: "WRITE_OUTCOME_UNKNOWN" });
+  assert.equal(reads, 1);
+  const settings = await f.settings.load();
+  await f.settings.save({ expectedRevision: settings.revision, settings: { ...settings.settings, drive: { ...settings.settings.drive, upload: false } } });
+  await assert.rejects(f.service.streamUploadStatus(input.operationId, claim), { code: "FORBIDDEN" });
+});
+
+test("MCP download capability streams without a browser identity, checks exact versions, consumes once and dies on settings/account change", async t => {
+  let downloads = 0, current = file();
+  const f = await fixture(t, url => {
+    if (url.pathname === "/retrieveItemDetails") return json({ items: [current] });
+    if (url.pathname.endsWith("/download/by_id")) return json({ document_id: current.docwsid, data_token: { url: syntheticDownloadURL() } });
+    if (url.hostname === "cvws.icloud-content.com") { downloads++; return new Response("abc", { headers: { "content-length": "3" } }); }
+    throw new Error("Unexpected synthetic download endpoint.");
+  });
+  const prepared = await f.service.downloadTransfer({ itemId: current.drivewsid });
+  assert.ok(prepared.transfer);
+  const response = (await applicationRoute(new Request(prepared.url, { headers: prepared.transfer.headers }), f.env))!;
+  assert.equal(response.status, 200); assert.equal(await response.text(), "abc");
+  assert.match(response.headers.get("x-robots-tag")!, /noindex.*nofollow/);
+  assert.equal(downloads, 1);
+  assert.equal((await applicationRoute(new Request(prepared.url, { headers: prepared.transfer.headers }), f.env))!.status, 409);
+  const stale = await f.service.downloadTransfer({ itemId: current.drivewsid });
+  current = { ...current, etag: "changed-version" };
+  assert.equal((await applicationRoute(new Request(stale.url, { headers: stale.transfer!.headers }), f.env))!.status, 409);
+  assert.equal(downloads, 1);
+  const changedSettings = await f.service.downloadTransfer({ itemId: current.drivewsid });
+  const settings = await f.settings.load();
+  await f.settings.save({ expectedRevision: settings.revision, settings: { ...settings.settings, drive: { ...settings.settings.drive, organize: false } } });
+  assert.equal((await applicationRoute(new Request(changedSettings.url, { headers: changedSettings.transfer!.headers }), f.env))!.status, 409);
+  const changedAccount = await f.service.downloadTransfer({ itemId: current.drivewsid });
+  await f.sessions.begin(f.generation);
+  assert.notEqual((await applicationRoute(new Request(changedAccount.url, { headers: changedAccount.transfer!.headers }), f.env))!.status, 200);
+  assert.equal(downloads, 1);
+});
 
 test("Drive readiness is independent of Reminders; a permission flip stops dispatch and result release", async t => {
   let metadata = 0, writes = 0;
@@ -318,7 +374,7 @@ test("streaming permission changes and bad digests prevent upload finalization a
   assert.equal(finalize, 0);
 });
 
-test("a fragmented 10 GiB download stays below D1's 1000-query invocation budget with bounded blocks", async t => {
+test("a fragmented 10 GiB download uses byte windows without buffer copies or exceeding D1's query budget", async t => {
   const current = file("synthetic-maximum.bin", "maximum", DRIVE_ROOT, DRIVE_FILE_BYTES);
   const fragment = new Uint8Array(64 * 1024);
   let remaining = DRIVE_FILE_BYTES;
@@ -332,18 +388,18 @@ test("a fragmented 10 GiB download stays below D1's 1000-query invocation budget
     } }, { highWaterMark: 0 }));
   });
   const handle = await f.service.download({ itemId: current.drivewsid });
-  let queries = 0, count = 0, blocks = 0;
+  let queries = 0, count = 0;
   f.db.afterStatement = async () => { assert.ok(++queries <= 1000, "D1 queries per download invocation"); };
   const response = await f.service.downloadContent(handle.handleId), reader = response.body!.getReader();
   for (;;) {
     const next = await reader.read(); if (next.done) break;
     assert.ok(next.value.length <= DRIVE_TRANSFER_BLOCK_BYTES);
-    count += next.value.length; blocks++;
+    assert.equal(next.value.buffer, fragment.buffer, "Forward source slices without aggregate buffer copies");
+    count += next.value.length;
   }
   reader.releaseLock();
   assert.equal(count, DRIVE_FILE_BYTES); assert.equal(remaining, 0);
-  assert.equal(blocks, Math.ceil(DRIVE_FILE_BYTES / DRIVE_TRANSFER_BLOCK_BYTES));
-  assert.ok(queries > blocks && queries < 1000);
+  assert.ok(queries >= Math.ceil(DRIVE_FILE_BYTES / DRIVE_TRANSFER_BLOCK_BYTES) && queries < 1000);
 });
 
 test("transfer fencing revalidates a changed session and stops before releasing a revoked block", async t => {
@@ -389,6 +445,28 @@ test("cancellation or expiry during a transfer fence query cannot release its bu
     if (sql.includes("FROM apple_session_state a LEFT JOIN")) clock = expiry;
   };
   await assert.rejects(expired.arrayBuffer(), { code: "AUTH_EXPIRED" });
+});
+
+test("expiry and cancellation stop small fragments inside an already authorized byte window", async t => {
+  const f = await fixture(t, url => {
+      if (url.pathname === "/retrieveItemDetails") return json({ items: [file()] });
+      if (url.pathname.endsWith("/download/by_id")) return json({ data_token: { url: syntheticDownloadURL() } });
+      return new Response(new ReadableStream<Uint8Array>({ pull(controller) { controller.enqueue(new Uint8Array([1])); } }, { highWaterMark: 0 }));
+  });
+  for (const kind of ["expiry", "abort"] as const) {
+    const abort = new AbortController();
+    const handle = await f.service.download({ itemId: file().drivewsid });
+    const response = await f.service.downloadContent(handle.handleId, abort.signal), reader = response.body!.getReader();
+    assert.equal((await reader.read()).value!.length, 1);
+    if (kind === "abort") abort.abort(new Error("Synthetic fragment cancellation"));
+    else {
+      const expiry = (await f.sessions.load()).session.login.expiresAt;
+      t.mock.method(Date, "now", () => expiry);
+    }
+    await assert.rejects(reader.read(), kind === "abort" ? /Synthetic fragment cancellation/ : { code: "AUTH_EXPIRED" });
+    reader.releaseLock();
+    t.mock.restoreAll();
+  }
 });
 
 test("search uses bounded selected-tree continuations and refuses stale scope and filename collisions", async t => {

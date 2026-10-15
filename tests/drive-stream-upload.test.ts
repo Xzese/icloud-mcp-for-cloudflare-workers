@@ -82,6 +82,12 @@ test("direct receipt recovery accepts a confirmed result without requesting any 
   assert.equal(pendingDriveStreamUpload(), null);
 });
 
+test("direct server failures surface the public error and retain the original upload", async t => {
+  browser(t, () => "prepared", socket => socket.message({ type: "failed", error: { code: "WRITE_OUTCOME_UNKNOWN", message: "Inspect the original operation; its Apple outcome is uncertain." } }));
+  await assert.rejects(streamDriveFile(file, context, () => {}), /Inspect the original operation; its Apple outcome is uncertain/);
+  assert.ok(pendingDriveStreamUpload());
+});
+
 test("direct upload requires browser persistence before sending a new intent", async t => {
   const { storage } = browser(t, () => { assert.fail("Network must not be reached"); }, () => assert.fail("Socket must not be opened"));
   t.mock.method(storage, "setItem", () => { throw new Error("synthetic storage unavailable"); });

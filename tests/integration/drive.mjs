@@ -43,6 +43,9 @@ async function bytesOf(stream) {
 export async function verifyDrive(options) {
   await verifyMultipartDrive(options);
   await verifyMultipartDrive(options, { transport: "stream" });
+  await verifyMultipartDrive(options, { transport: "stream", legacyProtocol: true });
+  await verifyMultipartDrive(options, { transport: "stream", capability: true });
+  await verifyMultipartDrive(options, { transport: "stream", capability: true, fault: "disconnect" });
   for (const fault of ["disconnect", "frame", "checksum"]) await verifyMultipartDrive(options, { transport: "stream", fault });
   const secret = randomBytes(32).toString("base64");
   const payloadBytes = randomBytes(300 * 1024);
@@ -103,7 +106,8 @@ export async function verifyDrive(options) {
       try {
         body = await bytesOf(request.body);
         binaryOffset = Buffer.from(body).indexOf(Buffer.from(payloadBytes.subarray(0, 32)));
-        assert.notEqual(binaryOffset, -1, "the multipart transfer body must be consumed and contain the exact uploaded bytes");
+        assert.equal(binaryOffset, 0, "The raw transfer starts with the file bytes");
+        assert.equal(body.length, payloadBytes.length, "The raw upload has no form framing");
         assert.ok(binaryOffset + payloadBytes.length <= body.length);
         assert.ok(Buffer.from(body.subarray(binaryOffset, binaryOffset + payloadBytes.length)).equals(Buffer.from(payloadBytes)));
         observedUpload = { byteLength: body.length, fileByteLength: payloadBytes.length, fileHash: createHash("sha256").update(body.subarray(binaryOffset, binaryOffset + payloadBytes.length)).digest("hex") };
@@ -287,14 +291,15 @@ export async function verifyDrive(options) {
 
     const preparedDownload = await mcp("tools/call", { name: "download_icloud_drive_file", arguments: { expectedGeneration: generation, itemId: typedItem.id } });
     assert.equal(preparedDownload.result.structuredContent.item.documentId, uploadedDocId);
-    assert.equal(preparedDownload.result.structuredContent.url, `/api/drive/downloads/${preparedDownload.result.structuredContent.handleId}`);
+    assert.match(preparedDownload.result.structuredContent.url, /\/api\/drive\/transfers\/download\/[a-f0-9-]{36}$/);
     assert.equal(JSON.stringify(preparedDownload.result.structuredContent).includes("icloud-content"), false);
-    const downloadResponse = await request(preparedDownload.result.structuredContent.url);
+    const delegated = (value, range) => worker.dispatchFetch(value.url, { headers: { ...value.transfer.headers, ...(range ? { range } : {}) } });
+    const downloadResponse = await delegated(preparedDownload.result.structuredContent);
     assert.equal(downloadResponse.status, 200);
     assert.equal(downloadResponse.headers.get("set-cookie"), null);
     assert.match(downloadResponse.headers.get("content-disposition"), /attachment/);
     assert.ok(Buffer.from(await downloadResponse.arrayBuffer()).equals(Buffer.from(payloadBytes)));
-    assert.equal((await request(preparedDownload.result.structuredContent.url)).status, 409, "download handles are single-use");
+    assert.equal((await delegated(preparedDownload.result.structuredContent)).status, 409, "download handles are single-use");
     assert.equal(downloads, 1);
 
     const oversizedRead = await mcp("tools/call", { name: "read_icloud_drive_file", arguments: { expectedGeneration: generation, itemId: typedItem.id } });
@@ -310,14 +315,14 @@ export async function verifyDrive(options) {
 
     const rangeHandle = await mcp("tools/call", { name: "download_icloud_drive_file", arguments: { itemId: typedItem.id } });
     redirectDownload = true;
-    const rangeResponse = await request(rangeHandle.result.structuredContent.url, { range: "bytes=2-5" });
+    const rangeResponse = await delegated(rangeHandle.result.structuredContent, "bytes=2-5");
     assert.equal(rangeResponse.status, 206);
     assert.equal(rangeResponse.headers.get("content-range"), `bytes 2-5/${payloadBytes.length}`);
     assert.ok(Buffer.from(await rangeResponse.arrayBuffer()).equals(Buffer.from(payloadBytes.subarray(2, 6))));
-    assert.equal((await request(rangeHandle.result.structuredContent.url, { range: "bytes=2-5" })).status, 409);
+    assert.equal((await delegated(rangeHandle.result.structuredContent, "bytes=2-5")).status, 409);
     redirectDownload = false; packageDownload = true;
     const packageHandle = await mcp("tools/call", { name: "download_icloud_drive_file", arguments: { itemId: typedItem.id } });
-    const archive = await request(packageHandle.result.structuredContent.url);
+    const archive = await delegated(packageHandle.result.structuredContent);
     assert.equal(archive.status, 200);
     assert.equal(archive.headers.get("content-length"), null);
     assert.ok(archive.headers.get("content-disposition").includes(".zip"));

@@ -418,7 +418,7 @@ export class DriveClient {
     const checked = DriveItemSchema.parse(selected);
     if (checked.type === "file" && checked.size === 0 && !checked.package) return new Response(null, { status: 200 });
     const prepared = await this.prepareDownload(selected);
-    return this.transport.download(prepared.url, signal ?? this.http.signal);
+    return this.transport.download(prepared.url, signal ?? this.http.signal, undefined, checked.package ? undefined : checked.size ?? undefined);
   }
 
   async allocateUpload(input: { name: string; size: number; contentType: string }): Promise<{ documentId: string; url: string }> {

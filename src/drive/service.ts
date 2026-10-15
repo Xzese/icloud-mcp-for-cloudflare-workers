@@ -1,3 +1,4 @@
+import { uploadDriveSocket } from "../transport/drive-upload-socket.ts";
 import { z } from "zod";
 import { DRIVE_FILE_LIMIT_LABEL, DRIVE_DIRECT_UPLOAD_BYTES, DRIVE_UPLOAD_PART_BYTES, DRIVE_UPLOAD_MINIMUM_LEASE_MS, DRIVE_TRANSFER_BLOCK_BYTES } from "./limits.ts";
 import { DriveStaging } from "./staging.ts";
@@ -21,6 +22,7 @@ import { DriveFolderListingDiagnostics, type DriveSearchReason } from "./listing
 import { accountScope, fingerprint } from "../lib/canonical.ts";
 import { b64, unb64, hex } from "../crypto/bytes.ts";
 import type { RuntimeEnv } from "../platform/sites.ts";
+import { issueDriveTransfer, type TransferClaim } from "./transfer-capability.ts";
 import { ListDrive, GetDriveItem, SearchDrive, TraverseDrive, ResolveDriveFolderPath, ReadDrive, DownloadDrive, UploadDrive, UploadDriveMetadata, CreateDriveFolder, RenameDriveItem, MoveDriveItem, GetDriveOperation, OperationId, INLINE_FILE_BYTES, DRIVE_FILE_BYTES, INLINE_UPLOAD_GUIDANCE } from "./schemas.ts";
 
 type Saved = Awaited<ReturnType<AppleSessionRepository["load"]>>;
@@ -91,8 +93,9 @@ export class DriveService {
     if (!pinned) saved = await new AppleSessionRenewal(this.env, this.sessions).ensure(saved.fence.generation, appleRequestBudget());
     requireServiceReady(saved.session, saved.state, "drive", saved.action);
     const connection = requireDriveConnection(saved.session);
-    const scope = { account: await accountScope(this.owner, connection.dsid), generation: saved.fence.generation, permissionRevision: revision, expiresAt: saved.session.login.expiresAt };
+    const scope = { account: await accountScope(this.owner, connection.dsid), generation: saved.fence.generation, permissionRevision: revision, expiresAt: Math.min(saved.session.login.expiresAt, pinned?.expiresAt ?? Infinity) };
     if (pinned && (scope.account !== pinned.account || scope.generation !== pinned.generation || scope.permissionRevision !== pinned.permissionRevision)) conflict("The Drive request's settings or account changed.");
+    if (scope.expiresAt <= Date.now()) throw new AppError("AUTH_EXPIRED", "This Drive authorization expired.", 410);
     const fence = await this.sessions.claimRenewal(saved.fence.generation, saved.fence.version);
     try {
       saved = await this.sessions.load();
@@ -139,8 +142,8 @@ export class DriveService {
       throw error;
     }
   }
-  private async metadata<T>(permission: ServicePermission, generation: number | undefined, run: (context: Context) => Promise<T>): Promise<T> {
-    const context = await this.open(permission, generation);
+  private async metadata<T>(permission: ServicePermission, generation: number | undefined, run: (context: Context) => Promise<T>, pinned?: DriveScope): Promise<T> {
+    const context = await this.open(permission, generation, pinned);
     let failure: unknown;
     try { const result = await run(context); await this.finish(context); return result; }
     catch (error) { failure = error; throw error; }
@@ -223,11 +226,41 @@ export class DriveService {
     });
   }
   private async transferClient(scope: DriveScope, permission: ServicePermission, auth: Saved["session"]["auth"]) {
-    const send: typeof fetch = async (input, init) => { await this.guard(scope, permission); return fetch(input, init); };
+    const send: typeof fetch = async (input, init) => {
+      await this.guard(scope, permission);
+      if (permission === "drive.upload" && this.env.DRIVE_UPLOAD_TRANSPORT !== "fetch" && init?.method === "POST" && Number(new Headers(init.headers).get("content-length")) > 64 * 1024 ** 2) {
+        return uploadDriveSocket(new URL(String(input)), init);
+      }
+      return fetch(input, init);
+    };
     return AppleAuthHTTP.restore(auth, send);
   }
   private checkedStream(source: ReadableStream<Uint8Array>, scope: DriveScope, permission: ServicePermission, size: number | null, signal?: AbortSignal, hash?: string, blockBytes = DRIVE_TRANSFER_BLOCK_BYTES) {
-    const reader = source.getReader(), digest = sha256.create();
+    type BulkReader = { readAtLeast(min: number, view: Uint8Array): Promise<ReadableStreamReadResult<Uint8Array>>; cancel(reason?: unknown): Promise<void>; releaseLock(): void };
+    let bulkReader: BulkReader | undefined;
+    try {
+      const candidate = source.getReader({ mode: "byob" }) as unknown as BulkReader;
+      if (typeof candidate.readAtLeast === "function") bulkReader = candidate;
+      else candidate.releaseLock();
+    } catch { /* Portable JS streams retain the zero-copy fragment path. */ }
+    const reader = bulkReader ?? source.getReader();
+    // Native streaming SHA-256 avoids spending the hosted Worker's CPU budget
+    // hashing gigabytes in JavaScript. Neither path retains the complete file.
+    const NativeDigest = (crypto as Crypto & { DigestStream?: typeof DigestStream }).DigestStream;
+    const nativeDigest = hash !== undefined && NativeDigest ? new NativeDigest("SHA-256") : undefined;
+    const digestWriter = nativeDigest?.getWriter();
+    void nativeDigest?.digest.catch(() => {});
+    const digest = hash !== undefined && !nativeDigest ? sha256.create() : undefined;
+    const finishDigest = async () => {
+      if (nativeDigest && digestWriter) {
+        await digestWriter.close();
+        digestWriter.releaseLock();
+        return hex(new Uint8Array(await nativeDigest.digest));
+      }
+      return digest ? hex(digest.digest()) : undefined;
+    };
+    const cancelDigest = async (reason?: unknown) => { await digestWriter?.abort(reason).catch(() => {}); };
+    console.info({ event: "drive-transfer-reader", bulk: !!bulkReader, nativeHash: !!nativeDigest, hashing: hash !== undefined });
     let count = 0;
     let saved: Saved | undefined, pending: Uint8Array | undefined, ended = false;
     const guard = async () => {
@@ -243,41 +276,51 @@ export class DriveService {
       conflict("The Apple session is busy updating. Resume this Drive request after inspecting its operation.");
     };
     let verified = false;
+    const checkActive = () => {
+      if (signal?.aborted) throw signal.reason ?? new AppError("CONFLICT", "The Drive transfer was cancelled.", 409);
+      if (Date.now() >= scope.expiresAt) throw new AppError("AUTH_EXPIRED", "The Drive authorization expired during transfer.", 409);
+    };
+    let authorizedThrough = 0;
     const stream = new ReadableStream<Uint8Array>({
       async pull(controller) {
         try {
-          if (signal?.aborted) throw signal.reason ?? new AppError("CONFLICT", "The Drive transfer was cancelled.", 409);
-          // Network/R2 chunks can be only a few KiB. Authorize bounded blocks,
-          // not every socket chunk, to stay within D1's per-invocation budget.
-          const bytes = new Uint8Array(Math.min(blockBytes, size === null ? blockBytes : Math.max(1, size - count)));
-          let length = 0;
-          while (length < bytes.length && !ended) {
-            if (!pending?.byteLength) {
-              const next = await reader.read();
-              if (next.done) { ended = true; break; }
-              pending = next.value;
-            }
-            const take = Math.min(bytes.length - length, pending.byteLength);
-            bytes.set(pending.subarray(0, take), length); length += take;
-            pending = pending.subarray(take);
+          checkActive();
+          while (!pending?.byteLength && !ended) {
+            const capacity = Math.min(blockBytes, size === null ? blockBytes : Math.max(1, size - count));
+            const next = bulkReader
+              ? await bulkReader.readAtLeast(capacity, new Uint8Array(capacity))
+              : await (reader as ReadableStreamDefaultReader<Uint8Array>).read();
+            if (next.value?.byteLength) pending = next.value;
+            else if (next.done) ended = true;
           }
-          if (signal?.aborted) throw signal.reason ?? new AppError("CONFLICT", "The Drive transfer was cancelled.", 409);
-          await guard();
-          if (signal?.aborted) throw signal.reason ?? new AppError("CONFLICT", "The Drive transfer was cancelled.", 409);
-          if (!length && ended) {
-            if (size !== null && count !== size || hash !== undefined && hex(digest.digest()) !== hash) throw new AppError("VALIDATION_ERROR", "The Drive content length or SHA-256 digest did not match its metadata.", 400);
+          checkActive();
+          if (ended) {
+            await guard();
+            if (size !== null && count !== size || hash !== undefined && await finishDigest() !== hash) throw new AppError("VALIDATION_ERROR", "The Drive content length or SHA-256 digest did not match its metadata.", 400);
+            checkActive();
             verified = true; reader.releaseLock(); controller.close(); return;
           }
-          count += length;
+          // Authorize byte windows without copying network chunks into large
+          // aggregate buffers. Those copies consumed the hosted CPU budget on
+          // both uploads and downloads. A slice never crosses a guard window.
+          if (count >= authorizedThrough) {
+            await guard();
+            authorizedThrough = count + blockBytes;
+          }
+          const take = Math.min(pending!.byteLength, authorizedThrough - count);
+          const block = pending!.subarray(0, take);
+          pending = pending!.subarray(take);
+          count += take;
           if (size !== null && count > size || count > DRIVE_FILE_BYTES) throw new AppError("VALIDATION_ERROR", "The Drive content exceeded its declared size.", 400);
-          const block = bytes.subarray(0, length);
-          if (hash !== undefined) digest.update(block);
+          if (digestWriter) await digestWriter.write(block);
+          else digest?.update(block);
+          checkActive();
           controller.enqueue(block);
-        } catch (error) { await reader.cancel(error).catch(() => {}); controller.error(error); }
+        } catch (error) { await cancelDigest(error); await reader.cancel(error).catch(() => {}); controller.error(error); }
       },
-      async cancel(reason) { await reader.cancel(reason).catch(() => {}); },
+      async cancel(reason) { await cancelDigest(reason); await reader.cancel(reason).catch(() => {}); },
     }, { highWaterMark: 0 });
-    return { stream, verified: () => verified, cancel: (reason?: unknown) => reader.cancel(reason).catch(() => {}) };
+    return { stream, verified: () => verified, cancel: async (reason?: unknown) => { await cancelDigest(reason); await reader.cancel(reason).catch(() => {}); } };
   }
   private async content(item: DriveItem, c: Context, signal?: AbortSignal, range?: DriveByteRange, inline = false) {
     ordinaryFile(item, DRIVE_FILE_BYTES);
@@ -287,7 +330,7 @@ export class DriveService {
     await this.finish(c);
     const http = await this.transferClient(c.scope, "drive.contents", c.http.snapshot());
     await this.guard(c.scope, "drive.contents");
-    const response = prepared ? await new DriveHTTP(http.http).download(prepared.url, signal, range) : new Response(new Uint8Array());
+    const response = prepared ? await new DriveHTTP(http.http).download(prepared.url, signal, range, packaged ? undefined : item.size!) : new Response(new Uint8Array());
     try { await this.guard(c.scope, "drive.contents"); }
     catch (error) { await response.body?.cancel(error).catch(() => {}); throw error; }
     const source = response.body ?? new ReadableStream<Uint8Array>({ start(controller) { controller.close(); } });
@@ -346,20 +389,27 @@ export class DriveService {
       return { item, encoding: request.encoding, content, bytesRead: bytes.length, truncated, generation: c.scope.generation };
     } finally { await this.close(c); }
   }
-  async download(input: unknown) {
+  async downloadTransfer(input: unknown) {
+    const prepared = await this.download(input, true);
+    return { ...prepared, url: prepared.transfer!.url };
+  }
+  async download(input: unknown, delegated = false) {
     const request = parse(DownloadDrive, input);
     return this.metadata("drive.contents", request.expectedGeneration, async c => {
       const item = await c.client.getItem(request.itemId, request.shareContext);
       ordinaryFile(item, DRIVE_FILE_BYTES);
       const handle = await this.operations.handle("download", { item }, c.scope);
-      return { handleId: handle.id, url: `/api/drive/downloads/${handle.id}`, expiresAt: handle.expiresAt, item, generation: c.scope.generation };
+      return { handleId: handle.id, url: `/api/drive/downloads/${handle.id}`, expiresAt: handle.expiresAt, item, generation: c.scope.generation,
+        ...(delegated ? { transfer: await issueDriveTransfer(this.env, this.owner, "download", handle.id, await fingerprint(item), { ...c.scope, expiresAt: handle.expiresAt }, { size: item.package ? null : item.size! }) } : {}) };
     });
   }
-  async downloadContent(handleId: string, signal?: AbortSignal, rangeHeader: string | null = null): Promise<Response> {
+  async downloadContent(handleId: string, signal?: AbortSignal, rangeHeader: string | null = null, claim?: TransferClaim): Promise<Response> {
     parse(z.string().uuid(), handleId);
-    const c = await this.open("drive.contents");
+    if (claim && (claim.kind !== "download" || claim.id !== handleId || claim.owner !== this.owner)) conflict("This capability belongs to another download.");
+    const c = await this.open("drive.contents", claim?.scope.generation, claim?.scope);
     try {
       const saved = parse(z.object({ item: DriveItemSchema }).strict(), await this.operations.consumeHandle(handleId, "download", c.scope));
+      if (claim && await fingerprint(saved.item) !== claim.inputHash) conflict("This capability belongs to another file version.");
       const current = await c.client.getItem(saved.item.id, saved.item.shareContext);
       if (!exact(current, saved.item)) conflict("The Drive file changed after its download handle was created. Request a fresh download.");
       return await this.content(current, c, signal, byteRange(rangeHeader, current.size!));
@@ -503,16 +553,32 @@ export class DriveService {
       return { operationId: row.operation_id, phase: row.phase, socketPath: `/api/drive/uploads/${row.operation_id}/stream` };
     });
   }
-  async streamUploadStatus(operationId: string) {
+  async prepareTransferUpload(input: unknown) {
+    const request = parse(UploadDriveMetadata, input);
+    return this.metadata("drive.upload", request.expectedGeneration, async c => {
+      const row = await this.operations.create(request.operationId, "stream-upload", request, c.scope);
+      if (row.permission_revision !== c.scope.permissionRevision) conflict("Upload permissions changed since this intent was prepared.");
+      if (row.phase === "prepared") await this.destination(c, request.parentId, request.name);
+      const result = this.publicOperation(row, await this.operations.data(row));
+      // Inspect uncertain work through MCP; never mint a fresh dispatch right
+      // for an operation whose Apple outcome is not provably replayable.
+      if (!["prepared", "allocated", "uploaded", "confirmed"].includes(row.phase)) return result;
+      return { ...result, transfer: await issueDriveTransfer(this.env, this.owner, "upload", row.operation_id, row.input_hash,
+        { ...c.scope, expiresAt: Math.min(c.scope.expiresAt, row.expires_at) }, { size: request.size, sha256: request.sha256 }) };
+    });
+  }
+  async streamUploadStatus(operationId: string, claim?: TransferClaim) {
+    if (claim && (claim.kind !== "upload" || claim.id !== operationId || claim.owner !== this.owner)) conflict("This capability belongs to another upload.");
     return this.metadata("drive.upload", undefined, async c => {
       const row = await this.operations.get(parse(OperationId, operationId), c.scope);
       if (row.kind !== "stream-upload") conflict("This operation was not prepared for direct streaming.");
+      if (claim && (row.input_hash !== claim.inputHash || row.permission_revision !== c.scope.permissionRevision)) conflict("This capability belongs to different upload input or permissions.");
       if (!["prepared", "allocated", "uploaded", "confirmed"].includes(row.phase)) throw unknownOutcome(row.operation_id);
       return { operationId: row.operation_id, phase: row.phase, size: parse(UploadDriveMetadata, (await this.operations.data(row)).input).size };
-    });
+    }, claim?.scope);
   }
-  async uploadStreamContent(operationId: string, body: ReadableStream<Uint8Array>, signal: AbortSignal) {
-    return this.uploadContent(operationId, body, signal, false, true);
+  async uploadStreamContent(operationId: string, body: ReadableStream<Uint8Array>, signal: AbortSignal, claim?: TransferClaim, ready?: () => void) {
+    return this.uploadContent(operationId, body, signal, false, true, claim, ready);
   }
   private staging(context: Context) {
     return new DriveStaging(this.requireStagingBucket(), this.operations, context.scope, () => this.guard(context.scope, "drive.upload"));
@@ -556,22 +622,26 @@ export class DriveService {
     const validated = UploadDrive.safeParse(input);
     if (!validated.success && validated.error.issues.some(issue => issue.code === "too_big" && ["size", "contentBase64"].includes(String(issue.path[0])))) throw new AppError("VALIDATION_ERROR", INLINE_UPLOAD_GUIDANCE, 413);
     const request = parse(UploadDrive, input);
+    const metadata = parse(UploadDriveMetadata, Object.fromEntries(Object.entries(request).filter(([key]) => key !== "contentBase64")));
+    if (request.contentBase64 === undefined || request.contentBase64 === "" && request.size > 0) return this.prepareTransferUpload(metadata);
+    if (request.size > INLINE_FILE_BYTES) throw new AppError("VALIDATION_ERROR", INLINE_UPLOAD_GUIDANCE, 413);
     let bytes: Uint8Array;
     try { bytes = unb64(request.contentBase64, INLINE_FILE_BYTES); } catch { throw new AppError("VALIDATION_ERROR", "The inline upload is not valid bounded base64.", 400); }
     if (bytes.length !== request.size || hex(sha256(bytes)) !== request.sha256) throw new AppError("VALIDATION_ERROR", "The inline upload length or SHA-256 digest did not match.", 400);
-    const metadata = parse(UploadDriveMetadata, Object.fromEntries(Object.entries(request).filter(([key]) => key !== "contentBase64")));
     await this.prepareUpload(metadata);
     return this.uploadContent(request.operationId, new ReadableStream<Uint8Array>({ start(controller) { controller.enqueue(bytes); controller.close(); } }));
   }
-  async uploadContent(operationId: string, body: ReadableStream<Uint8Array>, signal?: AbortSignal, staged = false, streamed = false) {
+  async uploadContent(operationId: string, body: ReadableStream<Uint8Array>, signal?: AbortSignal, staged = false, streamed = false, claim?: TransferClaim, ready?: () => void) {
     operationId = parse(OperationId, operationId);
-    let c: Context | null = await this.open("drive.upload");
+    if (claim && (claim.kind !== "upload" || claim.id !== operationId || claim.owner !== this.owner)) conflict("This capability belongs to another upload.");
+    let c: Context | null = await this.open("drive.upload", claim?.scope.generation, claim?.scope);
     const scope = c.scope;
     let row: DriveOperation;
     let data: DriveOperationData;
     let request: Upload;
     try {
       row = await this.operations.get(operationId, scope);
+      if (claim && (row.input_hash !== claim.inputHash || row.permission_revision !== scope.permissionRevision)) conflict("This capability belongs to different upload input or permissions.");
       data = await this.operations.data(row);
       if (row.kind !== (streamed ? "stream-upload" : "upload")) conflict("This operation belongs to a different upload transport.");
       request = parse(UploadDriveMetadata, data.input);
@@ -592,7 +662,9 @@ export class DriveService {
         await this.finish(c); return this.publicOperation(row, await this.operations.data(row));
       }
       if (row.phase === "prepared") {
+        if (signal?.aborted) throw signal.reason;
         await this.destination(c, request.parentId, request.name);
+        if (signal?.aborted) throw signal.reason;
         await this.guard(scope, "drive.upload");
         row = await this.operations.checkpoint(row, "allocating", data);
         await this.operations.assertLease(row);
@@ -613,6 +685,7 @@ export class DriveService {
         const checked = this.checkedStream(body, scope, "drive.upload", request.size, signal, request.sha256);
         let receipt;
         try {
+          ready?.();
           receipt = await client.uploadBytes(allocation, checked.stream, { name: request.name, size: request.size, signal });
           if (!checked.verified()) throw new AppError("VALIDATION_ERROR", "The upload server responded before the full content was verified.", 400);
         } catch (error) { await checked.cancel(error); throw error; }

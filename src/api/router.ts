@@ -11,7 +11,9 @@ import { z } from "zod";
 import { ServiceSettingsRepository } from "../persistence/service-settings.ts";
 import { ServiceSettingsSchema } from "../services/settings.ts";
 import { DriveService } from "../drive/service.ts";
+import { probeDriveContentSocket } from "../transport/drive-socket-probe.ts";
 import { driveUploadSocket } from "../drive/upload-socket.ts";
+import { authorizeDriveTransfer, driveTransferRoute } from "../drive/transfer-capability.ts";
 import { DriveConsent, INLINE_REQUEST_BYTES, INLINE_UPLOAD_GUIDANCE } from "../drive/schemas.ts";
 
 async function readJSON(request: Request, limit = 12_288): Promise<unknown> {
@@ -20,12 +22,28 @@ async function readJSON(request: Request, limit = 12_288): Promise<unknown> {
   catch { throw new AppError("VALIDATION_ERROR", "Provide a valid JSON request.", 400); }
 }
 
-const json = (data: unknown, status = 200) => Response.json(data, { status, headers: { "cache-control": "private, no-store", "x-content-type-options": "nosniff" } });
+const json = (data: unknown, status = 200) => Response.json(data, { status, headers: { "cache-control": "private, no-store", "x-content-type-options": "nosniff", "x-robots-tag": "noindex, nofollow, noarchive, nosnippet", "referrer-policy": "no-referrer" } });
 export async function applicationRoute(request: Request, env: RuntimeEnv, credentialJS?: string): Promise<Response | null> {
   const path = new URL(request.url).pathname;
   if (path !== "/mcp" && path !== "/connect/apple" && !path.startsWith("/api/")) return null;
   const requestId = crypto.randomUUID();
   try {
+    const transfer = driveTransferRoute(path);
+    if (transfer) {
+      const claim = await authorizeDriveTransfer(request, env, transfer);
+      const service = new DriveService(env, claim.owner);
+      if (transfer.kind === "upload" && request.headers.get("x-drive-transfer-action") === "diagnose") {
+        await service.streamUploadStatus(claim.id, claim);
+        return json(await probeDriveContentSocket());
+      }
+      const response = transfer.kind === "upload"
+        ? await driveUploadSocket(request, env, service, claim.id, claim)
+        : await service.downloadContent(claim.id, request.signal, request.headers.get("range"), claim);
+      response.headers.set("X-Robots-Tag", "noindex, nofollow, noarchive, nosnippet");
+      response.headers.set("Referrer-Policy", "no-referrer");
+      response.headers.set("Cache-Control", "private, no-store");
+      return response;
+    }
     if (path === "/api/bootstrap/identity" && request.method === "GET") {
       // An administrator can provision this exact site-scoped ID. Never claim it automatically.
       const user = request.headers.get("oai-authenticated-user-id");
