@@ -17,8 +17,8 @@ export const TOOL_PERMISSIONS: Readonly<Record<string, ServicePermission>> = Obj
   ].map(name => [name, "reminders.write" as const])),
   list_icloud_drive_items: "drive.browse", get_icloud_drive_item: "drive.browse", search_icloud_drive: "drive.browse", traverse_icloud_drive: "drive.browse",
   resolve_icloud_drive_folder_path: "drive.browse",
-  read_icloud_drive_file: "drive.contents", download_icloud_drive_file: "drive.contents",
-  upload_icloud_drive_file: "drive.upload", create_icloud_drive_folder: "drive.organize",
+  read_icloud_drive_file: "drive.contents", download_icloud_drive_file: "drive.contents", prepare_icloud_drive_download: "drive.contents",
+  upload_icloud_drive_file: "drive.upload", prepare_icloud_drive_upload: "drive.upload", create_icloud_drive_folder: "drive.organize",
   rename_icloud_drive_item: "drive.organize", move_icloud_drive_item: "drive.organize", get_icloud_drive_operation: "drive.browse",
 });
 export function enabledToolNames(settings: ServiceSettings): string[] {

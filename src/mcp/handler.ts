@@ -296,7 +296,8 @@ export async function handleMCP(request: Request, env: RuntimeEnv, owner: string
   registerTool("update_reminder_list_appearance", {
     title: "Update a reminder list's colour and emoji",
     description: "Set one built-in colour preset from red, orange, yellow, green, light-blue, blue, indigo, pink, purple, brown, grey or rose, one emoji grapheme, or both. Requires an exact owned, standard private listId, its current recordChangeTag from get_reminder_list_appearance, and the current expectedGeneration. Unknown existing fields are preserved. Color and badge clearing, custom RGB values, groups, sections and shared lists are unsupported. A stale tag returns CONFLICT; WRITE_OUTCOME_UNKNOWN requires a fresh appearance read before constructing another request. The original request is never automatically retried.",
-    inputSchema: UpdateListAppearanceRequest,
+    // Export the object fields; the service still enforces the cross-field refinement.
+    inputSchema: UpdateListAppearanceRequest.innerType(),
     outputSchema: ListAppearanceMutationOutput,
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
   }, async args => {

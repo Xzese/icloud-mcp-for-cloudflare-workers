@@ -34,9 +34,24 @@ test("owner dashboard settings change MCP discovery and direct permission enforc
     assert.ok((await list()).includes("get_reminders"));
     assert.ok(!(await list()).includes("list_icloud_drive_items"));
     assert.ok(!(await list()).includes("resolve_icloud_drive_folder_path"));
+    assert.ok(!(await list()).includes("prepare_icloud_drive_upload"));
+    assert.ok(!(await list()).includes("prepare_icloud_drive_download"));
     const newReadTools = ["get_reminder_view", "export_reminders", "get_reminder_filters", "run_reminder_filter", "inspect_reminder", "get_reminder_list_sections"];
     const newWriteTools = ["save_reminder_filter", "delete_reminder_filter", "create_reminder_workflow", "duplicate_reminder_list"];
     const initialTools = await list();
+    const initialCatalog = (await request("/mcp", { jsonrpc: "2.0", id: 11, method: "tools/list", params: {} })).data.result.tools;
+    const appearance = initialCatalog.find((tool: { name: string }) => tool.name === "update_reminder_list_appearance");
+    assert.deepEqual(Object.keys(appearance.inputSchema.properties).sort(), ["colorPreset", "emoji", "expectedGeneration", "listId", "recordChangeTag"]);
+    assert.equal(appearance.inputSchema.additionalProperties, false);
+    assert.ok(appearance.inputSchema.required.includes("listId"));
+    assert.ok(appearance.inputSchema.required.includes("recordChangeTag"));
+    const invalidAppearance = await request("/mcp", { jsonrpc: "2.0", id: 12, method: "tools/call", params: {
+      name: "update_reminder_list_appearance", arguments: { expectedGeneration: 0, listId: `List/${crypto.randomUUID().toUpperCase()}`, recordChangeTag: "synthetic-current" },
+    } });
+    assert.equal(invalidAppearance.data.result.isError, true);
+    assert.equal(invalidAppearance.data.result.structuredContent.error_code, "VALIDATION_ERROR", "the service retains its at-least-one-change rule");
+
+
     assert.ok([...newReadTools, ...newWriteTools].every(name => initialTools.includes(name)));
     const apple = new AppleConnectionService(env, "test-owner"), filters = new ConnectorFilterRepository(env, "test-owner");
     const filterId = crypto.randomUUID();
@@ -49,6 +64,8 @@ test("owner dashboard settings change MCP discovery and direct permission enforc
     assert.ok(tools.includes("list_icloud_drive_items"));
     assert.ok(tools.includes("resolve_icloud_drive_folder_path"));
     assert.ok(tools.includes("upload_icloud_drive_file"));
+    assert.ok(tools.includes("prepare_icloud_drive_upload"));
+    assert.ok(!tools.includes("prepare_icloud_drive_download"));
     assert.ok(!tools.includes("get_reminders"));
     assert.ok(!tools.includes("read_icloud_drive_file"));
     assert.ok([...newReadTools, ...newWriteTools].every(name => !tools.includes(name)));

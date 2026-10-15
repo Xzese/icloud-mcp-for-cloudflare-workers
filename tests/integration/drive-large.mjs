@@ -160,7 +160,7 @@ export async function verifyMultipartDrive(options, { bytes = DRIVE_UPLOAD_PART_
     const operationId = randomUUID(), input = { operationId, parentId: DRIVE_ROOT, name, size: bytes, sha256: hash, contentType: "application/octet-stream" };
     if (fault === "checksum") input.sha256 = "0".repeat(64);
     if (streaming) {
-      const authorized = capability ? await mcp("upload_icloud_drive_file", { ...input, contentBase64: "" }) : null;
+      const authorized = capability ? await mcp("prepare_icloud_drive_upload", input) : null;
       const prepared = capability ? { ...authorized, socketPath: new URL(authorized.transfer.url).pathname } : await post("/api/drive/prepare-stream-upload", input);
       assert.deepEqual([allocations, transfers, commits], [0, 0, 0]);
       const headers = { ...(capability ? authorized.transfer.headers : { "oai-authenticated-user-id": owner, "cf-access-jwt-assertion": assertion, origin }), upgrade: "websocket", "sec-websocket-protocol": legacyProtocol ? DRIVE_STREAM_LEGACY_PROTOCOL : DRIVE_STREAM_PROTOCOL };
@@ -224,7 +224,7 @@ export async function verifyMultipartDrive(options, { bytes = DRIVE_UPLOAD_PART_
         }
         assert.equal(operation.phase, "unknown");
         const beforeReplay = [allocations, transfers, commits];
-        assert.equal((capability ? await mcp("upload_icloud_drive_file", { ...input, contentBase64: "" }) : await post("/api/drive/prepare-stream-upload", input)).phase, "unknown");
+        assert.equal((capability ? await mcp("prepare_icloud_drive_upload", input) : await post("/api/drive/prepare-stream-upload", input)).phase, "unknown");
         const replay = await worker.dispatchFetch(origin + prepared.socketPath, { headers });
         assert.equal(replay.status, 503);
         assert.equal((await replay.json()).error.code, "WRITE_OUTCOME_UNKNOWN");
@@ -258,11 +258,11 @@ export async function verifyMultipartDrive(options, { bytes = DRIVE_UPLOAD_PART_
     }
     assert.deepEqual([allocations, transfers, commits], [1, 1, 1]);
     report("Downloading the complete generated file through the production Worker.");
-    const handle = capability ? await mcp("download_icloud_drive_file", { itemId }) : await post("/api/drive/download", { itemId });
+    const handle = capability ? await mcp("prepare_icloud_drive_download", { itemId }) : await post("/api/drive/download", { itemId });
     const download = capability ? await worker.dispatchFetch(handle.transfer.url, { headers: handle.transfer.headers }) : await request(handle.url);
     assert.equal(download.status, 200); assert.equal(download.headers.get("content-length"), String(bytes));
     assert.deepEqual(await hashStream(download.body), { size: bytes, sha256: hash });
-    const fresh = capability ? await mcp("download_icloud_drive_file", { itemId }) : await post("/api/drive/download", { itemId });
+    const fresh = capability ? await mcp("prepare_icloud_drive_download", { itemId }) : await post("/api/drive/download", { itemId });
     const start = bytes - 17, ranged = capability
       ? await worker.dispatchFetch(fresh.transfer.url, { headers: { ...fresh.transfer.headers, range: `bytes=${start}-${bytes - 1}` } })
       : await request(fresh.url, { range: `bytes=${start}-${bytes - 1}` });

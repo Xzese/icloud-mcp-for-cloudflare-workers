@@ -67,6 +67,8 @@ accepts folder names and returns an exact ID when it can verify every parent.
 | `traverse_icloud_drive` | Optional `folderId`, `shareContext`, `query`, `limit`, `maxItems`, `maxFolders`, `maxDepth`, `continuation` | Recursive `items` with `relativePath` and `depth`, `progress`, `complete`, `reasons`, cumulative `incompleteFolders`, next `continuation` |
 | `resolve_icloud_drive_folder_path` | `path`, optional starting `folderId` (Drive root by default), `shareContext` | `status`, `reason`, resolved `folder` or `choices`, `resolvedPath`, `remainingSegments`, `parentListing`, `foldersRead` |
 | `read_icloud_drive_file` | `itemId`, optional `shareContext`, optional `encoding`: `utf8` (default) or `base64`, optional `previewBytes`: 1–8192 for UTF-8 previews | `item`, `encoding`, `content`, `bytesRead`, `truncated` |
+| `prepare_icloud_drive_upload` | `parentId`, `name`, `operationId`, exact `size`, `sha256`, optional `contentType` | Metadata-only setup; absolute `transfer.url`, private `transfer.headers`, protocol, size and expiry |
+| `prepare_icloud_drive_download` | `itemId`, optional `shareContext` | Exact file version; absolute HTTPS `transfer.url`, private credential headers and expiry |
 | `download_icloud_drive_file` | `itemId`, optional `shareContext` | Exact `item`, single-use `transfer.url`, required `transfer.headers`, `handleId`, `expiresAt` |
 | `upload_icloud_drive_file` | `parentId`, `name`, `operationId`, `size`, `sha256`, optional `contentBase64` and `contentType` | Operation status; metadata-only calls include a scoped `transfer` plan |
 | `create_icloud_drive_folder` | `parentId`, `name`, `operationId` | Operation status |
@@ -254,7 +256,7 @@ The server requests exact binary frames of at most 8 MiB and returns a confirmed
 An interrupted stream cannot resume bytes; inspect the original operation through MCP and never
 automatically mint a replacement operation for an uncertain Apple write.
 
-For downloads, `download_icloud_drive_file` authorizes an exact current item/version and returns
+For downloads, `prepare_icloud_drive_download` (or the compatible `download_icloud_drive_file`) authorizes an exact current item/version and returns
 an absolute HTTPS `transfer.url` plus `transfer.headers`. GET with those headers streams the file
 outside the conversation. The handle is consumed once; current item/version, permissions and account
 state must still match. Ordinary files have an exact `transfer.size`; package archives use null because
@@ -262,6 +264,15 @@ their unpacked item size is not the ZIP byte length. The server still enforces t
 Dashboard download URLs continue to require the signed-in browser.
 
 Each endpoint uses an independent random UUID, separate from the operation or download handle ID.
+Agents should use `prepare_icloud_drive_upload` to start a large transfer, rather than infer
+streaming support from the inline upload tool. Supply only metadata, not base64 file contents.
+A successful preparation returns a `wss://` upload endpoint and private headers; it does not
+upload the file. The transfer client follows the returned WebSocket protocol. For downloads,
+`prepare_icloud_drive_download` returns an `https://` endpoint for GET with its required headers.
+Neither flow needs an authenticated dashboard session. Existing upload/download tool names
+remain compatible, but a client with a cached catalog may need a refreshed or new session to
+see newly published tools. Do not guess route URLs or put credentials in chat.
+
 The UUID alone grants no access. An AES-256-GCM sealed bearer capability binds the configured
 owner and origin, Apple account/generation, permission revision, direction, original operation/handle,
 exact input fingerprint and expiry. Its authentication tag detects tampering; a separate HMAC is not

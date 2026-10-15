@@ -230,6 +230,22 @@ export async function verifyDrive(options) {
     assert.equal(sharedPage.folder.shareContext, sharedItem.shareContext);
     assert.equal(JSON.stringify(sharedPage).includes("private-docws"), false);
 
+    const catalog = (await mcp("tools/list", {})).result.tools;
+    const uploadTool = catalog.find(tool => tool.name === "prepare_icloud_drive_upload");
+    const downloadTool = catalog.find(tool => tool.name === "prepare_icloud_drive_download");
+    assert.ok(uploadTool && downloadTool, "explicit transfer tools are registered, permitted and exported");
+    assert.equal(uploadTool.inputSchema.properties.size.maximum, 2 ** 31);
+    assert.equal(Object.hasOwn(uploadTool.inputSchema.properties, "contentBase64"), false);
+    assert.ok(uploadTool.outputSchema.properties.transfer);
+    const preparedTransfer = await mcp("tools/call", { name: "prepare_icloud_drive_upload", arguments: {
+      operationId: randomUUID(), parentId: DRIVE_ROOT, name: "metadata-only.bin", size: 2 ** 31, sha256: "a".repeat(64),
+    } });
+    assert.equal(preparedTransfer.result.isError, undefined, JSON.stringify(preparedTransfer));
+    assert.equal(preparedTransfer.result.structuredContent.phase, "prepared");
+    assert.match(preparedTransfer.result.structuredContent.transfer.url, /^wss:\/\//);
+    assert.ok(preparedTransfer.result.structuredContent.transfer.headers.Authorization);
+    assert.deepEqual([allocations, transfers, finalizations], [0, 0, 0], "MCP preparation sends no file bytes or write to Apple");
+
     const limitIntent = { operationId: randomUUID(), parentId: DRIVE_ROOT, name: "limit-boundary.bin", size: 2 * 1024 ** 3, sha256: "a".repeat(64), contentType: "application/octet-stream" };
     const acceptedLimit = await request("/api/drive/prepare-upload", { method: "POST", body: JSON.stringify(limitIntent) });
     assert.equal(acceptedLimit.status, 200);
@@ -289,7 +305,7 @@ export async function verifyDrive(options) {
     assert.equal(getCall.result.structuredContent.item.documentId, uploadedDocId);
     assert.equal(getCall.result.structuredContent.item.etag, "synthetic-upload-etag");
 
-    const preparedDownload = await mcp("tools/call", { name: "download_icloud_drive_file", arguments: { expectedGeneration: generation, itemId: typedItem.id } });
+    const preparedDownload = await mcp("tools/call", { name: "prepare_icloud_drive_download", arguments: { expectedGeneration: generation, itemId: typedItem.id } });
     assert.equal(preparedDownload.result.structuredContent.item.documentId, uploadedDocId);
     assert.match(preparedDownload.result.structuredContent.url, /\/api\/drive\/transfers\/download\/[a-f0-9-]{36}$/);
     assert.equal(JSON.stringify(preparedDownload.result.structuredContent).includes("icloud-content"), false);

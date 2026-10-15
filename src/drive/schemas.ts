@@ -40,8 +40,9 @@ export const DownloadDrive = GetDriveItem;
 export const CreateDriveFolder = z.object({ ...common, parentId: OwnedDriveId, name: DriveName, operationId: OperationId.describe("Stable operation key; retain after uncertain outcomes.") }).strict();
 export const RenameDriveItem = z.object({ ...common, itemId: OwnedDriveId, etag: z.string().min(1).max(512), name: DriveName, operationId: OperationId }).strict();
 export const MoveDriveItem = z.object({ ...common, itemId: OwnedDriveId, etag: z.string().min(1).max(512), destinationId: OwnedDriveId, operationId: OperationId }).strict();
-export const UploadDriveMetadata = z.object({ ...common, parentId: OwnedDriveId, name: DriveName, operationId: OperationId,
-  size: z.number().int().nonnegative().max(DRIVE_FILE_BYTES), sha256: z.string().regex(/^[a-f0-9]{64}$/),
+export const UploadDriveMetadata = z.object({ ...common, parentId: OwnedDriveId, name: DriveName, operationId: OperationId.describe("Stable UUID for this exact file and destination. Retain it and the original metadata after an uncertain outcome."),
+  size: z.number().int().nonnegative().max(DRIVE_FILE_BYTES).describe(`Exact original file size in bytes, up to ${DRIVE_FILE_LIMIT_LABEL}; not the base64 length.`),
+  sha256: z.string().regex(/^[a-f0-9]{64}$/).describe("Lowercase SHA-256 of every original file byte. Compute it locally; never invent a digest."),
   contentType: z.string().max(128).regex(/^[a-zA-Z0-9!#$&^_.+-]+\/[a-zA-Z0-9!#$&^_.+-]+$/).default("application/octet-stream"),
 }).strict();
 export const UploadDrive = UploadDriveMetadata.extend({
