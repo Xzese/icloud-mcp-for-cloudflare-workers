@@ -1583,6 +1583,49 @@ export async function verifyReminderWrites(options) {
     assert.deepEqual(state.records.get(dailyHistory.recordName).fields.AlarmIDs, historyAlarmIds);
     assert.deepEqual(state.records.get(dailyJourney.active.recordName), activeAfterDaily);
     assert.equal(state.modifies.length, beforeTimedDaily + 2);
+    const beforeIntervalIds = new Set(state.records.keys());
+    const everyOtherDay = seedTimedDaily("INTERVAL-TWO");
+    everyOtherDay.rule.fields.Interval = field("INT64", 2);
+    everyOtherDay.trigger.fields.DateComponentsData = field("BYTES", Buffer.from(JSON.stringify({
+      ...JSON.parse(Buffer.from(everyOtherDay.trigger.fields.DateComponentsData.value, "base64").toString("utf8")), isLeapMonth: false,
+    })).toString("base64"));
+    const beforeInterval = state.modifies.length, intervalRule = structuredClone(everyOtherDay.rule.fields);
+    const moveIntervalArgs = { ...everyOtherDay.args, changes: { dueDate: "2027-03-26T09:00:00Z" } };
+    const preparedInterval = await mcp("tools/call", { name: "prepare_reminder_update", arguments: moveIntervalArgs });
+    assert.equal(preparedInterval.result.isError, undefined, JSON.stringify(preparedInterval.result));
+    assert.equal(preparedInterval.result.structuredContent.supported, true);
+    assert.equal(preparedInterval.result.structuredContent.after.recurrence.interval, 2);
+    assert.equal(state.modifies.length, beforeInterval);
+    const movedInterval = await mcp("tools/call", { name: "update_reminder", arguments: { ...moveIntervalArgs, preparationToken: preparedInterval.result.structuredContent.preparationToken } });
+    assert.equal(movedInterval.result.isError, undefined, JSON.stringify(movedInterval.result));
+    const intervalArgs = { ...everyOtherDay.args, recordChangeTag: movedInterval.result.structuredContent.record.recordChangeTag };
+    state.nextModify = "committed-500";
+    const intervalLost = await mcp("tools/call", { name: "complete_reminder", arguments: intervalArgs });
+    assert.equal(intervalLost.result.structuredContent.error.code, "WRITE_OUTCOME_UNKNOWN");
+    const intervalReplay = await mcp("tools/call", { name: "complete_reminder", arguments: intervalArgs });
+    assert.equal(intervalReplay.result.isError, undefined, JSON.stringify(intervalReplay.result));
+    const intervalResult = intervalReplay.result.structuredContent;
+    assert.equal(intervalResult.replayed, true);
+    assert.equal(intervalResult.record.dueDate, "2027-03-28T08:00:00.000Z"); assert.equal(intervalResult.record.completed, false);
+    assert.equal(intervalResult.completedOccurrence.dueDate, "2027-03-26T09:00:00.000Z"); assert.equal(intervalResult.completedOccurrence.completed, true);
+    assert.deepEqual(state.records.get(everyOtherDay.rule.recordName).fields, intervalRule);
+    for (const rootId of [intervalResult.record.id, intervalResult.completedOccurrence.id]) {
+      const alarmId = state.records.get(rootId).fields.AlarmIDs.value[0];
+      const alarm = state.records.get(alarmId.startsWith("Alarm/") ? alarmId : `Alarm/${alarmId}`);
+      const triggerId = alarm.fields.TriggerID.value;
+      const trigger = state.records.get(triggerId.startsWith("AlarmTrigger/") ? triggerId : `AlarmTrigger/${triggerId}`);
+      assert.equal(JSON.parse(Buffer.from(trigger.fields.DateComponentsData.value, "base64").toString("utf8")).isLeapMonth, false);
+    }
+    const intervalHistoryId = intervalResult.completedOccurrence.id;
+    const intervalAgain = await mcp("tools/call", { name: "complete_reminder", arguments: intervalArgs });
+    assert.equal(intervalAgain.result.structuredContent.completedOccurrence.id, intervalHistoryId);
+    assert.equal(state.modifies.length, beforeInterval + 2, "Date move and one completion only; uncertain replays are read-only.");
+    // Keep this journey's synthetic graph out of subsequent list-size checks.
+    const intervalIds = new Set([...state.records.keys()].filter(id => !beforeIntervalIds.has(id)));
+    for (const id of intervalIds) state.records.delete(id);
+    const intervalList = state.records.get(listId);
+    intervalList.fields.ReminderIDs = field("STRING", JSON.stringify(JSON.parse(intervalList.fields.ReminderIDs.value)
+      .filter(id => !intervalIds.has(id.startsWith("Reminder/") ? id : `Reminder/${id}`))));
     const driftDaily = seedTimedDaily("DRIFT"), beforeDailyDrift = state.modifies.length;
     state.nextModify = "recurring-retained-crypto-drift";
     const dailyDrift = await mcp("tools/call", { name: "complete_reminder", arguments: driftDaily.args });

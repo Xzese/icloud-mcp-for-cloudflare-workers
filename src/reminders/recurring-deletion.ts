@@ -7,7 +7,7 @@ import type { RecurringIntent } from "../persistence/apple-sessions.ts";
 import type { SchedulingGraph } from "./linked-records.ts";
 import { RecurrenceCalendarTimeZone, recurrenceEndCalendarLabel } from "./recurrence-calendar.ts";
 import { readCompletionRecurrence } from "./recurrence.ts";
-import { dateComponents, decodeDateComponents, dueDateNonce } from "./linked-date.ts";
+import { dateComponentsForSource, decodeDateComponents, dueDateNonce } from "./linked-date.ts";
 import { validateAbsoluteDatePair, validateDateAlarmParticipant } from "./date-alarm-lifecycle.ts";
 import { nextRecurringDue, recurringRecordHash, type RecurringOperation } from "./recurring-lifecycle.ts";
 import { updateResolutionTokenMap, type CloudKitWriteRecord } from "./writes.ts";
@@ -56,6 +56,9 @@ export async function planRecurringDeletion(graph: SchedulingGraph, sourceList: 
     referenceField(rule, "Reminder", "Reminder", owner) !== source.recordName || !Number.isSafeInteger(timestamp) || timestamp < 0)
     throw new AppError("UNSUPPORTED_FEATURE", "Recurring deletion requires one exact childless open root with its owned supported rule and complete schedule.");
   const recurrence = readCompletionRecurrence(rule);
+  // Deletion has separate observed recipes; completion interval support must
+  // never make a multi-interval deletion advance by only one unit.
+  if (recurrence.interval !== 1) throw new AppError("UNSUPPORTED_FEATURE", "Recurring deletion currently requires interval one.");
   const unpairedAllDay = reminder.allDay === true && reminder.timeZone === null && !(reminder.alarmIds?.length) && graph.records.length === 2 &&
     Date.parse(reminder.dueDate) % 86_400_000 === 0 && new Date(reminder.dueDate).getUTCFullYear() >= 1 && new Date(reminder.dueDate).getUTCFullYear() <= 9999;
   const daily = recurrence.kind === "daily" && unpairedAllDay;
@@ -118,7 +121,7 @@ export async function planRecurringDeletion(graph: SchedulingGraph, sourceList: 
         AlarmUID: { type: "STRING", value: ids.activeAlarm }, TriggerID: { type: "STRING", value: ids.activeTrigger }, DueDateResolutionTokenAsNonce: { type: "DOUBLE", value: dueDateNonce(active.fields.ResolutionTokenMap.value) },
         Reminder: { type: "REFERENCE", value: { recordName: source.recordName, action: "VALIDATE" } }, Imported: { type: "INT64", value: 0 }, Deleted: { type: "INT64", value: 0 },
       } } }, { operationType: "create", record: { recordName: trigger, recordType: "AlarmTrigger", parent: { recordName: alarm }, fields: {
-        DateComponentsData: { type: "BYTES", value: b64(utf8(JSON.stringify(dateComponents(next!, reminder.timeZone!, Object.hasOwn(oldComponents, "nanosecond"))))) }, Type: { type: "STRING", value: "Date" },
+        DateComponentsData: { type: "BYTES", value: b64(utf8(JSON.stringify(dateComponentsForSource(next!, reminder.timeZone!, oldComponents)))) }, Type: { type: "STRING", value: "Date" },
         Alarm: { type: "REFERENCE", value: { recordName: alarm, action: "VALIDATE" } }, Imported: { type: "INT64", value: 0 }, Deleted: { type: "INT64", value: 0 },
       } } });
     }

@@ -56,6 +56,131 @@ const lookup = (values: CloudKitRecord[]) => async (ids: string[]): Promise<Clou
 const request = (root: CloudKitRecord) => ({ listId, reminderId: root.recordName, recordChangeTag: root.recordChangeTag!,
   changes: { dueDate: "2027-07-11T09:00:00+01:00" } });
 
+test("repeat intervals advance calendar units across clock changes, leap years and month boundaries", () => {
+  const cases = [
+    ["2027-03-26T09:00:00Z", "Europe/London", false, "daily", 2, "2027-03-28T08:00:00.000Z"],
+    ["2027-10-29T08:00:00Z", "Europe/London", false, "daily", 2, "2027-10-31T09:00:00.000Z"],
+    ["2026-10-12T08:00:00Z", "Europe/London", false, "weekly", 3, "2026-11-02T09:00:00.000Z"],
+    ["2028-02-28T00:00:00Z", null, true, "daily", 2, "2028-03-01T00:00:00.000Z"],
+    ["2027-01-31T09:00:00Z", "Europe/London", false, "monthly", 2, "2027-03-31T08:00:00.000Z"],
+    ["2027-12-31T00:00:00Z", null, true, "last-day-monthly", 2, "2028-02-29T00:00:00.000Z"],
+    ["2027-01-29T09:00:00Z", "Europe/London", false, "monthly-29", 2, "2027-03-29T08:00:00.000Z"],
+    ["2000-01-01T00:00:00Z", null, true, "daily", 999, "2002-09-26T00:00:00.000Z"],
+    ["2000-01-31T00:00:00Z", null, true, "last-day-monthly", 999, "2083-04-30T00:00:00.000Z"],
+    ["2000-01-10T09:00:00Z", "Europe/London", false, "monthly", 999, "2083-04-10T08:00:00.000Z"],
+  ] as const;
+  for (const [due, zone, allDay, kind, interval, expected] of cases)
+    assert.equal(nextRecurringDue(due, zone, allDay, kind, interval), expected);
+  for (const interval of [0, -1, 1.5, 1000, Number.NaN, Number.POSITIVE_INFINITY, Number.MAX_SAFE_INTEGER])
+    assert.throws(() => nextRecurringDue("2027-01-01T00:00:00Z", null, true, "daily", interval), hasCode("UNSUPPORTED_FEATURE"));
+  for (const [due, kind, interval] of [
+    ["2027-03-26T01:30:00Z", "daily", 2], ["2027-10-29T00:30:00Z", "daily", 2],
+    ["2027-12-31T09:00:00Z", "monthly", 2], ["9999-01-10T09:00:00Z", "monthly", 12],
+  ] as const) assert.throws(() => nextRecurringDue(due, "Europe/London", false, kind, interval), hasCode("UNSUPPORTED_FEATURE"));
+});
+
+test("date parser diagnostics identify rejected protocol fields without exposing private payload values or unknown keys", () => {
+  const payload: Record<string, unknown> = { ...dateComponents("2027-01-10T09:00:00Z", "Europe/London"),
+    year: "private-field-value", "private-native-key": "private-native-value", calendar: "private-calendar-value" };
+  delete payload.second;
+  assert.throws(() => decodeDateComponents(b64(utf8(JSON.stringify(payload)))), error => {
+    assert.ok(hasCode("UNSUPPORTED_FEATURE")(error));
+    const message = (error as Error).message;
+    assert.ok(message.includes("year:invalid_type")); assert.ok(message.includes("second:invalid_type"));
+    assert.ok(message.includes("calendar:unexpected")); assert.ok(message.includes("unrecognized:unexpected"));
+    assert.ok(!message.includes("private-")); assert.ok(!message.includes("Europe/London"));
+    return true;
+  });
+});
+
+test("Gregorian date components accept only an optional false leap-month marker", () => {
+  const ordinary = dateComponents("2027-01-10T09:00:00Z", "Europe/London");
+  assert.deepEqual(decodeDateComponents(b64(utf8(JSON.stringify({ ...ordinary, isLeapMonth: false })))), { ...ordinary, isLeapMonth: false });
+  for (const isLeapMonth of [true, null, 0, "false", {}, []])
+    assert.throws(() => decodeDateComponents(b64(utf8(JSON.stringify({ ...ordinary, isLeapMonth })))), hasCode("UNSUPPORTED_FEATURE"));
+});
+
+test("multi-interval completion preserves the exact rule, independent history and retained replay identities", async () => {
+  for (const [frequency, interval, expected] of [
+    [0, 2, "2027-01-12T09:00:00Z"], [1, 3, "2027-01-31T09:00:00Z"], [2, 2, "2027-03-10T09:00:00Z"],
+    [0, 999, "2029-10-05T08:00:00Z"],
+  ] as const) {
+    const values = records(), ids = recurringIdentities();
+    values[3].fields.Frequency = { type: "INT64", value: frequency };
+    values[3].fields.Interval = { type: "INT64", value: interval };
+    values[2].fields.DateComponentsData = { type: "BYTES", value: b64(utf8(JSON.stringify({
+      ...dateComponents("2027-01-10T09:00:00Z", "Europe/London", true), isLeapMonth: false,
+    }))) };
+    const before = structuredClone(values);
+    const list: CloudKitRecord = { recordName: listId, recordType: "List", recordChangeTag: "list-before", zoneID, raw: {}, fields: {
+      Deleted: { type: "INT64", value: 0 }, IsGroup: { type: "INT64", value: 0 },
+      ReminderIDs: { type: "STRING", value: JSON.stringify([values[0].recordName.slice(9)]) }, ResolutionTokenMap: { type: "STRING", value: JSON.stringify({ map: {} }) },
+    } };
+    const graph = await loadSchedulingGraph(values[0], owner, lookup(values));
+    const plan = await planRecurringCompletion(graph, list, owner, ids, Date.parse("2027-01-10T12:00:00Z"));
+    assert.equal(plan.active.fields.DueDate.value, Date.parse(expected));
+    assert.equal(plan.history!.fields.DueDate.value, Date.parse("2027-01-10T09:00:00Z"));
+    assert.equal(plan.history!.fields.Completed.value, 1);
+    assert.deepEqual(plan.history!.fields.RecurrenceRuleIDs.value, []);
+    assert.deepEqual(plan.guards, [values[3]]);
+    assert.ok(!plan.operations.some(op => op.record.recordType === "RecurrenceRule"));
+    for (const op of plan.operations.filter(op => op.operationType === "create" && op.record.recordType === "AlarmTrigger")) {
+      const components = decodeDateComponents(op.record.fields.DateComponentsData.value);
+      assert.equal(components.isLeapMonth, false); assert.equal(components.nanosecond, 0);
+    }
+    assert.deepEqual((await planRecurringCompletion(graph, list, owner, ids, plan.timestamp)).operations, plan.operations);
+    const receipt = plan.operations.filter(op => op.operationType !== "delete").map(op => {
+      const source = [...values, list].find(record => record.recordName === op.record.recordName);
+      return { ...op.record, raw: { ...source?.raw, ...(op.record.parent ? { parent: op.record.parent } : {}) },
+        recordChangeTag: "after", fields: { ...source?.fields, ...op.record.fields } };
+    });
+    await verifyRecurringExpected(plan.expected, [...receipt, values[3]], owner);
+    const wrongRule = structuredClone(values[3]); wrongRule.fields.Interval = { type: "INT64", value: 1 };
+    await assert.rejects(verifyRecurringExpected(plan.expected, [...receipt, wrongRule], owner), hasCode("WRITE_OUTCOME_UNKNOWN"));
+    const moved = planReminderUpdate(graph, { ...request(values[0]), changes: { dueDate: "2027-01-09T09:00:00Z" } }, owner, plan.timestamp);
+    assert.ok(moved.supported); assert.equal(moved.after.recurrence!.interval, interval);
+    assert.equal(decodeDateComponents(moved.dependencies.find(record => record.recordType === "AlarmTrigger")!.fields.DateComponentsData.value).isLeapMonth, false);
+    for (const scope of ["occurrence", "all_future"] as const)
+      await assert.rejects(planRecurringDeletion(graph, list, owner, scope, undefined, plan.timestamp), hasCode("UNSUPPORTED_FEATURE"));
+    assert.deepEqual(values, before);
+  }
+});
+
+test("ended multi-interval rules advance only on their cadence and complete or reopen the exact final occurrence", async () => {
+  for (const allDay of [true, false]) {
+    const values = records(), due = allDay ? "2027-01-10T00:00:00Z" : "2027-01-10T09:00:00Z";
+    const end = allDay ? "2027-01-14T00:00:00Z" : "2027-01-24T09:00:00Z";
+    values[0].fields.DueDate = { type: "TIMESTAMP", value: Date.parse(due) };
+    values[3].fields.Interval = { type: "INT64", value: 2 };
+    values[3].fields.Frequency = { type: "INT64", value: allDay ? 0 : 1 };
+    values[3].fields.EndDate = { type: "TIMESTAMP", value: Date.parse(end) };
+    if (allDay) {
+      values[0].fields.AllDay = { type: "INT64", value: 1 }; delete values[0].fields.TimeZone;
+      values[0].fields.AlarmIDs = { type: "UNKNOWN_LIST", value: [] }; values.splice(1, 2);
+    }
+    const rule = values.at(-1)!;
+    const list: CloudKitRecord = { recordName: listId, recordType: "List", recordChangeTag: "list-before", zoneID, raw: {}, fields: {
+      Deleted: { type: "INT64", value: 0 }, IsGroup: { type: "INT64", value: 0 },
+      ReminderIDs: { type: "STRING", value: JSON.stringify([values[0].recordName.slice(9)]) }, ResolutionTokenMap: { type: "STRING", value: JSON.stringify({ map: {} }) },
+    } };
+    const graph = await loadSchedulingGraph(values[0], owner, lookup(values));
+    const plan = await planRecurringCompletion(graph, list, owner, undefined, Date.parse(due) + 1000);
+    assert.equal(plan.mode, "advance");
+    assert.equal(plan.active.fields.DueDate.value, Date.parse(allDay ? "2027-01-12T00:00:00Z" : end));
+    const bad = structuredClone(values), badRule = bad.at(-1)!;
+    badRule.fields.EndDate = { type: "TIMESTAMP", value: Date.parse(allDay ? "2027-01-13T00:00:00Z" : "2027-01-17T09:00:00Z") };
+    await assert.rejects(planRecurringCompletion(await loadSchedulingGraph(bad[0], owner, lookup(bad)), list, owner, undefined, plan.timestamp), hasCode("UNSUPPORTED_FEATURE"));
+    values[0].fields.DueDate = { type: "TIMESTAMP", value: Date.parse(end) };
+    if (!allDay) values[2].fields.DateComponentsData = { type: "BYTES", value: b64(utf8(JSON.stringify(dateComponents(end, "Europe/London")))) };
+    const final = await planRecurringCompletion(await loadSchedulingGraph(values[0], owner, lookup(values)), list, owner, undefined, Date.parse(end) + 1000);
+    assert.equal(final.mode, "final"); assert.equal(final.history, undefined); assert.equal(final.active.fields.DueDate, undefined);
+    assert.equal(final.active.fields.Completed.value, 1); assert.deepEqual(final.guards.find(record => record.recordName === rule.recordName), rule);
+    values[0].fields = { ...values[0].fields, ...final.active.fields };
+    const reopened = await planRecurringCompletion(await loadSchedulingGraph(values[0], owner, lookup(values)), list, owner, undefined, final.timestamp + 1000, "reopen");
+    assert.equal(reopened.mode, "reopen"); assert.equal(reopened.active.fields.Completed.value, 0); assert.equal(reopened.active.fields.DueDate, undefined);
+  }
+});
+
 test("date-pair diagnostics report bounded shape and equality without native identities or payloads", async () => {
   const values = records(), graph = await loadSchedulingGraph(values[0], owner, lookup(values));
   const identity = crypto.randomUUID();
@@ -1215,7 +1340,7 @@ test("recurring completion preserves encoded history, advances calendar dates an
     if (variant === "offset-zone") bad[0].fields.TimeZone = { type: "STRING", value: "+01:00" };
     if (variant === "all-day") bad[0].fields.AllDay = { type: "INT64", value: 1 };
     if (variant === "ended") bad[3].fields.EndDate = { type: "TIMESTAMP", value: Date.parse("2027-03-28T00:00:00Z") };
-    if (variant === "interval") bad[3].fields.Interval = { type: "INT64", value: 2 };
+    if (variant === "interval") bad[3].fields.Interval = { type: "INT64", value: 1000 };
     if (variant === "tags") bad[0].fields.HashtagIDs = { type: "STRING_LIST", value: ["synthetic-tag"] };
     if (variant === "family") bad[0].fields.ChildReminderIDs = { type: "STRING_LIST", value: ["synthetic-child"] };
     if (variant === "early") bad[0].fields.DueDateDeltaAlertsData = { type: "BYTES", value: b64(utf8("[]")) };

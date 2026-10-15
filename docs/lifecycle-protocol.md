@@ -527,3 +527,26 @@ absent. The native sidebar and refreshed MCP catalogue showed no remaining test 
 existing Test list contained no MCP-prefixed samples. Unrelated Lists were retained and
 Recently Deleted was not purged. Private captures remain ignored; no Apple data or credentials
 were added to source.
+
+## Interval-aware completion
+
+Completion now carries the stored interval (1–999) from the rule classifier into
+calendar advancement for the existing daily, weekly and monthly recipes. Timed
+rules retain their local clock; all-day rules retain calendar-date labels. Ordinary
+monthly completion checks the target month rather than each intervening month, so
+31 January every two months advances to 31 March. Missing target dates, ambiguous
+or missing local times, unsupported rule patterns and overdue skipping still fail
+before dispatch. Hourly and yearly completion remain separate unsupported recipes.
+
+Ended timed weekly and all-day daily completion require the end to align with the
+stored interval cadence. Final completion and reopening retain the exact active
+record and rule. Recurring deletion still requires interval one, with an explicit
+check preventing the shared classifier from expanding deletion eligibility.
+
+Synthetic planner tests cover intervals 2, 3 and 999, leap years, clock changes,
+month boundaries, aligned/misaligned ends and retained history identities. The
+production Worker acceptance moves an every-two-days reminder, completes it across
+a London clock change, and reconciles a lost acknowledgement without another
+write or history record. This extends calendar calculation over the previously
+observed record transitions; it is not a new native Apple interval observation.
+Unknown alarm date-component payloads remain unsupported independently of interval.

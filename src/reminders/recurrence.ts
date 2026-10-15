@@ -97,7 +97,7 @@ export function readPreservedRecurrence(record: CloudKitRecord): RecurrenceState
   if (!Object.hasOwn(record.fields, "SetPositions")) return readRecurrence(record);
   const base = { ...record, fields: Object.fromEntries(Object.entries(record.fields).filter(([key]) => key !== "SetPositions")) };
   const recurrence = readRecurrence(base);
-  if (recurrence.frequency !== "monthly" || recurrence.interval !== 1 || recurrence.endDate !== null ||
+  if (recurrence.frequency !== "monthly" || recurrence.endDate !== null ||
     !Array.isArray(recurrence.monthDays) || canonicalJSON(recurrence.monthDays) !== "[28,29]") {
     throw new AppError("UNSUPPORTED_FEATURE", "The recurrence SetPositions shape is outside the observed monthly date-preservation recipe.");
   }
@@ -111,27 +111,28 @@ export function readPreservedRecurrence(record: CloudKitRecord): RecurrenceState
 }
 
 /** Separate completion recipe: never relax the ordinary recurrence-edit reader. */
-export function readCompletionRecurrence(record: CloudKitRecord): { kind: "weekly" | "last-day-monthly" | "monthly-29" | "monthly" | "daily"; endDate: number | null } {
+export function readCompletionRecurrence(record: CloudKitRecord): { kind: "weekly" | "last-day-monthly" | "monthly-29" | "monthly" | "daily"; interval: number; endDate: number | null } {
   const positions = record.fields.SetPositions;
   const base = { ...record, fields: Object.fromEntries(Object.entries(record.fields).filter(([key]) => key !== "SetPositions")) };
   const recurrence = readRecurrence(base);
-  if (recurrence.interval !== 1 || recurrence.weekdays || recurrence.ordinalWeekday || recurrence.months) {
+  if (recurrence.weekdays || recurrence.ordinalWeekday || recurrence.months) {
     throw new AppError("UNSUPPORTED_FEATURE", "This recurring completion pattern needs another native recipe.");
   }
   const endDate = recurrence.endDate === null ? null : Date.parse(recurrence.endDate);
-  if (recurrence.frequency === "weekly" && !recurrence.monthDays && positions === undefined) return { kind: "weekly", endDate };
-  if (recurrence.frequency === "daily" && !recurrence.monthDays && positions === undefined) return { kind: "daily", endDate };
+  const interval = recurrence.interval;
+  if (recurrence.frequency === "weekly" && !recurrence.monthDays && positions === undefined) return { kind: "weekly", interval, endDate };
+  if (recurrence.frequency === "daily" && !recurrence.monthDays && positions === undefined) return { kind: "daily", interval, endDate };
   // Ordinary Monthly has no explicit day selection: the current due date is
   // its calendar anchor, including after a native date edit.
-  if (recurrence.frequency === "monthly" && endDate === null && !recurrence.monthDays && positions === undefined) return { kind: "monthly", endDate };
+  if (recurrence.frequency === "monthly" && endDate === null && !recurrence.monthDays && positions === undefined) return { kind: "monthly", interval, endDate };
   if (recurrence.frequency === "monthly" && endDate === null && ["[28,29]", "[28,29,30,31]"].includes(canonicalJSON(recurrence.monthDays)) &&
     positions && typeof positions === "object" && "type" in positions && positions.type === "BYTES" && "value" in positions && typeof positions.value === "string") {
     try {
       if (canonicalJSON(JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(unb64(positions.value, 8192)))) === "[-1]")
-        return { kind: canonicalJSON(recurrence.monthDays) === "[28,29]" ? "monthly-29" : "last-day-monthly", endDate };
+        return { kind: canonicalJSON(recurrence.monthDays) === "[28,29]" ? "monthly-29" : "last-day-monthly", interval, endDate };
     } catch { /* reject an unknown pattern below */ }
   }
-  throw new AppError("UNSUPPORTED_FEATURE", "Supported completion patterns are interval-one weekly, all-day daily, non-ended timed daily or ordinary monthly with one absolute alarm, and the observed last-day monthly rule.");
+  throw new AppError("UNSUPPORTED_FEATURE", "Supported completion patterns are weekly, all-day daily, non-ended timed daily or ordinary monthly with one absolute alarm, and the observed last-day monthly rule, with intervals 1–999.");
 }
 export function recurrenceEdit(record: CloudKitRecord, input: RecurrenceInput) {
   const before = readRecurrence(record), parsed = RecurrenceChanges.parse(input);

@@ -34,8 +34,11 @@ Fresh sign-in opens Apple's authorization context, performs the remembered-accou
 preflight, and only then requests the SRP challenge. The Apple-facing origin, current device-context
 header, frame ID, cookies and evolving session headers are maintained across those steps; the
 dashboard's localhost or LAN origin is not forwarded to Apple. Rejected or federated preflight
-stops before SRP initialization. Account security-lock code `-20209` is recognized as either a
+stops before SRP initialization. Apple security response `-20209` is recognized as either a
 JSON number or string and never treated as a reason to repeat password-proof submission.
+The error identifies the failed sign-in step without exposing Apple's raw response or account
+details. It does not establish an account-wide lock or require recovery when a fresh sign-in
+at iCloud.com with the same Apple Account succeeds.
 
 Local development resolves private Apple state from the main Git checkout, including when launched
 inside a linked worktree. A separate SQLite transaction locks that state across processes and

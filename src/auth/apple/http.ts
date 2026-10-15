@@ -14,6 +14,12 @@ export { APPLE_USER_AGENT } from "../../transport/apple-http.ts";
 export const CLIENT_BUILD = "2534Project66";
 export const CLIENT_MASTERING = "2534B22";
 const responseHeaders = ["X-Apple-ID-Account-Country", "X-Apple-ID-Session-Id", "X-Apple-Auth-Attributes", "X-Apple-Session-Token", "X-Apple-TwoSV-Trust-Token", "scnt"] as const;
+const signInSteps = new Map([
+  ["/appleauth/auth/authorize/signin", "sign-in initialization"],
+  ["/appleauth/auth/federate", "account preflight"],
+  ["/appleauth/auth/signin/init", "password challenge"],
+  ["/appleauth/auth/signin/complete", "password verification"],
+]);
 const token = z.string().max(16_384).refine(value => !/[\r\n\x00]/.test(value));
 const CookieSchema = z.object({ name: z.string().min(1).max(256).regex(/^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/), value: z.string().max(8192).refine(value => !/[\x00-\x20\x7f;,]/.test(value)), domain: z.string().max(253).regex(/^(?:[a-z0-9-]+\.)*(?:apple\.com|icloud\.com)$/), hostOnly: z.boolean(), path: z.string().max(4096).startsWith("/"), secure: z.boolean(), expiresAt: z.number().finite().nullable() }).strict();
 export const AuthSnapshotSchema = z.object({ clientId: z.string().min(1).max(100).regex(/^[A-Za-z0-9-]+$/), headers: z.record(z.enum(responseHeaders), token), cookies: z.array(CookieSchema).max(200) }).strict();
@@ -110,7 +116,8 @@ export class AppleAuthHTTP {
     if (response.status === 429 || response.status >= 500 && delay) throw new AppleRetryError(retryAfterMs);
     const errors = reply.body?.serviceErrors;
     if (Array.isArray(errors) && errors.some(error => object(error)?.code === -20209 || object(error)?.code === "-20209")) {
-      throw new AppError("UNSUPPORTED_AUTH", "Apple reports an account security lock for this sign-in. Resolve it through Apple's official sign-in or account recovery page before retrying.", 422);
+      const step = signInSteps.get(new URL(url).pathname) ?? "Apple authentication";
+      throw new AppError("UNSUPPORTED_AUTH", `Apple blocked this connector during ${step} (security response -20209). If a fresh sign-in at iCloud.com works with the same Apple Account, account recovery may not be needed; this connector's sign-in needs investigation. Use Apple's recovery page if Apple also blocks your sign-in there.`, 422);
     }
     return reply;
   }

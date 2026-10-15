@@ -15,6 +15,9 @@ export const DateComponents = z.object({
   day: z.number().int().min(1).max(31), hour: z.number().int().min(0).max(23),
   minute: z.number().int().min(0).max(59), second: z.number().int().min(0).max(59), timeZone: TimeZone,
   nanosecond: z.literal(0).optional(),
+  // Observed native Gregorian alarms can explicitly encode an ordinary month.
+  // A true leap-month flag needs calendar semantics outside this recipe.
+  isLeapMonth: z.literal(false).optional(),
 }).strict().refine(value => {
   const date = new Date(0);
   date.setUTCFullYear(value.year, value.month - 1, value.day);
@@ -70,13 +73,36 @@ export function dateComponents(due: string, timeZone: string, includeZeroNanosec
   }
   return result.data;
 }
+/** Preserve optional native component markers when changing an exact date pair. */
+export function dateComponentsForSource(due: string, timeZone: string, source: z.infer<typeof DateComponents>) {
+  return { ...dateComponents(due, timeZone, Object.hasOwn(source, "nanosecond")),
+    ...(Object.hasOwn(source, "isLeapMonth") ? { isLeapMonth: false as const } : {}) };
+}
 export function decodeDateComponents(value: unknown) {
   if (typeof value !== "string") throw new AppError("UNSUPPORTED_FEATURE", "The date trigger is not base64 JSON.");
   let decoded: unknown;
   try { decoded = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(unb64(value, 8192))); }
   catch { throw new AppError("UNSUPPORTED_FEATURE", "The date trigger is not bounded UTF-8 JSON."); }
   const result = DateComponents.safeParse(decoded);
-  if (!result.success) throw new AppError("UNSUPPORTED_FEATURE", "This trigger uses unsupported date-component fields or calendar semantics.");
+  if (!result.success) {
+    // Fixed protocol names and validation codes only: never return native field
+    // private values, arbitrary key names, time-zone identifiers or Zod messages.
+    const names = new Set(["era", "year", "month", "day", "hour", "minute", "second", "nanosecond", "timeZone", "timeZone.identifier", "calendar",
+      "isLeapMonth", "leapMonth", "weekday", "weekdayOrdinal", "quarter", "weekOfMonth", "weekOfYear", "yearForWeekOfYear", "timeZone.secondsFromGMT"]);
+    const problems = result.error.issues.flatMap(issue => {
+      const path = issue.path.join(".");
+      if (issue.code === "unrecognized_keys") return issue.keys.map(key => {
+        const field = path ? `${path}.${key}` : key;
+        const parent = path === "" ? decoded : path === "timeZone" && decoded && typeof decoded === "object" ? (decoded as { timeZone?: unknown }).timeZone : undefined;
+        const value = parent && typeof parent === "object" ? (parent as Record<string, unknown>)[key] : undefined;
+        const shape = typeof value === "boolean" ? String(value) : value === null ? "null" : Array.isArray(value) ? "array" : typeof value;
+        return `${names.has(field) ? field : "unrecognized"}:unexpected(${shape})`;
+      });
+      return [`${names.has(path) ? path : "components"}:${issue.code}`];
+    });
+    const summary = [...new Set(problems)].slice(0, 8).join(", ");
+    throw new AppError("UNSUPPORTED_FEATURE", `This trigger uses unsupported date-component fields or calendar semantics. Validation: ${summary}.`);
+  }
   return result.data;
 }
 export function dueDateNonce(encoded: unknown) {
@@ -152,7 +178,7 @@ export function inspectRootAbsoluteDatePair(graph: SchedulingGraph, owner: strin
   for (const record of [alarm, trigger]) if (!record.recordChangeTag || record.deleted || field(record, "Deleted", "INT64") !== 0 || field(record, "Imported", "INT64") !== 0)
     throw new AppError("CONFLICT", "A retained absolute-date participant changed or was deleted.", 409);
   const components = decodeDateComponents(field(trigger, "DateComponentsData", "BYTES"));
-  if (canonicalJSON(components) !== canonicalJSON(dateComponents(reminder.dueDate, reminder.timeZone, Object.hasOwn(components, "nanosecond"))) ||
+  if (canonicalJSON(components) !== canonicalJSON(dateComponentsForSource(reminder.dueDate, reminder.timeZone, components)) ||
     field(alarm, "DueDateResolutionTokenAsNonce", "DOUBLE") !== dueDateNonce(field(graph.reminder, "ResolutionTokenMap", "STRING")))
     throw new AppError("CONFLICT", "The retained reminder due date, nonce and absolute trigger disagree.", 409);
   return [alarm, trigger];
@@ -189,8 +215,7 @@ export function linkedDatePlan(graph: SchedulingGraph, write: CloudKitWriteRecor
   }
   if (rule && referenceField(rule, "Reminder", "Reminder", owner) !== reminder.id) throw new AppError("PROTOCOL_CHANGED", "The recurrence belongs to a different reminder.");
   const oldComponents = decodeDateComponents(field(trigger, "DateComponentsData", "BYTES"));
-  const includeZeroNanosecond = Object.hasOwn(oldComponents, "nanosecond");
-  if (canonicalJSON(oldComponents) !== canonicalJSON(dateComponents(reminder.dueDate, reminder.timeZone, includeZeroNanosecond)) ||
+  if (canonicalJSON(oldComponents) !== canonicalJSON(dateComponentsForSource(reminder.dueDate, reminder.timeZone, oldComponents)) ||
     field(alarm, "DueDateResolutionTokenAsNonce", "DOUBLE") !== dueDateNonce(field(graph.reminder, "ResolutionTokenMap", "STRING"))) {
     throw new AppError("CONFLICT", "The current date, resolution token and alarm/trigger disagree; wait for synchronization and review again.", 409);
   }
@@ -200,7 +225,7 @@ export function linkedDatePlan(graph: SchedulingGraph, write: CloudKitWriteRecor
       DueDateResolutionTokenAsNonce: { type: "DOUBLE", value: dueDateNonce(tokenMap) },
     } },
     { recordName: trigger.recordName, recordType: "AlarmTrigger", recordChangeTag: trigger.recordChangeTag!, fields: {
-      DateComponentsData: { type: "BYTES", value: b64(utf8(JSON.stringify(dateComponents(new Date(due).toISOString(), zone, includeZeroNanosecond)))) },
+      DateComponentsData: { type: "BYTES", value: b64(utf8(JSON.stringify(dateComponentsForSource(new Date(due).toISOString(), zone, oldComponents)))) },
     } },
   ];
   return { dependencies, guards: rule ? [rule] : [] };

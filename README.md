@@ -276,7 +276,7 @@ ordinary members can have one supported absolute-date pair. Direct deletion
 detaches the selected reminder from its List and parent; parent deletion soft-deletes its
 children while preserving their native links and completion state. Exact reads of a detached
 deleted reminder return `listId: null`. No hard-delete or restore tool is exposed.
-Root-only recurring completion supports interval-one timed weekly recurrence, optionally with
+Root-only recurring completion supports intervals 1–999 for timed weekly recurrence, optionally with
 one absolute date alarm, non-ended timed daily recurrence with exactly one absolute-date
 pair in a stored IANA zone, all-day daily recurrence and the observed last-day monthly pattern.
 The active ID remains open at its next calendar due date; `completedOccurrence` returns fresh
@@ -284,7 +284,7 @@ completed history at the old date. Supported weekly and timed daily alarm pairs 
 separately for the active
 record and history. Retain the original ID/tag arguments: durable occurrence intents reconcile
 uncertain acknowledgements by exact reads without creating another history. An all-day daily
-interval-one root with an inclusive end calendar date, or a timed interval-one weekly root
+root with an inclusive end calendar date on its interval cadence, or a timed weekly root
 ending on its exact local cadence, completes its final occurrence in place, returning no
 history, and can reopen at that same date. Daily end instants outside midnight UTC require
 the explicit `recurrenceCalendarTimeZone`; timed weekly rules use their stored zone.
