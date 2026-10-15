@@ -6,6 +6,7 @@ import { Button } from "@/components/ui/button";
 import type { DriveItem } from "@/icloud/drive";
 import { DRIVE_FILE_BYTES, DRIVE_FILE_LIMIT_LABEL } from "@/drive/limits";
 import { uploadDriveFile, pendingDriveUpload, discardDriveUpload } from "@/lib/drive-upload";
+import { streamDriveFile, pendingDriveStreamUpload } from "@/lib/drive-stream-upload";
 
 const ROOT = "FOLDER::com.apple.CloudDocs::root";
 interface Connection { generation: number; services: { drive: { enabled: boolean; ready: boolean; browse: boolean; contents: boolean; upload: boolean; organize: boolean } }; }
@@ -32,6 +33,7 @@ export default function DrivePanel() {
   const [pendingUpload, setPendingUpload] = useState<string | null>(null);
   const [preview, setPreview] = useState<TextPreview | null>(null);
   const fileInput = useRef<HTMLInputElement>(null);
+  const streamInput = useRef<HTMLInputElement>(null);
   const folder = trail[trail.length - 1]!;
   const access = connection?.services.drive;
   const refreshStatus = useCallback(async () => {
@@ -46,7 +48,7 @@ export default function DrivePanel() {
   }, []);
   useEffect(() => {
     const timer = setTimeout(() => {
-      try { const id = pendingDriveUpload(); setOperation(id); setPendingUpload(id); }
+      try { const id = pendingDriveUpload(); setOperation(id ?? pendingDriveStreamUpload()); setPendingUpload(id); }
       catch (cause) { setError(cause instanceof Error ? cause.message : "The retained upload could not be read."); }
       void refreshStatus();
     }, 0);
@@ -89,9 +91,9 @@ export default function DrivePanel() {
     setOperation(result.operationId);
     setNotice(result.phase === "confirmed" ? "Change confirmed by Apple." : `Operation ${result.phase}. Inspect its status before starting another change.`);
   }
-  async function upload(file: globalThis.File) {
+  async function upload(file: globalThis.File, direct = false) {
     if (file.size > DRIVE_FILE_BYTES) throw new Error(`Choose a file no larger than ${DRIVE_FILE_LIMIT_LABEL}.`);
-    const result = await uploadDriveFile(file, { ...context, parentId: folder.id }, (text, id) => { setNotice(text); if (id) setOperation(id); });
+    const result = await (direct ? streamDriveFile : uploadDriveFile)(file, { ...context, parentId: folder.id }, (text, id) => { setNotice(text); if (id) setOperation(id); });
     retain(result); await browse();
   }
   const items = matches ?? listing?.items ?? [];
@@ -103,6 +105,7 @@ export default function DrivePanel() {
       <div className="action-row"><Button variant="outline" disabled={busy} onClick={() => void run(() => browse())}><RefreshCw size={16} />Refresh folder</Button>
         {access.upload && !folder.shareContext && <><input ref={fileInput} type="file" hidden onChange={event => { const file = event.target.files?.[0]; event.target.value = ""; if (file) void run(() => upload(file)); }} /><Button variant="outline" disabled={busy} onClick={() => fileInput.current?.click()}><Upload size={16} />Upload file (up to {DRIVE_FILE_LIMIT_LABEL})</Button></>}
       </div>
+      {access.upload && !folder.shareContext && <div className="action-row"><input ref={streamInput} type="file" hidden onChange={event => { const file = event.target.files?.[0]; event.target.value = ""; if (file) void run(() => upload(file, true)); }} /><Button variant="outline" disabled={busy} onClick={() => streamInput.current?.click()}><Upload size={16} />Stream file directly (experimental)</Button><span className="fine-print">No temporary file copy. Keep this page open; an interrupted transfer cannot resume its bytes.</span></div>}
       {pendingUpload && access.upload && <p className="fine-print">Interrupted a large upload? Reselect the same file in its original folder to resume. <Button variant="ghost" disabled={busy} onClick={() => void run(async () => { await discardDriveUpload(pendingUpload); setNotice("Staged data discarded. Any Apple operation receipt is retained."); })}>Discard staged data</Button></p>}
       <form className="drive-form" onSubmit={event => { event.preventDefault(); void run(() => find()); }}><label htmlFor="drive-search">Find file or folder names within this folder</label><div className="action-row"><input id="drive-search" value={query} maxLength={200} disabled={busy || !!continuation} onChange={event => setQuery(event.target.value)} /><Button variant="outline" disabled={busy || !query.trim()} type="submit"><Search size={16} />Search</Button>{matches && <Button variant="ghost" disabled={busy} onClick={() => { setMatches(null); setContinuation(null); }}>Clear search</Button>}</div></form>
       {access.organize && !folder.shareContext && <form className="drive-form" onSubmit={event => { event.preventDefault(); void run(async () => { const operationId = crypto.randomUUID(); setOperation(operationId); retain(await call<Operation>("/api/drive/create-folder", { ...context, parentId: folder.id, name, operationId })); setName(""); await browse(); }); }}><label htmlFor="drive-folder-name">New folder name</label><div className="action-row"><input id="drive-folder-name" value={name} maxLength={255} disabled={busy} onChange={event => setName(event.target.value)} /><Button type="submit" variant="outline" disabled={busy || !name.trim()}><FolderPlus size={16} />Create folder</Button></div></form>}

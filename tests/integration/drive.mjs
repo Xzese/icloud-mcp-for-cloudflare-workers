@@ -42,6 +42,8 @@ async function bytesOf(stream) {
 
 export async function verifyDrive(options) {
   await verifyMultipartDrive(options);
+  await verifyMultipartDrive(options, { transport: "stream" });
+  for (const fault of ["disconnect", "frame", "checksum"]) await verifyMultipartDrive(options, { transport: "stream", fault });
   const secret = randomBytes(32).toString("base64");
   const payloadBytes = randomBytes(300 * 1024);
   payloadBytes.fill(65, 0, 8192); // A valid text prefix; the preview never validates its unread suffix.

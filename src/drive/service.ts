@@ -492,6 +492,28 @@ export class DriveService {
     if (!this.env.BUCKET) throw new AppError("CONFIGURATION_REQUIRED", "Files above 64 MiB require a private BUCKET R2 binding and the multipart upload flow on Workers or Sites.", 503);
     return this.env.BUCKET;
   }
+  async prepareStreamUpload(input: unknown) {
+    const request = parse(UploadDriveMetadata, input);
+    return this.metadata("drive.upload", request.expectedGeneration, async c => {
+      // A distinct kind pins the transport in the idempotency fingerprint.
+      // Neither a staged intent nor the ordinary HTTP route can use this key.
+      const row = await this.operations.create(request.operationId, "stream-upload", request, c.scope);
+      if (row.permission_revision !== c.scope.permissionRevision) conflict("Upload permissions changed since this intent was prepared.");
+      if (row.phase === "prepared") await this.destination(c, request.parentId, request.name);
+      return { operationId: row.operation_id, phase: row.phase, socketPath: `/api/drive/uploads/${row.operation_id}/stream` };
+    });
+  }
+  async streamUploadStatus(operationId: string) {
+    return this.metadata("drive.upload", undefined, async c => {
+      const row = await this.operations.get(parse(OperationId, operationId), c.scope);
+      if (row.kind !== "stream-upload") conflict("This operation was not prepared for direct streaming.");
+      if (!["prepared", "allocated", "uploaded", "confirmed"].includes(row.phase)) throw unknownOutcome(row.operation_id);
+      return { operationId: row.operation_id, phase: row.phase, size: parse(UploadDriveMetadata, (await this.operations.data(row)).input).size };
+    });
+  }
+  async uploadStreamContent(operationId: string, body: ReadableStream<Uint8Array>, signal: AbortSignal) {
+    return this.uploadContent(operationId, body, signal, false, true);
+  }
   private staging(context: Context) {
     return new DriveStaging(this.requireStagingBucket(), this.operations, context.scope, () => this.guard(context.scope, "drive.upload"));
   }
@@ -541,7 +563,7 @@ export class DriveService {
     await this.prepareUpload(metadata);
     return this.uploadContent(request.operationId, new ReadableStream<Uint8Array>({ start(controller) { controller.enqueue(bytes); controller.close(); } }));
   }
-  async uploadContent(operationId: string, body: ReadableStream<Uint8Array>, signal?: AbortSignal, staged = false) {
+  async uploadContent(operationId: string, body: ReadableStream<Uint8Array>, signal?: AbortSignal, staged = false, streamed = false) {
     operationId = parse(OperationId, operationId);
     let c: Context | null = await this.open("drive.upload");
     const scope = c.scope;
@@ -551,10 +573,10 @@ export class DriveService {
     try {
       row = await this.operations.get(operationId, scope);
       data = await this.operations.data(row);
-      if (row.kind !== "upload") conflict("This operation is not an upload intent.");
+      if (row.kind !== (streamed ? "stream-upload" : "upload")) conflict("This operation belongs to a different upload transport.");
       request = parse(UploadDriveMetadata, data.input);
       if (row.phase !== "confirmed" && (data.staging?.cancelled || staged && !data.staging?.objectEtag)) conflict("This staged upload is unavailable.");
-      if (row.phase !== "confirmed" && !staged && (request.size > DRIVE_DIRECT_UPLOAD_BYTES || data.staging)) throw new AppError("VALIDATION_ERROR", "Use prepare-multipart-upload, numbered parts and complete-multipart-upload for this file. Direct uploads allow at most 64 MiB.", 413);
+      if (row.phase !== "confirmed" && !staged && !streamed && (request.size > DRIVE_DIRECT_UPLOAD_BYTES || data.staging)) throw new AppError("VALIDATION_ERROR", "Use prepare-multipart-upload, numbered parts and complete-multipart-upload for this file. Direct uploads allow at most 64 MiB.", 413);
     } catch (error) {
       await this.close(c);
       await body.cancel(error).catch(() => {});

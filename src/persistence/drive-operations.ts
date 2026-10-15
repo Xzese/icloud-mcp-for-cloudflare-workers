@@ -85,7 +85,7 @@ export class DriveOperationRepository {
     if (row.permission_revision !== scope.permissionRevision) throw new AppError("CONFLICT", "Service settings changed after this operation began. Inspect the retained operation; do not replay it.", 409);
     const now = Date.now(), lease = crypto.randomUUID();
     const next = await this.db.prepare("UPDATE drive_operations SET lease_id = ?, lease_until = ?, revision = revision + 1 WHERE owner_id = ? AND operation_id = ? AND revision = ? AND lease_until <= ? AND expires_at > ? RETURNING *")
-      .bind(lease, Math.min(now + (row.kind === "upload" ? DRIVE_UPLOAD_LEASE_MS : 150_000), row.expires_at), this.owner, row.operation_id, row.revision, now, now).first<DriveOperation>();
+      .bind(lease, Math.min(now + (["upload", "stream-upload"].includes(row.kind) ? DRIVE_UPLOAD_LEASE_MS : 150_000), row.expires_at), this.owner, row.operation_id, row.revision, now, now).first<DriveOperation>();
     if (!next) throw conflict();
     return next;
   }

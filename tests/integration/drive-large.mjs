@@ -11,7 +11,7 @@ import { Envelopes } from "../../src/crypto/envelopes.ts";
 import { loginAssurance } from "../../src/auth/apple/policy.ts";
 import { DEFAULT_SERVICE_SETTINGS } from "../../src/services/settings.ts";
 import { DRIVE_ROOT } from "../../src/icloud/drive.ts";
-import { DRIVE_UPLOAD_PART_BYTES, DRIVE_FILE_BYTES } from "../../src/drive/limits.ts";
+import { DRIVE_UPLOAD_PART_BYTES, DRIVE_FILE_BYTES, DRIVE_STREAM_CHUNK_BYTES, DRIVE_STREAM_PROTOCOL } from "../../src/drive/limits.ts";
 
 const root = resolve(new URL("../..", import.meta.url).pathname);
 const owner = "synthetic-multipart-owner", origin = "https://multipart.example.test";
@@ -65,7 +65,9 @@ async function inspectMultipart(request, size, expected, report) {
   assert.equal(trailer.toString(), `\r\n--${boundary}--\r\n`);
 }
 
-export async function verifyMultipartDrive(options, { bytes = DRIVE_UPLOAD_PART_BYTES + 17, report = () => {} } = {}) {
+export async function verifyMultipartDrive(options, { bytes = DRIVE_UPLOAD_PART_BYTES + 17, report = () => {}, transport = "multipart", fault } = {}) {
+  assert.ok(["multipart", "stream"].includes(transport));
+  const streaming = transport === "stream";
   assert.ok(Number.isSafeInteger(bytes) && bytes > DRIVE_UPLOAD_PART_BYTES && bytes <= DRIVE_FILE_BYTES);
   const hash = expectedHash(bytes), secret = randomBytes(32).toString("base64");
   const team = "https://multipart.cloudflareaccess.com", audience = "synthetic-multipart-audience";
@@ -104,10 +106,10 @@ export async function verifyMultipartDrive(options, { bytes = DRIVE_UPLOAD_PART_
     }
     throw new Error("Unexpected synthetic multi-gigabyte upstream request.");
   };
-  const worker = new Miniflare({ ...options, name: "multipart-drive-acceptance", d1Databases: { DB: "multipart-drive-db" }, d1Persist: false, r2Buckets: ["BUCKET"], r2Persist: false,
+  const worker = new Miniflare({ ...options, name: "multipart-drive-acceptance", d1Databases: { DB: "multipart-drive-db" }, d1Persist: false, r2Buckets: streaming ? [] : ["BUCKET"], r2Persist: false,
     bindings: { ...options.bindings, APP_ORIGIN: origin, REMINDERS_OWNER_ID: owner, TEAM_DOMAIN: team, POLICY_AUD: audience, ENCRYPTION_KEY_ID: "synthetic", ENCRYPTION_KEYS_JSON: JSON.stringify({ synthetic: secret }), LIVE_APPLE_CONNECTION_APPROVED: "controlled-device-v2", APPLE_CRYPTO_REVIEW_APPROVED: "device-proof-v2", APPLE_SESSION_RETENTION_WRITES: "absolute-30d-v1" }, outboundService, log: new Log(LogLevel.ERROR) });
   try {
-    const db = await worker.getD1Database("DB"), bucket = await worker.getR2Bucket("BUCKET");
+    const db = await worker.getD1Database("DB"), bucket = streaming ? null : await worker.getR2Bucket("BUCKET");
     const statements = (await readFile(join(root, "schema.sql"), "utf8")).replace(/^\s*--.*$/gm, "").split(";").map(value => value.trim()).filter(Boolean);
     await db.batch(statements.map(sql => db.prepare(sql)));
     const settings = { ...structuredClone(DEFAULT_SERVICE_SETTINGS), drive: { enabled: true, browse: true, contents: true, upload: true, organize: false } };
@@ -121,6 +123,72 @@ export async function verifyMultipartDrive(options, { bytes = DRIVE_UPLOAD_PART_
       assert.equal(response.status, 200, JSON.stringify({ value, allocations, transfers, commits, upstreamFailure })); return value;
     };
     const operationId = randomUUID(), input = { operationId, parentId: DRIVE_ROOT, name, size: bytes, sha256: hash, contentType: "application/octet-stream" };
+    if (fault === "checksum") input.sha256 = "0".repeat(64);
+    if (streaming) {
+      const prepared = await post("/api/drive/prepare-stream-upload", input);
+      assert.deepEqual([allocations, transfers, commits], [0, 0, 0]);
+      const headers = { "oai-authenticated-user-id": owner, "cf-access-jwt-assertion": assertion, origin, upgrade: "websocket", "sec-websocket-protocol": DRIVE_STREAM_PROTOCOL };
+      assert.equal((await worker.dispatchFetch(origin + prepared.socketPath, { headers: { ...headers, origin: "https://other.example.test" } })).status, 403);
+      assert.equal((await worker.dispatchFetch(origin + prepared.socketPath, { headers: { ...headers, "sec-websocket-protocol": "invalid" } })).status, 400);
+      assert.equal((await request(prepared.socketPath)).status, 426);
+      assert.equal((await request(`/api/drive/uploads/${operationId}/content`, { body: new Uint8Array(), binary: true })).status, 409);
+      const sendFile = async replay => {
+        const response = await worker.dispatchFetch(origin + prepared.socketPath, { headers });
+        assert.equal(response.status, 101, response.status === 101 ? undefined : await response.text());
+        const socket = response.webSocket, queue = [];
+        let waiting, ended = false, offset = 0;
+        socket.binaryType = "arraybuffer";
+        socket.addEventListener("message", event => {
+          const message = JSON.parse(event.data);
+          if (waiting) { const next = waiting; waiting = null; next.resolve(message); } else queue.push(message);
+        });
+        socket.addEventListener("close", () => { ended = true; if (waiting) { waiting.reject(new Error("Stream closed without a saved result.")); waiting = null; } });
+        socket.accept();
+        try {
+          for (;;) {
+            const message = queue.length ? queue.shift() : await new Promise((resolve, reject) => {
+              if (ended) { reject(new Error("Stream closed without a saved result.")); return; }
+              const timer = setTimeout(() => reject(new Error("Direct upload message timed out.")), 60_000);
+              waiting = { resolve: value => { clearTimeout(timer); resolve(value); }, reject: error => { clearTimeout(timer); reject(error); } };
+            });
+            assert.equal(message.operationId, operationId);
+            if (fault && message.type === "failed") return;
+            assert.notEqual(message.type, "failed", JSON.stringify({ message, upstreamFailure }));
+            if (message.type === "result") {
+              assert.equal(message.operation.phase, "confirmed");
+              assert.equal(message.operation.result.item.size, bytes);
+              assert.equal(offset, replay ? 0 : bytes); break;
+            }
+            assert.equal(replay, false, "receipt replay never requests file bytes");
+            assert.equal(message.type, "pull"); assert.equal(message.offset, offset);
+            assert.equal(message.bytes, Math.min(DRIVE_STREAM_CHUNK_BYTES, bytes - offset));
+            if (fault === "disconnect") { socket.close(); return; }
+            if (fault === "frame") { socket.send(new Uint8Array(1)); continue; }
+            socket.send(chunk.slice(0, message.bytes)); offset += message.bytes;
+            if (offset % (256 * 1024 ** 2) === 0) report(`Streamed ${offset} of ${bytes} bytes without R2.`);
+          }
+        } finally { if (socket.readyState === 1) socket.close(); }
+      };
+      await sendFile(false);
+      if (fault) {
+        let operation;
+        for (let attempt = 0; attempt < 40; attempt++) {
+          operation = await post("/api/drive/operation", { operationId });
+          if (operation.phase === "unknown") break;
+          await new Promise(resolve => setTimeout(resolve, 25));
+        }
+        assert.equal(operation.phase, "unknown");
+        const beforeReplay = [allocations, transfers, commits];
+        assert.equal((await post("/api/drive/prepare-stream-upload", input)).phase, "unknown");
+        const replay = await worker.dispatchFetch(origin + prepared.socketPath, { headers });
+        assert.equal(replay.status, 503);
+        assert.equal((await replay.json()).error.code, "WRITE_OUTCOME_UNKNOWN");
+        assert.deepEqual([allocations, transfers, commits], beforeReplay);
+        assert.equal(commits, 0);
+        return { result: "passed", transport: "websocket", r2Bound: false, fault, unsafeReplayPrevented: true };
+      }
+      await sendFile(true);
+    } else {
     const prepared = await post("/api/drive/prepare-multipart-upload", input);
     assert.equal(prepared.partBytes, DRIVE_UPLOAD_PART_BYTES);
     assert.deepEqual([allocations, transfers, commits], [0, 0, 0]);
@@ -142,6 +210,8 @@ export async function verifyMultipartDrive(options, { bytes = DRIVE_UPLOAD_PART_
     await post("/api/drive/complete-multipart-upload", { operationId });
     assert.deepEqual([allocations, transfers, commits], [1, 1, 1]);
     assert.equal((await bucket.list()).objects.length, 0, "confirmed staged bytes are deleted");
+    }
+    assert.deepEqual([allocations, transfers, commits], [1, 1, 1]);
     report("Downloading the complete generated file through the production Worker.");
     const handle = await post("/api/drive/download", { itemId }), download = await request(handle.url);
     assert.equal(download.status, 200); assert.equal(download.headers.get("content-length"), String(bytes));
@@ -151,7 +221,7 @@ export async function verifyMultipartDrive(options, { bytes = DRIVE_UPLOAD_PART_
     assert.equal(ranged.status, 206); assert.equal(ranged.headers.get("content-range"), `bytes ${start}-${bytes - 1}/${bytes}`);
     assert.deepEqual(await hashStream(ranged.body), { size: 17, sha256: expectedHash(17) });
     assert.equal((await request(fresh.url)).status, 409);
-    return { bytes, sha256: hash, appleUploads: transfers, resumedParts: true, rangeVerified: true };
+    return { bytes, sha256: hash, appleUploads: transfers, ...(streaming ? { transport: "websocket", r2Bound: false, confirmedReplayWithoutBytes: true } : { resumedParts: true }), rangeVerified: true };
   } finally { await worker.dispose(); }
 }
 
@@ -159,6 +229,6 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
   const config = JSON.parse(await readFile(join(root, "dist/server/wrangler.json"), "utf8")), server = join(root, "dist/server");
   const paths = (await readdir(server, { recursive: true, withFileTypes: true })).filter(file => file.isFile() && /\.(?:js|mjs)$/.test(file.name)).map(file => join(file.parentPath, file.name));
   const entry = join(server, "index.js");
-  const result = await verifyMultipartDrive({ modulesRoot: server, modules: [entry, ...paths.filter(path => path !== entry)].map(path => ({ type: "ESModule", path })), compatibilityDate: config.compatibility_date, compatibilityFlags: config.compatibility_flags, assets: { directory: join(root, "dist/client"), routerConfig: { has_user_worker: true } } }, { bytes: Number(process.env.DRIVE_LARGE_TEST_BYTES ?? 2 ** 31 + 17), report: console.log });
+  const result = await verifyMultipartDrive({ modulesRoot: server, modules: [entry, ...paths.filter(path => path !== entry)].map(path => ({ type: "ESModule", path })), compatibilityDate: config.compatibility_date, compatibilityFlags: config.compatibility_flags, assets: { directory: join(root, "dist/client"), routerConfig: { has_user_worker: true } } }, { bytes: Number(process.env.DRIVE_LARGE_TEST_BYTES ?? 2 ** 31 + 17), transport: process.env.DRIVE_LARGE_TEST_TRANSPORT ?? "multipart", report: console.log });
   console.log(JSON.stringify(result));
 }

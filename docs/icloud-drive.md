@@ -241,6 +241,7 @@ content downloads and `docws` fallback remain covered by synthetic tests rather 
 | Text preview | Up to 8 KiB of leading UTF-8 bytes | Set `previewBytes` on the read tool/HTTP route; file must be within 10 GiB |
 | Direct HTTP upload | 64 MiB | Prepare metadata, then stream binary bytes |
 | Dashboard/multipart upload | 10 GiB | Stage 8 MiB parts in private R2, then stream to Apple |
+| Experimental direct stream | 10 GiB | Browser WebSocket relays bytes to Apple without R2; no byte resume |
 | Private download | 10 GiB | Authenticated same-origin URL, single use, ten-minute lifetime |
 
 An MCP download result is an application-relative authenticated URL. It is not a public share
@@ -281,6 +282,34 @@ per-socket-chunk queries while keeping a 10 GiB invocation below D1's 1,000-quer
 Text reads/previews retain 4 KiB blocks so a preview never consumes a large transfer block.
 
 ### Multi-gigabyte transfers on Workers and Sites
+
+The dashboard also offers **Stream file directly (experimental)**. This sends the browser's
+file through an authenticated, same-origin WebSocket into Apple's existing single-request
+upload. It creates no R2 object and works without a `BUCKET` binding. The existing Upload
+button retains resumable R2 staging.
+
+Direct streaming first hashes the file incrementally and saves its original operation UUID
+and metadata in tab-local session storage. `POST /api/drive/prepare-stream-upload` prepares a
+distinct `stream-upload` intent and returns its same-origin `socketPath`. Connect using
+WebSocket subprotocol `icloud-drive-upload-v1`, with no query parameters. The server sends
+`{type:"pull", operationId, offset, bytes}` for each frame; send exactly the requested binary
+bytes (up to 1 MiB), once per credit. Credits follow consumption by the Apple upload stream,
+so the browser cannot queue the complete file in Worker memory. The existing 16 MiB
+authorization blocks, exact length/full SHA-256 checks and encrypted mutation ledger apply.
+Apple credentials, allocation URLs and private receipts remain server-side.
+
+The server returns `{type:"result", operationId, operation}` only after saving the result;
+errors use `{type:"failed", operationId, error}`. Keep the page open during streaming and
+finalization. A disconnect, malformed frame, checksum failure or uncertain Apple response
+retains the original operation ID and never automatically resends the Apple upload. Reselect
+the original file to recover only a safe allocated intent or a durably saved receipt. An
+`unknown`/`uploading`/`committing` outcome must first be inspected, not retried under a new key.
+This mode has no byte-level resume or durable file copy. WebSocket gateway behavior and live
+Apple transfers remain subject to live acceptance; local synthetic success does not prove them.
+
+Run `DRIVE_LARGE_TEST_TRANSPORT=stream npm run test:drive:large` after building either target
+for the 2 GiB + 17-byte direct-stream journey without an R2 binding. Standard Worker journeys
+also cover malformed frames, disconnects and full-file checksum failures without unsafe replay.
 
 The 10 GiB limit is an application ceiling, not a guarantee of that size on every deployment.
 Both targets use the same R2 `BUCKET` binding. Sites provisions it from the logical
@@ -377,6 +406,8 @@ owner authentication; knowing a handle does not grant access.
 | `/api/drive/list`, `/lookup`, `/search`, `/traverse`, `/resolve-folder-path`, `/read`, `/download` | POST corresponding tool input |
 | `/api/drive/upload`, `/create-folder`, `/rename`, `/move`, `/operation` | POST corresponding tool input |
 | `/api/drive/prepare-upload` | POST upload metadata without `contentBase64`; returns `operationId`, `uploadPath` |
+| `/api/drive/prepare-stream-upload` | POST upload metadata; returns `operationId`, `phase`, `socketPath` for direct streaming |
+| `/api/drive/uploads/<operationId>/stream` | GET WebSocket upgrade, same origin and `icloud-drive-upload-v1` subprotocol; binary frames only on server credit |
 | `/api/drive/uploads/<operationId>/content` | POST raw bytes, `Content-Type: application/octet-stream`, configured application `Origin` |
 | `/api/drive/prepare-multipart-upload` | POST upload metadata; returns phase, part size and acknowledged part numbers |
 | `/api/drive/uploads/<operationId>/parts/<partNumber>` | POST one binary part with `X-Content-SHA256` and configured application `Origin` |

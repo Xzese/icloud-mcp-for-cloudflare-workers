@@ -11,6 +11,7 @@ import { z } from "zod";
 import { ServiceSettingsRepository } from "../persistence/service-settings.ts";
 import { ServiceSettingsSchema } from "../services/settings.ts";
 import { DriveService } from "../drive/service.ts";
+import { driveUploadSocket } from "../drive/upload-socket.ts";
 import { DriveConsent, INLINE_REQUEST_BYTES, INLINE_UPLOAD_GUIDANCE } from "../drive/schemas.ts";
 
 async function readJSON(request: Request, limit = 12_288): Promise<unknown> {
@@ -45,6 +46,8 @@ export async function applicationRoute(request: Request, env: RuntimeEnv, creden
       return await handleMCP(request, env, owner);
     }
     if (request.method === "GET") {
+      const streamUpload = /^\/api\/drive\/uploads\/([a-f0-9-]{36})\/stream$/i.exec(path);
+      if (streamUpload) return await driveUploadSocket(request, env, new DriveService(env, owner), z.string().uuid().parse(streamUpload[1]).toLowerCase());
       if (path === "/api/settings") return json(await new ServiceSettingsRepository(env, owner).load());
       const download = /^\/api\/drive\/downloads\/([a-f0-9-]{36})$/i.exec(path);
       if (download) return await new DriveService(env, owner).downloadContent(z.string().uuid().parse(download[1]), request.signal, request.headers.get("range"));
@@ -82,7 +85,7 @@ export async function applicationRoute(request: Request, env: RuntimeEnv, creden
         const connection = new AppleConnectionService(env, owner);
         return json(await (path === "/api/drive/approve" ? connection.approveDrive(value.data.expectedGeneration, value.data.restartApproval) : connection.approveReminders(value.data.expectedGeneration, value.data.restartApproval)));
       }
-      const driveActions = { list: "list", lookup: "get", search: "search", traverse: "traverse", "resolve-folder-path": "resolveFolderPath", read: "read", download: "download", upload: "upload", "prepare-upload": "prepareUpload", "prepare-multipart-upload": "prepareMultipartUpload", "discard-multipart-upload": "discardMultipartUpload", "create-folder": "createFolder", rename: "rename", move: "move", operation: "operation" } as const;
+      const driveActions = { list: "list", lookup: "get", search: "search", traverse: "traverse", "resolve-folder-path": "resolveFolderPath", read: "read", download: "download", upload: "upload", "prepare-upload": "prepareUpload", "prepare-stream-upload": "prepareStreamUpload", "prepare-multipart-upload": "prepareMultipartUpload", "discard-multipart-upload": "discardMultipartUpload", "create-folder": "createFolder", rename: "rename", move: "move", operation: "operation" } as const;
       const driveAction = path.startsWith("/api/drive/") ? path.slice("/api/drive/".length) : "";
       if (Object.hasOwn(driveActions, driveAction)) {
         const method = driveActions[driveAction as keyof typeof driveActions];
