@@ -237,15 +237,17 @@ content downloads and `docws` fallback remain covered by synthetic tests rather 
 
 | Transfer | Limit | How |
 | --- | --- | --- |
-| MCP full read/upload | 64 KiB of decoded file bytes | UTF-8/base64 response or base64 upload input |
+| MCP inline full read/upload | 64 KiB of decoded file bytes | UTF-8/base64 response or base64 upload input |
+| MCP chunk upload/read and checksum | 64 MiB, inclusive | Authenticated MCP tools; 64 KiB decoded bytes per chunk |
 | Text preview | Up to 8 KiB of leading UTF-8 bytes | Set `previewBytes` on the read tool/HTTP route; file must be within 64 MiB |
 | Dashboard/HTTP upload | 64 MiB | Prepare metadata, then stream binary bytes |
 | Private download | 64 MiB | Authenticated same-origin URL, single use, ten-minute lifetime |
 
 An MCP download result is an application-relative authenticated URL. It is not a public share
 link or an attachment automatically imported into ChatGPT. A client must retain the owner's
-deployment authentication to fetch it. If your MCP client cannot do that, use the dashboard
-download button. Never send Apple cookies or sign-in credentials as tool arguments.
+deployment authentication to fetch it. If your MCP client cannot do that, use `read_icloud_drive_file_chunk` for ordinary files
+or the dashboard download button. Use `checksum_icloud_drive_file` when only independent
+content verification is needed. Never send Apple cookies or sign-in credentials as tool arguments.
 
 The dashboard can browse owned and shared folders, search names, preview text and download files.
 Folder creation and uploads are available in owned folders.
@@ -267,7 +269,8 @@ but content reads, previews and transfers refuse them. The MCP JSON upload reque
 requests direct clients to dashboard Upload or the HTTP prepare-upload/binary flow.
 
 Uploads require exact byte size and lowercase SHA-256. The server verifies both before
-finalizing the new file. File bodies are streamed and are never persisted in D1. Metadata
+finalizing the new file. Direct HTTP and inline upload bodies are streamed without persistence. MCP chunk uploads
+use bounded, encrypted temporary staging in D1, described below. Metadata
 responses are bounded. Each content transfer has a five-minute timeout; upload operations
 have a six-minute exclusive lease, capped by the saved session deadline. The dashboard hashes
 file chunks before sending the file, without buffering the complete file for hashing.
@@ -277,6 +280,61 @@ URLs and upload receipts stay private.
 The 64 MiB cap is 67,108,864 bytes, below Cloudflare Free/Pro’s 100 MB incoming-request
 limit. Other hosting platforms may impose different limits. These are streamed transfers,
 not bundled static assets. See [Cloudflare’s limits](https://developers.cloudflare.com/workers/platform/limits/).
+
+## Transfers through MCP without a separate browser login
+
+`get_icloud_drive_transfer_info` returns `dashboardOrigin`, `inlineBytes`, `maxFileBytes`,
+`chunkBytes` and `chunkUploadsAvailable`. The maximum is **67,108,864 bytes, inclusive**.
+The origin is deployment metadata, not a credential. HTTP paths retain their owner and Origin
+checks. The following tools use the existing MCP authentication and saved Apple session;
+no Apple cookies or credentials belong in their inputs.
+
+Apply additive migration `0008_drive_upload_chunks.sql` before using chunk uploads. Older
+deployments report `chunkUploadsAvailable: false` and an actionable migration error, while
+existing inline, dashboard and HTTP uploads continue to work.
+
+1. Hash the complete source and record its exact size. Call `prepare_icloud_drive_upload`
+   with the same metadata accepted by HTTP prepare-upload: `operationId`, `parentId`, `name`,
+   `size`, `sha256`, optional `contentType` and `expectedGeneration`.
+2. Call `append_icloud_drive_upload_chunk` with `operationId`, `offset` and `contentBase64`.
+   Offsets are multiples of 65,536; each decoded chunk is exactly 65,536 bytes except the
+   final chunk, which contains exactly the remaining bytes. Empty files need no chunks.
+   Out-of-order chunks are accepted. An identical offset/bytes retry is safe; changing an
+   existing chunk conflicts. Progress reports received bytes and chunks.
+3. Call `complete_icloud_drive_upload` with the retained `operationId`. It checks every staged
+   byte and the complete SHA-256 before Apple allocation, then uses the existing durable
+   upload state machine. A confirmed repeat does not upload again. Missing chunks or a bad
+   digest fail before allocation. Uncertain writes retain the original operation key and
+   must be inspected with `get_icloud_drive_operation`, never automatically replaced.
+4. Call `checksum_icloud_drive_file` with the confirmed `itemId` and `etag` (and `shareContext`
+   when present). It streams the entire file and returns SHA-256 and byte count after checking
+   length and the live version again. Compare both with the source. Upload confirmation and
+   matching paths/sizes alone do not prove independent read-back equality. Preserve existing
+   iCloud files and source originals until verification succeeds.
+
+For complete binary downloads, call `read_icloud_drive_file_chunk` with the same exact item ID,
+share context and etag on every request, an `offset` starting at zero, and optional `length`
+(up to 65,536). Decode base64 and advance by `nextOffset` until `complete`. Each chunk checks
+Apple's byte range, byte count and live metadata version. Combine bytes in order and compare
+the full checksum. A version conflict requires restarting the read; never combine versions.
+Checksums and chunk reads exclude package archives. Ignored or incorrect upstream ranges
+fail explicitly.
+
+Chunk staging uses the existing encryption key ring, with owner/account/session/operation/
+offset bound encryption. At most 128 MiB of decoded staged bytes are retained per owner.
+Staging expires with its operation (at most 24 hours, capped by session expiry), is removed
+after confirmed completion, and expired rows are purged on the next append. Disconnect removes
+it with the operation records. `discard_icloud_drive_upload_chunks` releases staging for a
+still-prepared operation without touching Apple; its original intent/key remain retained.
+Settings changes prevent continuing the old upload. Staging adds database traffic and MCP
+round trips: a full 64 MiB file takes 1,024 append calls. Authenticated HTTP streaming is the
+more efficient option for clients that can use it.
+
+Connector registration metadata must also be refreshed after deployment so clients discover
+these tools. The old connector-wide “Private synthetic feasibility prototype. Apple connection
+and reminder changes are disabled.” prefix is not generated by this source; remove it in the
+hosted connector registration. Current readiness comes from `connection_status` and each
+operation's enforced owner/session/permission checks.
 
 ## HTTP API
 
@@ -351,8 +409,10 @@ indexing. Unknown protocol shapes fail explicitly. Apple may change these undocu
 
 Operation secrets expire at the earlier of the Apple session's local retention deadline or
 24 hours. Operation keys remain non-reusable tombstones for that generation. There are at most
-1,024 operation keys per generation and 128 active transfer/search/share-context handles per owner; reconnect
-only after reviewing outstanding work if the operation limit is reached. Disconnect/reconnect
+1,024 unexpired, unconfirmed operations per generation and 128 active transfer/search/share-context
+handles per owner. Confirmed receipts do not consume the unfinished-operation quota, so verified
+migrations can exceed 1,024 files without reconnecting. Review outstanding work if the limit is
+reached; never abandon uncertain writes under new keys. Disconnect/reconnect
 invalidates old handles and recovery scope. Local cleanup never removes iCloud files.
 
 ## Database upgrade and rollback
@@ -373,6 +433,8 @@ The integrated Reminders collection and workflow features additionally require p
 migrations `0004_bulk_change_jobs.sql`, `0005_connector_filters.sql`,
 `0006_create_workflows.sql` and `0007_list_duplication.sql`; apply them in order using the
 [Reminders upgrade guide](reminder-jobs.md#storage-migration-and-rollback).
+Then apply `migrations/0008_drive_upload_chunks.sql` for MCP chunk uploads. It adds only the
+staging table and expiry index. Existing HTTP transfers do not require this new table.
 
 If the settings table is absent, old Reminders defaults remain and Drive stays disabled;
 saving preferences fails with an explicit migration message. Malformed stored settings fail

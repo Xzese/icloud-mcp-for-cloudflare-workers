@@ -121,3 +121,16 @@ test("Expired operation keys remain tombstones and authenticated ciphertext cann
   assert.equal(db.sqlite.prepare("SELECT envelope FROM drive_operations WHERE operation_id = ?").get(a.operation_id)?.envelope, null);
   db.sqlite.close();
 });
+
+test("verified upload history does not block migrations exceeding 1024 files or permit operation-key reuse", async t => {
+  const { db, repository, scope } = fixture();
+  t.after(() => db.sqlite.close());
+  const original = await repository.create(crypto.randomUUID(), "upload", { name: "verified.bin" }, scope);
+  db.sqlite.prepare("UPDATE drive_operations SET phase = 'confirmed' WHERE owner_id = ?").run(repository.owner);
+  // Seed retained confirmed receipts as a large migration would leave them.
+  const insert = db.sqlite.prepare("INSERT INTO drive_operations (owner_id,operation_id,account_scope,generation,permission_revision,input_hash,kind,phase,expires_at,envelope) SELECT owner_id,?,account_scope,generation,permission_revision,input_hash,kind,phase,expires_at,NULL FROM drive_operations WHERE operation_id = ?");
+  for (let i = 1; i < 1348; i++) insert.run(crypto.randomUUID(), original.operation_id);
+  const next = await repository.create(crypto.randomUUID(), "upload", { name: "next.bin" }, scope);
+  assert.equal(next.phase, "prepared");
+  await assert.rejects(repository.create(original.operation_id, "upload", { name: "different.bin" }, scope), { code: "CONFLICT" });
+});

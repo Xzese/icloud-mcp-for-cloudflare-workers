@@ -23,7 +23,8 @@ const canonicalOperationId = (value: string) => {
   return parsed.data.toLowerCase();
 };
 
-// Bodies are never stored. Inputs, Apple receipts and identifiers are sealed
+// Direct-upload bodies are never stored here. MCP chunks have separate bounded,
+// encrypted temporary staging. Inputs, Apple receipts and identifiers are sealed
 // under the same key ring, with a distinct record context for every operation.
 export class DriveOperationRepository {
   readonly db: D1DatabaseSession;
@@ -74,8 +75,8 @@ export class DriveOperationRepository {
     const envelope = JSON.stringify(await this.envelopes.encrypt({ input }, this.context(id, scope.account, scope.generation)));
     await this.db.prepare("UPDATE drive_operations SET envelope = NULL WHERE owner_id = ? AND expires_at <= ? AND lease_until <= ?").bind(this.owner, Date.now(), Date.now()).run();
     await this.db.prepare(`INSERT OR IGNORE INTO drive_operations (owner_id,operation_id,account_scope,generation,permission_revision,input_hash,kind,phase,expires_at,envelope)
-      SELECT ?,?,?,?,?,?,?,'prepared',?,? WHERE (SELECT COUNT(*) FROM drive_operations WHERE owner_id = ? AND generation = ?) < 1024`)
-      .bind(this.owner, id, scope.account, scope.generation, scope.permissionRevision, inputHash, kind, expires, envelope, this.owner, scope.generation).run();
+      SELECT ?,?,?,?,?,?,?,'prepared',?,? WHERE (SELECT COUNT(*) FROM drive_operations WHERE owner_id = ? AND generation = ? AND phase <> 'confirmed' AND expires_at > ?) < 1024`)
+      .bind(this.owner, id, scope.account, scope.generation, scope.permissionRevision, inputHash, kind, expires, envelope, this.owner, scope.generation, Date.now()).run();
     const row = await this.get(id, scope);
     if (row.input_hash !== inputHash || row.kind !== kind) throw new AppError("CONFLICT", "This operation key was already used for different input. Retain the original key and input for recovery.", 409);
     return row;

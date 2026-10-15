@@ -1,5 +1,7 @@
 import { z } from "zod";
 import { DRIVE_FILE_LIMIT_LABEL, DRIVE_UPLOAD_MINIMUM_LEASE_MS } from "./limits.ts";
+import { DriveUploadChunks } from "../persistence/drive-upload-chunks.ts";
+import { sha256Stream } from "../lib/file-digest.ts";
 import { sha256 } from "@noble/hashes/sha2.js";
 import { AppError } from "../errors.ts";
 import { AppleAuthHTTP } from "../auth/apple/http.ts";
@@ -18,9 +20,9 @@ import { resolveDriveFolderPath } from "./folder-path.ts";
 import { newTraversal, traversalPage, TraversalState } from "./traversal.ts";
 import { DriveFolderListingDiagnostics, type DriveSearchReason } from "./listing.ts";
 import { accountScope, fingerprint } from "../lib/canonical.ts";
-import { b64, unb64, hex } from "../crypto/bytes.ts";
+import { b64, unb64, hex, concat } from "../crypto/bytes.ts";
 import type { RuntimeEnv } from "../platform/sites.ts";
-import { ListDrive, GetDriveItem, SearchDrive, TraverseDrive, ResolveDriveFolderPath, ReadDrive, DownloadDrive, UploadDrive, UploadDriveMetadata, CreateDriveFolder, RenameDriveItem, MoveDriveItem, GetDriveOperation, OperationId, INLINE_FILE_BYTES, DRIVE_FILE_BYTES, INLINE_UPLOAD_GUIDANCE } from "./schemas.ts";
+import { AppendDriveUploadChunk, ReadDriveChunk, ChecksumDrive, ListDrive, GetDriveItem, SearchDrive, TraverseDrive, ResolveDriveFolderPath, ReadDrive, DownloadDrive, UploadDrive, UploadDriveMetadata, CreateDriveFolder, RenameDriveItem, MoveDriveItem, GetDriveOperation, OperationId, INLINE_FILE_BYTES, DRIVE_FILE_BYTES, INLINE_UPLOAD_GUIDANCE } from "./schemas.ts";
 
 type Saved = Awaited<ReturnType<AppleSessionRepository["load"]>>;
 type Upload = z.infer<typeof UploadDriveMetadata>;
@@ -252,7 +254,25 @@ export class DriveService {
     }, { highWaterMark: 0 });
     return { stream, verified: () => verified, cancel: (reason?: unknown) => reader.cancel(reason).catch(() => {}) };
   }
-  private async content(item: DriveItem, c: Context, signal?: AbortSignal, range?: DriveByteRange, inline = false) {
+  private batchContent(source: ReadableStream<Uint8Array>) {
+    const reader = source.getReader();
+    return new ReadableStream<Uint8Array>({
+      async pull(controller) {
+        const parts: Uint8Array[] = [];
+        let size = 0;
+        try {
+          while (size < 4 * 1024 * 1024) {
+            const next = await reader.read();
+            if (next.done) { if (size) controller.enqueue(concat(...parts)); controller.close(); reader.releaseLock(); return; }
+            parts.push(next.value); size += next.value.byteLength;
+          }
+          controller.enqueue(concat(...parts));
+        } catch (error) { await reader.cancel(error).catch(() => {}); controller.error(error); }
+      },
+      async cancel(reason) { await reader.cancel(reason).catch(() => {}); },
+    }, { highWaterMark: 0 });
+  }
+  private async content(item: DriveItem, c: Context, signal?: AbortSignal, range?: DriveByteRange, inline = false, batch = false) {
     ordinaryFile(item, DRIVE_FILE_BYTES);
     const prepared = item.size === 0 && !item.package ? null : await c.client.prepareDownload(item);
     const packaged = item.package || prepared?.package;
@@ -265,7 +285,7 @@ export class DriveService {
     catch (error) { await response.body?.cancel(error).catch(() => {}); throw error; }
     const source = response.body ?? new ReadableStream<Uint8Array>({ start(controller) { controller.close(); } });
     const size = range ? range.end - range.start + 1 : item.size!;
-    const checked = this.checkedStream(source, c.scope, "drive.contents", packaged ? null : size, signal);
+    const checked = this.checkedStream(batch ? this.batchContent(source) : source, c.scope, "drive.contents", packaged ? null : size, signal);
     const headers = new Headers({ "Content-Type": response.headers.get("content-type") ?? "application/octet-stream", "Cache-Control": "private, no-store", "X-Content-Type-Options": "nosniff" });
     if (!packaged) { headers.set("Content-Length", String(size)); headers.set("Accept-Ranges", "bytes"); }
     if (range) headers.set("Content-Range", `bytes ${range.start}-${range.end}/${item.size}`);
@@ -310,6 +330,39 @@ export class DriveService {
       catch { throw new AppError("UNSUPPORTED_FEATURE", "This content is not valid UTF-8 text. Use an authenticated download, or a base64 full read for files up to 64 KiB.", 409); }
       return { item, encoding: request.encoding, content, bytesRead: bytes.length, truncated, generation: c.scope.generation };
     } finally { await this.close(c); }
+  }
+  private async versionedContent<T>(request: z.infer<typeof ChecksumDrive>, consume: (response: Response, item: DriveItem) => Promise<T>, range?: (item: DriveItem) => DriveByteRange | undefined) {
+    const c = await this.open("drive.contents", request.expectedGeneration);
+    let item: DriveItem, result: T;
+    try {
+      item = await c.client.getItem(request.itemId, request.shareContext);
+      ordinaryFile(item, DRIVE_FILE_BYTES);
+      if (item.package) throw new AppError("UNSUPPORTED_FEATURE", "Chunk reads and file checksums do not support package archives.", 409);
+      if (item.etag !== request.etag) conflict("The Drive file version changed. Restart verification with current metadata.");
+      result = await consume(await this.content(item, c, undefined, range?.(item), true, range === undefined), item);
+      await this.guard(c.scope, "drive.contents");
+    } finally { await this.close(c); }
+    // Do not return a digest or chunk when the live identity changed while read.
+    const check = await this.open("drive.contents", c.scope.generation, c.scope);
+    try {
+      if (!exact(item, await check.client.getItem(item.id, item.shareContext))) conflict("The Drive file changed during verification. Restart with current metadata.");
+      await this.finish(check);
+    } finally { await this.close(check); }
+    return { ...result, item, generation: c.scope.generation };
+  }
+  async checksum(input: unknown) {
+    const request = parse(ChecksumDrive, input);
+    return this.versionedContent(request, async (response, item) => ({ sha256: await sha256Stream(response.body!), bytesRead: item.size! }));
+  }
+  async readChunk(input: unknown) {
+    const request = parse(ReadDriveChunk, input);
+    return this.versionedContent(request, async (response, item) => {
+      const bytes = new Uint8Array(await response.arrayBuffer());
+      return { encoding: "base64" as const, content: b64(bytes), offset: request.offset, bytesRead: bytes.length, nextOffset: request.offset + bytes.length, complete: request.offset + bytes.length === item.size };
+    }, item => {
+      if (request.offset > item.size! || request.offset === item.size && item.size !== 0) throw new AppError("VALIDATION_ERROR", "The chunk offset is outside this file.", 400);
+      return item.size === 0 ? undefined : { start: request.offset, end: Math.min(item.size!, request.offset + request.length) - 1, total: item.size! };
+    });
   }
   async download(input: unknown) {
     const request = parse(DownloadDrive, input);
@@ -451,6 +504,63 @@ export class DriveService {
       return { operationId: request.operationId, uploadPath: `/api/drive/uploads/${request.operationId}/content` };
     });
   }
+  async transferInfo(_input: unknown) {
+    parse(z.object({}).strict(), _input);
+    await this.permission("drive.browse");
+    return { dashboardOrigin: this.env.APP_ORIGIN ?? null, inlineBytes: INLINE_FILE_BYTES, maxFileBytes: DRIVE_FILE_BYTES, chunkBytes: INLINE_FILE_BYTES, chunkUploadsAvailable: await new DriveUploadChunks(this.operations).available(), httpRequiresOwnerAuthentication: true as const, mcpTransfersRequireBrowserLogin: false as const };
+  }
+  async discardUploadChunks(input: unknown) {
+    const request = parse(GetDriveOperation, input);
+    const chunks = new DriveUploadChunks(this.operations);
+    await chunks.requireSchema();
+    return this.metadata("drive.upload", request.expectedGeneration, async c => {
+      let row = await this.operations.get(request.operationId, c.scope);
+      if (row.kind !== "upload" || row.phase !== "prepared") conflict("Only an upload that has not started can discard staged chunks.");
+      row = await this.operations.claim(row, c.scope);
+      try { await chunks.clear(row); }
+      finally { await this.operations.release(row); }
+      return { operationId: row.operation_id, receivedChunks: 0, receivedBytes: 0, generation: c.scope.generation };
+    });
+  }
+  async prepareChunkUpload(input: unknown) {
+    const request = parse(UploadDriveMetadata, input);
+    const chunks = new DriveUploadChunks(this.operations);
+    await chunks.requireSchema();
+    await this.prepareUpload(request);
+    return this.metadata("drive.upload", request.expectedGeneration, async c => {
+      const row = await this.operations.get(request.operationId, c.scope);
+      return { operationId: row.operation_id, phase: row.phase, chunkBytes: INLINE_FILE_BYTES, totalChunks: Math.ceil(request.size / INLINE_FILE_BYTES), expiresAt: row.expires_at, generation: c.scope.generation };
+    });
+  }
+  async appendUploadChunk(input: unknown) {
+    const request = parse(AppendDriveUploadChunk, input);
+    let bytes: Uint8Array;
+    try { bytes = unb64(request.contentBase64, INLINE_FILE_BYTES); }
+    catch { throw new AppError("VALIDATION_ERROR", "Provide a base64 chunk of at most 64 KiB.", 400); }
+    return this.metadata("drive.upload", request.expectedGeneration, async c => {
+      const row = await this.operations.get(request.operationId, c.scope);
+      const metadata = parse(UploadDriveMetadata, (await this.operations.data(row)).input);
+      if (request.offset % INLINE_FILE_BYTES !== 0 || request.offset >= metadata.size || bytes.length !== Math.min(INLINE_FILE_BYTES, metadata.size - request.offset)) throw new AppError("VALIDATION_ERROR", "Use aligned 64 KiB chunks, with an exact shorter final chunk. Empty files have no chunks.", 400);
+      const progress = await new DriveUploadChunks(this.operations).append(row, c.scope, request.offset, bytes);
+      return { operationId: row.operation_id, ...progress, totalChunks: Math.ceil(metadata.size / INLINE_FILE_BYTES), generation: c.scope.generation };
+    });
+  }
+  async completeChunkUpload(input: unknown) {
+    const request = parse(GetDriveOperation, input);
+    const chunks = new DriveUploadChunks(this.operations);
+    await chunks.requireSchema();
+    const prepared = await this.metadata("drive.upload", request.expectedGeneration, async c => {
+      const row = await this.operations.get(request.operationId, c.scope);
+      if (row.kind !== "upload" || row.permission_revision !== c.scope.permissionRevision) conflict("The upload kind or permissions changed.");
+      const metadata = parse(UploadDriveMetadata, (await this.operations.data(row)).input);
+      return { row, metadata };
+    });
+    const result = await this.uploadContent(request.operationId, chunks.stream(prepared.row, prepared.metadata.size), undefined, async () => {
+      if (await sha256Stream(chunks.stream(prepared.row, prepared.metadata.size)) !== prepared.metadata.sha256) throw new AppError("VALIDATION_ERROR", "The staged upload SHA-256 does not match. No file was committed.", 400);
+    });
+    if (result.phase === "confirmed") await chunks.clear(prepared.row);
+    return result;
+  }
   async upload(input: unknown) {
     const validated = UploadDrive.safeParse(input);
     if (!validated.success && validated.error.issues.some(issue => issue.code === "too_big" && ["size", "contentBase64"].includes(String(issue.path[0])))) throw new AppError("VALIDATION_ERROR", INLINE_UPLOAD_GUIDANCE, 413);
@@ -462,7 +572,7 @@ export class DriveService {
     await this.prepareUpload(metadata);
     return this.uploadContent(request.operationId, new ReadableStream<Uint8Array>({ start(controller) { controller.enqueue(bytes); controller.close(); } }));
   }
-  async uploadContent(operationId: string, body: ReadableStream<Uint8Array>, signal?: AbortSignal) {
+  async uploadContent(operationId: string, body: ReadableStream<Uint8Array>, signal?: AbortSignal, verifyStaged?: () => Promise<void>) {
     operationId = parse(OperationId, operationId);
     let c: Context | null = await this.open("drive.upload");
     const scope = c.scope;
@@ -488,6 +598,9 @@ export class DriveService {
         if (row.phase !== "confirmed") throw unknownOutcome(operationId);
         await this.finish(c); return this.publicOperation(row, await this.operations.data(row));
       }
+      // Hold the operation lease while verifying so a concurrent discard or
+      // append cannot change staging between verification and Apple allocation.
+      if (["prepared", "allocated"].includes(row.phase)) await verifyStaged?.();
       if (row.phase === "prepared") {
         await this.destination(c, request.parentId, request.name);
         await this.guard(scope, "drive.upload");

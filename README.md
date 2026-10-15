@@ -17,8 +17,11 @@ Access and Managed OAuth. No containers, Python runtime, KV namespace or Durable
 
 The browser performs the Apple password proof exchange. The Worker stores Apple session cookies,
 tokens, list summaries, pagination state and private Drive operation receipts encrypted with
-AES-256-GCM in D1. Reminder contents and Drive file bodies are fetched on demand and are not
-cached in D1. Service preferences are ordinary owner-scoped configuration.
+AES-256-GCM in D1. Reminder contents and downloaded Drive bodies are fetched on demand and are not
+cached in D1. MCP chunk uploads temporarily stage encrypted bytes in D1 (128 MiB per owner,
+access expires within 24 hours). Staging is removed after confirmed completion or on later
+expiry cleanup; direct HTTP uploads stream without staging.
+Service preferences are ordinary owner-scoped configuration.
 
 **Experimental, unofficial integration.** This project uses Apple's undocumented web protocols,
 not Sign in with Apple or an official public iCloud API. The login page is served by your deployment;
@@ -115,9 +118,10 @@ operations. Search is bounded and explicitly reports incomplete results.
 
 - Inline MCP full reads/uploads: **64 KiB** of decoded bytes, UTF-8 or base64.
 - Text previews: **8 KiB** of leading UTF-8 bytes, with explicit truncation, for files up to 64 MiB.
+- MCP chunk uploads, binary chunk reads and full-file SHA-256: **64 MiB**, using existing MCP authentication (chunk uploads require migration `0008`).
 - Dashboard/HTTP uploads and private downloads: **64 MiB** (67,108,864 bytes), with a five-minute transfer timeout.
 - Downloads require owner authentication. A returned URL is not a public share or an attachment
-  automatically available to every MCP client; use the dashboard if the client cannot fetch it.
+  automatically available to every MCP client; use the MCP chunk-read/checksum tools or dashboard if the client cannot fetch it.
 - Retain each write's UUID `operationId`. After a timeout or `WRITE_OUTCOME_UNKNOWN`, inspect
   the same operation before trying again. Never automatically use a fresh key.
 
@@ -436,7 +440,7 @@ configuration with Wrangler as a substitute for Sites publication.
    including the complete build output. The helper can reuse the main checkout's installed
    dependencies; otherwise install them in the generated checkout. Edit application code in
    the main checkout, and reconcile any unsaved Site-source changes before preparing another copy.
-   The build packages the immutable `migrations/0000`–`0007` SQL history in Sites'
+   The build packages the immutable `migrations/0000`–`0008` SQL history in Sites'
    expected initialization layout; Sites provisions the logical D1 binding and applies pending
    migrations. New standalone databases use `schema.sql`. Neither path needs Drizzle installation
    or migration generation.

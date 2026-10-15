@@ -868,3 +868,129 @@ test("package tokens download bounded archives without using unpacked sizes as C
   await assert.rejects(f.service.downloadContent(ranged.handleId, undefined, "bytes=0-0"), { code: "UNSUPPORTED_FEATURE" });
   assert.equal(contentRequests, 1);
 });
+
+test("MCP upload chunks survive service restarts, reject changes and commit only after full verification", async t => {
+  const payload = new Uint8Array(64 * 1024 + 7).fill(42);
+  let allocations = 0, transfers = 0, commits = 0, uploaded = false;
+  const item = file("chunked.bin", "chunked-document", DRIVE_ROOT, payload.length);
+  const f = await fixture(t, async (url, init) => {
+    if (url.pathname === "/retrieveItemDetailsInFolders") return json([{ ...root, items: uploaded ? [item] : [], directChildrenCount: uploaded ? 1 : 0 }]);
+    if (url.pathname === "/retrieveItemDetails") return json({ items: [item] });
+    if (url.pathname === "/ws/com.apple.CloudDocs/upload/web") {
+      allocations++;
+      return json([{ document_id: item.docwsid, url: `https://cws.icloud-content.com/${identity.dsid}/singleFileUpload?tk=synthetic` }]);
+    }
+    if (url.hostname === "cws.icloud-content.com") {
+      transfers++;
+      const bytes = new Uint8Array(await new Response(init.body).arrayBuffer());
+      assert.ok(bytes.length > payload.length);
+      const start = new TextDecoder().decode(bytes.subarray(0, 1024)).indexOf("\r\n\r\n") + 4;
+      assert.deepEqual(bytes.subarray(start, start + payload.length), payload);
+      return json({ singleFile: { referenceChecksum: "synthetic-reference", size: payload.length, fileChecksum: "synthetic-checksum", wrappingKey: "synthetic-key" } });
+    }
+    if (url.pathname === "/ws/com.apple.CloudDocs/update/documents") { commits++; uploaded = true; return json({ status: { status_code: 0 }, results: [{ status: { status_code: 0 }, document: { document_id: item.docwsid, zone: item.zone, parent_id: item.parentId, name: item.name, type: item.type, etag: item.etag, size: item.size } }] }); }
+    throw new Error(`Unexpected synthetic endpoint ${url.pathname}`);
+  });
+  const input = await uploadInput(item.name, payload);
+  const intent = { ...input };
+  Reflect.deleteProperty(intent, "contentBase64");
+  const prepared = await f.service.prepareChunkUpload(intent);
+  assert.equal(prepared.totalChunks, 2);
+  assert.equal(prepared.chunkBytes, 65536);
+  const restarted = new DriveService(f.env, owner);
+  const last = { operationId: intent.operationId, offset: 65536, contentBase64: b64(payload.subarray(65536)) };
+  assert.equal((await restarted.appendUploadChunk(last)).receivedBytes, 7);
+  assert.equal((await restarted.appendUploadChunk(last)).receivedBytes, 7);
+  await assert.rejects(restarted.appendUploadChunk({ ...last, contentBase64: b64(new Uint8Array(7)) }), { code: "CONFLICT" });
+  await assert.rejects(restarted.appendUploadChunk({ ...last, offset: 1 }), { code: "VALIDATION_ERROR" });
+  await assert.rejects(restarted.completeChunkUpload({ operationId: intent.operationId }), { code: "VALIDATION_ERROR" });
+  assert.equal(allocations, 0, "missing chunks must fail before contacting Apple");
+  await restarted.appendUploadChunk({ operationId: intent.operationId, offset: 0, contentBase64: b64(payload.subarray(0, 65536)) });
+  const staged = f.db.sqlite.prepare("SELECT envelope FROM drive_upload_chunks").all();
+  assert.equal(staged.length, 2);
+  assert.ok(staged.every(row => !String(row.envelope).includes(last.contentBase64)));
+  let verifiedUnderLease = false;
+  f.db.afterStatement = async sql => {
+    if (sql.startsWith("SELECT byte_offset,byte_length")) {
+      const lease = f.db.sqlite.prepare("SELECT lease_id, phase FROM drive_operations WHERE operation_id = ?").get(intent.operationId);
+      assert.ok(lease?.lease_id, "verification must exclude concurrent append/discard");
+      assert.equal(lease?.phase, "prepared");
+      verifiedUnderLease = true;
+      f.db.afterStatement = null;
+    }
+  };
+  const confirmed = await restarted.completeChunkUpload({ operationId: intent.operationId });
+  assert.equal(verifiedUnderLease, true);
+  assert.equal(confirmed.phase, "confirmed");
+  assert.equal(f.db.sqlite.prepare("SELECT COUNT(*) AS count FROM drive_upload_chunks").get()?.count, 0);
+  assert.deepEqual(await restarted.completeChunkUpload({ operationId: intent.operationId }), confirmed);
+  assert.deepEqual([allocations, transfers, commits], [1, 1, 1]);
+});
+
+test("MCP full-file checksum and binary chunks require a pinned version and verify the whole stream", async t => {
+  const bytes = new Uint8Array(65539).fill(65);
+  let etag = "file-version", truncate = false, ignoreRange = false, changeDuringRead = false;
+  const item = file("binary.bin", "checksum-document", DRIVE_ROOT, bytes.length);
+  const f = await fixture(t, (url, init) => {
+    if (url.pathname === "/retrieveItemDetails") return json({ items: [{ ...item, etag }] });
+    if (url.pathname.startsWith("/ws/com.apple.CloudDocs/download/by_id")) return json({ data_token: { url: syntheticDownloadURL() } });
+    if (url.hostname === "cvws.icloud-content.com") {
+      if (changeDuringRead) etag = "changed-during-read";
+      const range = new Headers(init.headers).get("range");
+      if (range && !ignoreRange) {
+        const match = /^bytes=(\d+)-(\d+)$/.exec(range)!;
+        const start = Number(match[1]), end = Number(match[2]);
+        return new Response(bytes.subarray(start, end + 1), { status: 206, headers: { "content-range": `bytes ${start}-${end}/${bytes.length}` } });
+      }
+      return new Response(truncate ? bytes.subarray(0, bytes.length - 1) : bytes);
+    }
+    throw new Error(`Unexpected synthetic endpoint ${url.pathname}`);
+  });
+  const request = { itemId: item.drivewsid, etag };
+  const checksum = await f.service.checksum(request);
+  assert.equal(checksum.sha256, hex(await digest(bytes)));
+  assert.equal(checksum.bytesRead, bytes.length);
+  const first = await f.service.readChunk({ ...request, offset: 0 });
+  assert.equal(first.nextOffset, 65536);
+  assert.equal(first.complete, false);
+  const last = await f.service.readChunk({ ...request, offset: first.nextOffset });
+  assert.equal(last.complete, true);
+  assert.equal(last.content, b64(bytes.subarray(65536)));
+  await assert.rejects(f.service.readChunk({ ...request, offset: bytes.length }), { code: "VALIDATION_ERROR" });
+  ignoreRange = true;
+  await assert.rejects(f.service.readChunk({ ...request, offset: 0 }), { code: "PROTOCOL_CHANGED" });
+  truncate = true;
+  await assert.rejects(f.service.checksum(request), { code: "VALIDATION_ERROR" });
+  etag = "changed";
+  await assert.rejects(f.service.checksum(request), { code: "CONFLICT" });
+  etag = "file-version"; truncate = false; changeDuringRead = true;
+  await assert.rejects(f.service.checksum(request), { code: "CONFLICT" });
+});
+
+test("chunk preparation includes exactly 64 MiB, rejects oversize, and digest failures do not allocate", async t => {
+  let reads = 0;
+  const f = await fixture(t, url => {
+    assert.equal(url.pathname, "/retrieveItemDetailsInFolders", "staging must not allocate or commit on Apple");
+    reads++;
+    return json([{ ...root, items: [], directChildrenCount: 0 }]);
+  });
+  const input = await uploadInput("boundary.bin");
+  Reflect.deleteProperty(input, "contentBase64");
+  const prepared = await f.service.prepareChunkUpload({ ...input, size: 67108864 });
+  assert.equal(prepared.totalChunks, 1024);
+  await assert.rejects(f.service.prepareChunkUpload({ ...input, operationId: crypto.randomUUID(), size: 67108865 }), { code: "VALIDATION_ERROR" });
+  const bad = { ...input, operationId: crypto.randomUUID(), sha256: "0".repeat(64) };
+  await f.service.prepareChunkUpload(bad);
+  await f.service.appendUploadChunk({ operationId: bad.operationId, offset: 0, contentBase64: b64(new TextEncoder().encode("abc")) });
+  await assert.rejects(f.service.completeChunkUpload({ operationId: bad.operationId }), { code: "VALIDATION_ERROR" });
+  assert.equal(reads, 2);
+  await f.service.discardUploadChunks({ operationId: bad.operationId });
+  assert.equal(f.db.sqlite.prepare("SELECT COUNT(*) AS count FROM drive_upload_chunks").get()?.count, 0);
+  assert.equal((await f.service.operation({ operationId: bad.operationId })).phase, "prepared");
+  const saved = await f.settings.load();
+  await f.settings.save({ expectedRevision: saved.revision, settings: saved.settings });
+  await assert.rejects(f.service.appendUploadChunk({ operationId: bad.operationId, offset: 0, contentBase64: b64(new TextEncoder().encode("abc")) }), { code: "CONFLICT" });
+  f.db.sqlite.exec("DROP TABLE drive_upload_chunks");
+  assert.equal((await f.service.transferInfo({})).chunkUploadsAvailable, false);
+  await assert.rejects(f.service.prepareChunkUpload({ ...input, operationId: crypto.randomUUID() }), { code: "CONFIGURATION_REQUIRED" });
+});

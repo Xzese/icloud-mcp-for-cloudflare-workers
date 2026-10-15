@@ -152,7 +152,7 @@ npx wrangler d1 execute icloud-reminders --remote --config wrangler.production.t
 npx wrangler d1 execute icloud-reminders --remote --config wrangler.production.toml --file migrations/0007_list_duplication.sql
 ```
 
-For Sites, the build packages the complete immutable migration history (`0000`–`0007`)
+For Sites, the build packages the complete immutable migration history (`0000`–`0008`)
 under `dist/.openai/drizzle`. Later schema changes append new migration files;
 changing an already-applied initializer does not install new
 tables. Preserve the exact ignored Site binding, use the native source workflow, regenerate

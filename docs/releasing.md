@@ -68,7 +68,7 @@ source does not make the operator's live Site, D1 database or encrypted Apple se
 Fresh installations use `schema.sql`, containing the session table and additive job ledger.
 Existing deployments apply missing migrations in order (`0001` jobs, `0002` service settings,
 `0003` Drive operations, `0004` bulk changes, `0005` saved filters, `0006` create workflows
-and `0007` list duplication), without changing session rows,
+`0007` list duplication and `0008` encrypted Drive upload staging), without changing session rows,
 generation, credentials or retention evidence. Sites packages the immutable migration history;
 the artifact check verifies equivalence to the fresh-install schema. Verify additive application to its existing D1.
 Do not reset or recreate databases during upgrades.

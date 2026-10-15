@@ -424,7 +424,7 @@ export async function handleMCP(request: Request, env: RuntimeEnv, owner: string
     }
   });
   registerDriveTools(registerTool, env, owner);
-  // Only the bounded inline-upload tool can exceed the ordinary 64 KiB request
+  // Only the bounded inline-upload and staging-chunk tools can exceed the ordinary 64 KiB request
   // budget. Never grant a larger budget to other tools or JSON-RPC batches.
   let bytes;
   try { bytes = await limitedBytes(new Response(request.body, { headers: request.headers }), INLINE_REQUEST_BYTES); }
@@ -436,7 +436,7 @@ export async function handleMCP(request: Request, env: RuntimeEnv, owner: string
   try { message = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes)); } catch { /* SDK handles invalid JSON. */ }
   if (bytes.byteLength > 65_536) {
     const upload = message as { method?: unknown; params?: { name?: unknown } } | null;
-    if (!upload || Array.isArray(upload) || upload.method !== "tools/call" || upload.params?.name !== "upload_icloud_drive_file") throw new AppError("VALIDATION_ERROR", "This MCP request exceeds the 64 KiB limit.", 413);
+    if (!upload || Array.isArray(upload) || upload.method !== "tools/call" || !["upload_icloud_drive_file", "append_icloud_drive_upload_chunk"].includes(String(upload.params?.name))) throw new AppError("VALIDATION_ERROR", "This MCP request exceeds the 64 KiB limit.", 413);
   }
   // Sites uses its stateless 2026 discovery/list/call contract. Keep owner,
   // enabled-tool schemas, callbacks and all byte limits shared with the SDK.

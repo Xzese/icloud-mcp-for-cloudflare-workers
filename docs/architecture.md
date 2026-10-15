@@ -19,7 +19,7 @@ D1 holds encrypted Apple-session envelopes in `apple_session_state`. Envelope as
 binds owner/account/generation/schema. Versioned leases fence concurrent setup, consent, reads, writes
 and disconnect. `schema.sql` defines the session, job, saved-filter and workflow tables for a new deployment. Local setup
 and tests execute it directly using native D1. Standalone operators initialize D1 with Wrangler's
-`d1 execute --file schema.sql`. The Sites build copies the immutable `migrations/0000`–`0007` history into
+`d1 execute --file schema.sql`. The Sites build copies the immutable `migrations/0000`–`0008` history into
 `dist/.openai/drizzle/`; pending migrations upgrade existing databases while preserving jobs
 and encrypted sessions. Artifact verification compares fresh `schema.sql` and migrated schemas.
 No Drizzle dependency or migration generation is needed. Standalone upgrades must apply their

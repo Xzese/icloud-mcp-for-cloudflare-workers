@@ -130,8 +130,11 @@ export async function verifyDrive(options) {
       }
       const range = request.headers.get("range");
       if (range) {
-        assert.equal(range, "bytes=2-5");
-        return new Response(payloadBytes.subarray(2, 6), { status: 206, headers: { "Content-Range": `bytes 2-5/${payloadBytes.length}`, "Content-Length": "4" } });
+        const match = /^bytes=(\d+)-(\d+)$/.exec(range);
+        assert.ok(match);
+        const start = Number(match[1]), end = Number(match[2]);
+        assert.ok(start >= 0 && end >= start && end < payloadBytes.length);
+        return new Response(payloadBytes.subarray(start, end + 1), { status: 206, headers: { "Content-Range": `bytes ${start}-${end}/${payloadBytes.length}`, "Content-Length": String(end - start + 1) } });
       }
       return new Response(packageDownload ? new TextEncoder().encode("synthetic zip") : payloadBytes, { headers: { "content-type": packageDownload ? "application/zip" : "application/octet-stream", "set-cookie": "synthetic=private", location: "https://example.invalid" } });
     }
@@ -197,6 +200,13 @@ export async function verifyDrive(options) {
     assert.ok(listedTools.result.tools.some(tool => tool.name === "get_icloud_drive_item" && tool.outputSchema.properties.item));
     assert.ok(listedTools.result.tools.some(tool => tool.name === "traverse_icloud_drive" && tool.outputSchema.properties.progress));
     assert.ok(listedTools.result.tools.some(tool => tool.name === "resolve_icloud_drive_folder_path" && tool.outputSchema.properties.parentListing));
+    for (const name of ["get_icloud_drive_transfer_info", "prepare_icloud_drive_upload", "append_icloud_drive_upload_chunk", "complete_icloud_drive_upload", "discard_icloud_drive_upload_chunks", "read_icloud_drive_file_chunk", "checksum_icloud_drive_file"]) {
+      assert.ok(listedTools.result.tools.some(tool => tool.name === name), `Missing transfer tool ${name}`);
+    }
+    const info = await mcp("tools/call", { name: "get_icloud_drive_transfer_info", arguments: {} });
+    assert.equal(info.result.structuredContent.dashboardOrigin, origin);
+    assert.equal(info.result.structuredContent.maxFileBytes, 67108864);
+    assert.equal(info.result.structuredContent.chunkUploadsAvailable, true);
     const missingPath = await mcp("tools/call", { name: "resolve_icloud_drive_folder_path", arguments: { expectedGeneration: generation, path: "Documents/Snap Heaven/01/FY 2026" } });
     assert.equal(missingPath.result.isError, undefined, JSON.stringify(missingPath));
     assert.equal(missingPath.result.structuredContent.status, "not_found");
@@ -318,6 +328,38 @@ export async function verifyDrive(options) {
     assert.ok(archive.headers.get("content-disposition").includes(".zip"));
     assert.equal(await archive.text(), "synthetic zip");
     packageDownload = false;
+    const checksumCall = await mcp("tools/call", { name: "checksum_icloud_drive_file", arguments: { itemId: typedItem.id, etag: typedItem.etag } });
+    assert.equal(checksumCall.result.isError, undefined, JSON.stringify(checksumCall));
+    assert.equal(checksumCall.result.structuredContent.sha256, payloadHash);
+    assert.equal(checksumCall.result.structuredContent.bytesRead, payloadBytes.length);
+    const downloadedParts = [];
+    let offset = 0;
+    while (offset < payloadBytes.length) {
+      const part = await mcp("tools/call", { name: "read_icloud_drive_file_chunk", arguments: { itemId: typedItem.id, etag: typedItem.etag, offset } });
+      assert.equal(part.result.isError, undefined, JSON.stringify(part));
+      const value = part.result.structuredContent;
+      downloadedParts.push(Buffer.from(value.content, "base64"));
+      offset = value.nextOffset;
+      assert.equal(value.complete, offset === payloadBytes.length);
+    }
+    assert.ok(Buffer.concat(downloadedParts).equals(payloadBytes));
+    // Reuse this synthetic endpoint's fixture identity for a distinct upload journey.
+    uploaded = false;
+    const chunkOperationId = randomUUID();
+    const chunkIntent = { operationId: chunkOperationId, parentId: DRIVE_ROOT, name: uploadedName, size: payloadBytes.length, sha256: payloadHash };
+    const chunkPrepared = await mcp("tools/call", { name: "prepare_icloud_drive_upload", arguments: chunkIntent });
+    assert.equal(chunkPrepared.result.isError, undefined, JSON.stringify(chunkPrepared));
+    for (let byteOffset = 0; byteOffset < payloadBytes.length; byteOffset += 65536) {
+      const part = await mcp("tools/call", { name: "append_icloud_drive_upload_chunk", arguments: { operationId: chunkOperationId, offset: byteOffset, contentBase64: payloadBytes.subarray(byteOffset, byteOffset + 65536).toString("base64") } });
+      assert.equal(part.result.isError, undefined, JSON.stringify(part));
+    }
+    const chunkComplete = await mcp("tools/call", { name: "complete_icloud_drive_upload", arguments: { operationId: chunkOperationId } });
+    assert.equal(chunkComplete.result.isError, undefined, JSON.stringify(chunkComplete));
+    assert.equal(chunkComplete.result.structuredContent.phase, "confirmed");
+    const chunkReplay = await mcp("tools/call", { name: "complete_icloud_drive_upload", arguments: { operationId: chunkOperationId } });
+    assert.deepEqual(chunkReplay.result.structuredContent, chunkComplete.result.structuredContent);
+    assert.deepEqual([allocations, transfers, finalizations], [2, 2, 2]);
+    assert.equal((await db.prepare("SELECT COUNT(*) AS count FROM drive_upload_chunks").first()).count, 0);
     const downloadsBeforeRevocation = downloads;
 
     const settingsRow = await db.prepare("SELECT revision, settings_json FROM owner_service_settings WHERE owner_id = ?").bind(owner).first();
@@ -326,13 +368,17 @@ export async function verifyDrive(options) {
     await db.prepare("UPDATE owner_service_settings SET revision = revision + 1, settings_json = ? WHERE owner_id = ?").bind(JSON.stringify(revoked), owner).run();
     const staleRead = await mcp("tools/call", { name: "read_icloud_drive_file", arguments: { expectedGeneration: generation, itemId: typedItem.id, encoding: "base64" } });
     assert.equal(staleRead.result.isError, true, JSON.stringify(staleRead));
+    for (const name of ["checksum_icloud_drive_file", "read_icloud_drive_file_chunk"]) {
+      const denied = await mcp("tools/call", { name, arguments: { itemId: typedItem.id, etag: typedItem.etag, ...(name === "read_icloud_drive_file_chunk" ? { offset: 0 } : {}) } });
+      assert.equal(denied.result.isError, true);
+    }
     const revokedRead = await request("/api/drive/read", { method: "POST", body: JSON.stringify({ expectedGeneration: generation, itemId: typedItem.id, encoding: "base64" }) });
     const revokedReadBody = await revokedRead.json();
     assert.equal(revokedRead.status, 403, JSON.stringify(revokedReadBody));
     assert.equal(revokedReadBody.error.code, "FORBIDDEN");
     assert.equal(downloads, downloadsBeforeRevocation, "revoked content access must not issue another Apple content request");
     return {
-      checks: ["signed-owner-origin", "300-KiB-streaming-upload", "exact-document-commit-and-idempotent-replay", "typed-MCP-metadata", "recursive-HTTP-MCP-listing-search-and-cursor-rotation", "shared-path-and-persisted-private-context", "private-single-use-download", "docws-shared-fallback", "validated-330-and-byte-ranges", "bounded-package-archive", "64-KiB-inline-guidance-and-8-KiB-preview", "contents-permission-revocation"],
+      checks: ["signed-owner-origin", "300-KiB-streaming-upload", "MCP-chunk-upload-download-and-SHA256-without-browser-login", "exact-document-commit-and-idempotent-replay", "typed-MCP-metadata", "recursive-HTTP-MCP-listing-search-and-cursor-rotation", "shared-path-and-persisted-private-context", "private-single-use-download", "docws-shared-fallback", "validated-330-and-byte-ranges", "bounded-package-archive", "64-KiB-inline-guidance-and-8-KiB-preview", "contents-permission-revocation"],
       uploadedBytes: payloadBytes.length, operationId, metadataTools: 2,
       outboundTransferBytes: observedUpload?.byteLength ?? 0, appleUploadRequests: allocations + transfers + finalizations, downloads,
     };
