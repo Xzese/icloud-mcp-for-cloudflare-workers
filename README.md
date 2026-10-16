@@ -697,12 +697,13 @@ No GitHub workflow in this repository deploys production or receives Apple crede
 
 ## Development and project structure
 
-Dependabot checks weekly and groups routine minor/patch updates into one npm PR and one GitHub
-Actions PR. Routine bot updates enable squash auto-merge automatically; the four protected-branch
-CI checks must pass before merging. Major upgrades remain manual, and failed updates stay blocked.
-Minor/patch npm security fixes are grouped separately and handled when alerts arrive.
-Merged branches are deleted automatically. The automation follows the
-[email MCP server's workflow](https://github.com/Xzese/email-mcp-for-cloudflare-workers/blob/main/.github/workflows/dependabot-auto-merge.yml).
+Dependabot combines weekly npm and GitHub Actions version updates into one dependency PR,
+including major upgrades. Bot updates enable squash auto-merge automatically; the four
+protected-branch CI checks must pass, the branch must be up to date and conversations resolved
+before merging. Failed updates stay blocked. Security fixes are grouped separately per ecosystem
+and handled when alerts arrive, without waiting for the weekly batch. Merged branches are deleted
+automatically. The grouping uses GitHub's
+[multi-ecosystem updates](https://docs.github.com/en/code-security/how-tos/secure-your-supply-chain/secure-your-dependencies/configuring-multi-ecosystem-updates).
 Builds also refresh the dependency inventory and third-party notices automatically, so a
 dependency update ships current attribution without a separate generated-file PR. The local
 and acceptance runners declare their Miniflare API version explicitly; a Wrangler update

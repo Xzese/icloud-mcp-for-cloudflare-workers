@@ -25,10 +25,11 @@ Use the title **iCloud Reminders MCP Server for Cloudflare Workers** and a repos
 `icloud-reminders-mcp-for-cloudflare-workers`. The repository is MIT-licensed; preserve the
 reference and vendored notices. Enable GitHub private vulnerability reporting after publication,
 enable branch protection/required CI checks, and keep production secrets out of GitHub Actions.
-Dependabot groups weekly minor/patch updates by ecosystem (npm and GitHub Actions). Its workflow
-enables squash auto-merge for those routine bot PRs using API metadata without executing PR code.
+Dependabot combines weekly npm and GitHub Actions version updates into one multi-ecosystem PR,
+including major upgrades. Security fixes are grouped separately per ecosystem when alerts arrive.
+Its workflow enables squash auto-merge for bot dependency PRs without executing PR code.
 Auto-merge waits for all four required CI checks, an up-to-date branch and resolved conversations.
-Major upgrades and contributor PRs still need an explicit merge choice. Merged head branches are
+Contributor PRs still need an explicit merge choice. Merged head branches are
 deleted automatically. Keep auto-merge and branch protection enabled; do not bypass failing checks.
 
 ## Updating a private ChatGPT Site
