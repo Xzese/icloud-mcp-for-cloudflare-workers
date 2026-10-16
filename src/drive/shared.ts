@@ -14,12 +14,12 @@ function boundedDescriptor(value: unknown, depth = 0): boolean {
 }
 export const DriveShareID = z.union([
   z.string().min(1).max(512).regex(/^[A-Za-z0-9._:-]+$/),
-  z.record(z.unknown()).refine(value => Object.keys(value).length > 0 && boundedDescriptor(value) && new TextEncoder().encode(JSON.stringify(value)).length <= 8192),
+  z.record(z.string(), z.unknown()).refine(value => Object.keys(value).length > 0 && boundedDescriptor(value) && new TextEncoder().encode(JSON.stringify(value)).length <= 8192),
 ]);
 export const DriveDocwsItemID = z.string().min(1).max(512).regex(/^[A-Za-z0-9._:-]+$/).refine(value => value !== "." && value !== "..");
 const reference = z.object({ itemId: DriveDocwsItemID, documentId: identifier, parentId: z.string().max(512).nullable() }).strict();
 export const DriveSharedContext = z.object({ shareID: DriveShareID, ownerRecordName: identifier.optional(),
-  references: z.record(reference).refine(value => Object.keys(value).length <= 2000 && new TextEncoder().encode(JSON.stringify(value)).length <= 256_000).optional(),
+  references: z.record(z.string(), reference).refine(value => Object.keys(value).length <= 2000 && new TextEncoder().encode(JSON.stringify(value)).length <= 256_000).optional(),
 }).strict();
 export type SharedContext = z.infer<typeof DriveSharedContext>;
 export interface DriveSharedStore {

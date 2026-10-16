@@ -33,7 +33,7 @@ export function planBulkChange(item: BulkChangeItemData, current: CloudKitRecord
 
 const StoredWrite = z.object({
   recordName: z.string(), recordType: z.literal("Reminder"), recordChangeTag: z.string(),
-  fields: z.record(z.object({ type: z.string(), value: z.unknown() }).strict()),
+  fields: z.record(z.string(), z.object({ type: z.string(), value: z.unknown() }).strict()),
 }).strict();
 
 /** Observation is not a receipt: compare the persisted plan, including implicit calendar changes. */

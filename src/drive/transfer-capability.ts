@@ -16,7 +16,7 @@ const Claim = z.object({ version: z.literal(1), owner: z.string().min(1).max(256
 const Envelope = z.object({ version: z.literal(1), keyId: z.string().min(1).max(64), iv: z.string().max(24), ciphertext: z.string().max(4096) }).strict();
 export type TransferClaim = z.infer<typeof Claim>;
 export const DriveTransferPlan = z.object({
-  url: z.string().url(), method: z.enum(["GET", "WEBSOCKET", "POST"]), headers: z.record(z.string()), expiresAt: number,
+  url: z.string().url(), method: z.enum(["GET", "WEBSOCKET", "POST"]), headers: z.record(z.string(), z.string()), expiresAt: number,
   completionUrl: z.string().url().optional(),
   protocol: z.enum([DRIVE_STREAM_PROTOCOL, DRIVE_STREAM_LEGACY_PROTOCOL, DRIVE_RELAY_PROTOCOL, "icloud-drive-upload-parts-v1"]).optional(), size: number.nullable(), sha256: z.string().regex(/^[a-f0-9]{64}$/).optional(), partBytes: number.optional(),
 }).strict();
