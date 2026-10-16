@@ -1,3 +1,4 @@
+import { DRIVE_FILE_BYTES } from "../src/drive/limits.ts";
 import test from "node:test";
 import assert from "node:assert/strict";
 import { mkdtemp, writeFile, readFile, rm } from "node:fs/promises";
@@ -9,13 +10,13 @@ import { createHash } from "node:crypto";
 import { fileMetadata, uploadFile, downloadFile, validatePlan } from "../scripts/drive-transfer.mjs";
 
 const { WebSocketServer } = createRequire(import.meta.url)("ws");
-test("transfer clients accept 2 GiB and reject one byte above the limit before connecting", () => {
+test("transfer clients accept the configured maximum and reject one byte above the limit before connecting", () => {
   for (const kind of ["upload", "download"]) {
     const plan = { url: `${kind === "upload" ? "wss" : "https"}://transfer.example.test/api/drive/transfers/${kind}/${crypto.randomUUID()}`,
       method: kind === "upload" ? "WEBSOCKET" : "GET", headers: { Authorization: "Bearer c3ludGhldGlj" },
-      expiresAt: Date.now() + 60_000, size: 2 ** 31, protocol: "icloud-drive-upload-v2", sha256: "a".repeat(64) };
-    assert.equal(validatePlan(plan, kind).size, 2 ** 31);
-    assert.throws(() => validatePlan({ ...plan, size: 2 ** 31 + 1 }, kind), /invalid or expired/);
+      expiresAt: Date.now() + 60_000, size: DRIVE_FILE_BYTES, protocol: "icloud-drive-upload-v2", sha256: "a".repeat(64) };
+    assert.equal(validatePlan(plan, kind).size, DRIVE_FILE_BYTES);
+    assert.throws(() => validatePlan({ ...plan, size: DRIVE_FILE_BYTES + 1 }, kind), /invalid or expired/);
   }
 });
 

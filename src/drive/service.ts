@@ -19,6 +19,7 @@ import { DriveSharedContext } from "./shared.ts";
 import { resolveDriveFolderPath } from "./folder-path.ts";
 import { newTraversal, traversalPage, TraversalState } from "./traversal.ts";
 import { DriveFolderListingDiagnostics, type DriveSearchReason } from "./listing.ts";
+import { CreateDriveBatch, GetDriveBatch, DriveBatchIdentity, DriveBatchOutput, BatchState, DRIVE_BATCH_BYTES } from "./batch.ts";
 import { accountScope, fingerprint } from "../lib/canonical.ts";
 import { b64, unb64, hex } from "../crypto/bytes.ts";
 import type { RuntimeEnv } from "../platform/sites.ts";
@@ -726,5 +727,126 @@ export class DriveService {
       }
       return this.publicOperation(row, data);
     });
+  }
+  async createUploadBatch(input: unknown) {
+    const request = parse(CreateDriveBatch, input);
+    const names = new Set<string>(), keys = new Set([request.jobId]);
+    let total = 0;
+    // Validate every byte before saving an immutable authorized manifest.
+    for (const file of request.files) {
+      const name = file.name.normalize("NFC").toLowerCase();
+      if (names.has(name) || keys.has(file.operationId)) conflict("Batch names and operation UUIDs must be unique; the job UUID cannot be a file UUID.");
+      names.add(name); keys.add(file.operationId);
+      let bytes: Uint8Array;
+      try { bytes = unb64(file.contentBase64, DRIVE_BATCH_BYTES); }
+      catch { throw new AppError("VALIDATION_ERROR", "Batch file content is not bounded base64.", 400); }
+      total += bytes.length;
+      if (bytes.length !== file.size || hex(sha256(bytes)) !== file.sha256 || total > DRIVE_BATCH_BYTES) throw new AppError("VALIDATION_ERROR", "Batch sizes or digests do not match, or total content exceeds 32 KiB.", 400);
+    }
+    return this.metadata("drive.upload", request.expectedGeneration, async c => {
+      const row = await this.operations.create(request.jobId, "bulk-upload", request, c.scope);
+      if (row.permission_revision !== c.scope.permissionRevision) conflict("Batch permissions changed. Inspect the original job.");
+      return this.batchPage(row, await this.operations.data(row), c.scope, 0, 10);
+    });
+  }
+  private async batchPage(row: DriveOperation, data: DriveOperationData, scope: DriveScope, offset: number, limit: number) {
+    if (row.kind !== "bulk-upload") conflict("This ID does not identify a Drive upload job.");
+    const manifest = parse(CreateDriveBatch, data.input);
+    const state = BatchState.parse(data.batch ?? { items: manifest.files.map(() => ({ phase: "pending" })) });
+    if (state.items.length !== manifest.files.length) throw new AppError("PROTOCOL_CHANGED", "The batch progress does not match its manifest.");
+    const cancelled = row.phase === "failed";
+    const results: z.infer<typeof DriveBatchOutput>["results"] = [];
+    const counts = { pending: 0, running: 0, confirmed: 0, failed: 0, unknown: 0, cancelled: 0 };
+    for (let ordinal = 0; ordinal < manifest.files.length; ordinal++) {
+      const file = manifest.files[ordinal], retained = state.items[ordinal];
+      let phase: z.infer<typeof DriveBatchOutput>["results"][number]["phase"] = retained.phase;
+      let item: DriveItem | undefined;
+      // Inspect only our retained child receipt. Status never dispatches Apple.
+      if (["running", "confirmed", "unknown"].includes(phase)) {
+        try {
+          const child = await this.operations.get(file.operationId, scope);
+          if (child.phase === "confirmed") {
+            const parsed = DriveItemSchema.safeParse((await this.operations.data(child)).result);
+            if (parsed.success) { item = parsed.data; phase = "confirmed"; }
+            else phase = "unknown";
+          } else if (cancelled || child.lease_until <= Date.now()) phase = "unknown";
+        } catch { phase = "unknown"; }
+      }
+      if (cancelled && phase === "pending") phase = "cancelled";
+      counts[phase]++;
+      if (ordinal >= offset && ordinal < offset + limit) results.push({ ordinal, operationId: file.operationId, name: file.name, phase, ...(retained.errorCode ? { errorCode: retained.errorCode } : {}), ...(item ? { item } : {}) });
+    }
+    const status = cancelled ? "cancelled" : row.phase === "confirmed" ? "finished" : row.lease_until > Date.now() ? "running" : "ready";
+    return DriveBatchOutput.parse({ jobId: row.operation_id, generation: row.generation, status, executionMode: "request-driven", total: manifest.files.length, counts, results,
+      nextOffset: offset + limit < manifest.files.length ? offset + limit : null, expiresAt: row.expires_at });
+  }
+  async getUploadBatch(input: unknown) {
+    const request = parse(GetDriveBatch, input);
+    return this.metadata("drive.browse", request.expectedGeneration, async c => {
+      const row = await this.operations.get(request.jobId, c.scope);
+      return this.batchPage(row, await this.operations.data(row), c.scope, request.offset, request.limit);
+    });
+  }
+  async cancelUploadBatch(input: unknown) {
+    const request = parse(DriveBatchIdentity, input);
+    // Browsing permission suffices to stop a retained job even after upload revocation.
+    return this.metadata("drive.browse", request.expectedGeneration, async c => {
+      let row = await this.operations.get(request.jobId, c.scope);
+      if (row.kind !== "bulk-upload") conflict("This ID does not identify a Drive upload job.");
+      if (!["failed", "confirmed"].includes(row.phase)) row = await this.operations.cancelBatch(row);
+      return this.batchPage(row, await this.operations.data(row), c.scope, 0, 10);
+    });
+  }
+  async continueUploadBatch(input: unknown) {
+    const request = parse(DriveBatchIdentity, input);
+    const prepared = await this.metadata("drive.upload", request.expectedGeneration, async c => {
+      const row = await this.operations.get(request.jobId, c.scope);
+      if (row.kind !== "bulk-upload") conflict("This ID does not identify a Drive upload job.");
+      if (row.permission_revision !== c.scope.permissionRevision) conflict("Batch permissions changed. Inspect or cancel the original job.");
+      return { row, scope: c.scope };
+    });
+    const scope = prepared.scope;
+    let row = prepared.row, data = await this.operations.data(row);
+    if (["confirmed", "failed"].includes(row.phase)) return this.batchPage(row, data, scope, 0, 10);
+    row = await this.operations.claim(row, scope);
+    try {
+      const manifest = parse(CreateDriveBatch, data.input);
+      const state = BatchState.parse(data.batch ?? { items: manifest.files.map(() => ({ phase: "pending" })) });
+      if (state.items.length !== manifest.files.length) throw new AppError("PROTOCOL_CHANGED", "The batch progress does not match its manifest.");
+      // A recovered coordinator intent is read-only, even if it died before
+      // creating a child intent. Lack of a receipt is not permission to replay.
+      const recovering = state.items.findIndex(item => item.phase === "running");
+      const index = recovering >= 0 ? recovering : state.items.findIndex(item => item.phase === "pending");
+      if (index >= 0) {
+        const file = manifest.files[index];
+        state.items[index] = { phase: "running" };
+        data = { ...data, batch: state };
+        row = await this.operations.checkpoint(row, "uploading", data);
+        await this.guard(scope, "drive.upload");
+        await this.operations.assertLease(row);
+        try {
+          const result = recovering >= 0
+            ? await this.operation({ operationId: file.operationId, expectedGeneration: scope.generation })
+            : await this.upload({ ...file, parentId: manifest.parentId, expectedGeneration: scope.generation });
+          state.items[index] = { phase: result.phase === "confirmed" ? "confirmed" : "unknown", ...(result.phase === "confirmed" ? {} : { errorCode: "WRITE_OUTCOME_UNKNOWN" }) };
+        } catch (error) {
+          let uncertain = recovering >= 0 || error instanceof AppError && error.code === "WRITE_OUTCOME_UNKNOWN";
+          let confirmed = false;
+          try {
+            const child = await this.operations.get(file.operationId, scope);
+            uncertain ||= !["prepared", "confirmed", "failed"].includes(child.phase);
+            confirmed = child.phase === "confirmed" && DriveItemSchema.safeParse((await this.operations.data(child)).result).success;
+          } catch (lookupError) {
+            // Only an explicit absent key proves no child intent was saved.
+            uncertain ||= !(lookupError instanceof AppError && lookupError.code === "FORBIDDEN");
+          }
+          state.items[index] = confirmed ? { phase: "confirmed" } : { phase: uncertain ? "unknown" : "failed", errorCode: uncertain ? "WRITE_OUTCOME_UNKNOWN" : error instanceof AppError ? error.code : "UPSTREAM_UNAVAILABLE" };
+        }
+      }
+      await this.guard(scope, "drive.upload");
+      row = await this.operations.checkpoint(row, state.items.some(item => ["pending", "running"].includes(item.phase)) ? "uploading" : "confirmed", { ...data, batch: state });
+    } finally { await this.operations.release(row); }
+    row = await this.operations.get(request.jobId, scope);
+    return this.batchPage(row, await this.operations.data(row), scope, 0, 10);
   }
 }

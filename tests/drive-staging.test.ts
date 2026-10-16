@@ -81,10 +81,10 @@ test("staging sweep deletes only expired complete objects; storage cleanup failu
   assert.equal(row.phase, "prepared"); assert.equal((await repo.data(row)).staging?.cancelled, true);
 });
 
-test("the 2 GiB boundary is accepted and larger uploads are refused", () => {
+test("the configured size boundary is accepted and larger uploads are refused", () => {
   const metadata = { parentId: "FOLDER::com.apple.CloudDocs::root", name: "synthetic.bin", operationId: crypto.randomUUID(), sha256: "a".repeat(64) };
   for (const size of [0, 64 * 1024 ** 2 + 1, DRIVE_FILE_BYTES]) assert.ok(UploadDriveMetadata.safeParse({ ...metadata, size }).success);
-  assert.equal(DRIVE_FILE_BYTES, 2 ** 31);
-  for (const size of [DRIVE_FILE_BYTES + 1, 2 ** 32 + 1]) assert.equal(UploadDriveMetadata.safeParse({ ...metadata, size }).success, false);
-  assert.equal(Math.ceil(DRIVE_FILE_BYTES / DRIVE_UPLOAD_PART_BYTES), 256);
+  assert.equal(DRIVE_FILE_BYTES, 4 * 1024 ** 3);
+  for (const size of [DRIVE_FILE_BYTES + 1, Number.MAX_SAFE_INTEGER]) assert.equal(UploadDriveMetadata.safeParse({ ...metadata, size }).success, false);
+  assert.equal(Math.ceil(DRIVE_FILE_BYTES / DRIVE_UPLOAD_PART_BYTES), 512);
 });

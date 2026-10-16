@@ -374,7 +374,7 @@ test("streaming permission changes and bad digests prevent upload finalization a
   assert.equal(finalize, 0);
 });
 
-test("a fragmented 2 GiB download uses byte windows without buffer copies or exceeding D1's query budget", async t => {
+test("a fragmented maximum-size download uses byte windows without buffer copies or exceeding D1's query budget", async t => {
   const current = file("synthetic-maximum.bin", "maximum", DRIVE_ROOT, DRIVE_FILE_BYTES);
   const fragment = new Uint8Array(64 * 1024);
   let remaining = DRIVE_FILE_BYTES;
@@ -1085,4 +1085,167 @@ test("package tokens download bounded archives without using unpacked sizes as C
   const ranged = await f.service.download({ itemId: current.drivewsid });
   await assert.rejects(f.service.downloadContent(ranged.handleId, undefined, "bytes=0-0"), { code: "UNSUPPORTED_FEATURE" });
   assert.equal(contentRequests, 1);
+});
+
+async function batchFixture(t: TestContext, loseCommit = -1) {
+  const files: ReturnType<typeof file>[] = [], pending = new Map<string, number>();
+  const counts = { allocate: 0, transfer: 0, commit: 0 };
+  const hooks: { transfer?: () => Promise<void> } = {};
+  const f = await fixture(t, async (url, init) => {
+    if (["/retrieveItemDetailsInFolders", "/retrieveItemDetails"].includes(url.pathname)) {
+      const payload = JSON.parse(String(init.body)), lookup = Array.isArray(payload) ? payload[0] : payload;
+      const id = (lookup.items?.[0] ?? lookup).drivewsid;
+      return json([id === DRIVE_ROOT ? { ...root, items: files, directChildrenCount: files.length } : files.find(item => item.drivewsid === id)]);
+    }
+    if (url.pathname.endsWith("/upload/web")) {
+      const id = `batch-doc-${++counts.allocate}`;
+      pending.set(id, JSON.parse(String(init.body)).size);
+      return json([{ document_id: id, url: `https://cws.icloud-content.com/123456789/singleFileUpload?tk=${id}` }]);
+    }
+    if (url.hostname === "cws.icloud-content.com") {
+      counts.transfer++; await hooks.transfer?.(); await drain(init.body as ReadableStream<Uint8Array>);
+      return json({ singleFile: { referenceChecksum: "synthetic-reference", size: pending.get(url.searchParams.get("tk")!)!, fileChecksum: "synthetic-checksum", wrappingKey: "synthetic-key" } });
+    }
+    if (url.pathname.endsWith("/update/documents")) {
+      counts.commit++;
+      const payload = JSON.parse(String(init.body)), current = file(payload.path.path, payload.document_id, DRIVE_ROOT, payload.data.size);
+      files.push(current);
+      if (counts.commit === loseCommit) throw new Error("synthetic lost acknowledgement");
+      return json({ status: { status_code: 0 }, results: [{ status: { status_code: 0 }, document: { document_id: current.docwsid, zone: current.zone, parent_id: DRIVE_ROOT, name: current.name, type: "FILE", etag: current.etag, size: current.size } }] });
+    }
+    throw new Error("Unexpected synthetic bulk endpoint");
+  });
+  const request = { jobId: crypto.randomUUID(), parentId: DRIVE_ROOT, expectedGeneration: f.generation, files: await Promise.all([new Uint8Array(), new TextEncoder().encode("abc"), new Uint8Array([0, 255, 128])].map(async (bytes, i) => {
+    const { parentId: _parent, expectedGeneration: _generation, ...input } = { ...await uploadInput(`batch-${i}.bin`, bytes), expectedGeneration: f.generation };
+    void _parent; void _generation; return input;
+  })) };
+  return { ...f, request, counts, files, hooks };
+}
+
+test("bulk Drive jobs validate the entire manifest, are encrypted, bounded and request-driven", async t => {
+  const f = await batchFixture(t);
+  for (const bad of [
+    { ...f.request, files: f.request.files.map((v, i) => i === 2 ? { ...v, sha256: "0".repeat(64) } : v) },
+    { ...f.request, files: [f.request.files[1], { ...f.request.files[2], name: f.request.files[1].name.toUpperCase() }] },
+    { ...f.request, files: [{ ...f.request.files[1], operationId: f.request.jobId }] },
+    { ...f.request, files: Array.from({ length: 26 }, () => f.request.files[0]) },
+  ]) await assert.rejects(f.service.createUploadBatch(bad));
+  assert.deepEqual(f.counts, { allocate: 0, transfer: 0, commit: 0 });
+  const prepared = await f.service.createUploadBatch(f.request);
+  assert.equal(prepared.status, "ready"); assert.equal(prepared.counts.pending, 3);
+  assert.equal(f.db.sqlite.prepare("SELECT COUNT(*) AS n FROM drive_operations").get()?.n, 1);
+  const stored = f.db.sqlite.prepare("SELECT envelope FROM drive_operations").get()?.envelope;
+  assert.equal(String(stored).includes("batch-1.bin"), false);
+  assert.equal(JSON.stringify(prepared).includes(f.request.files[1].contentBase64), false);
+  await assert.rejects(f.service.createUploadBatch({ ...f.request, files: f.request.files.slice(0, 1) }), { code: "CONFLICT" });
+  for (let i = 0; i < 3; i++) {
+    const next = await f.service.continueUploadBatch({ jobId: f.request.jobId, expectedGeneration: f.generation });
+    assert.equal(next.counts.confirmed, i + 1); assert.equal(f.counts.commit, i + 1);
+  }
+  const before = { ...f.counts };
+  const replay = await f.service.continueUploadBatch({ jobId: f.request.jobId, expectedGeneration: f.generation });
+  assert.equal(replay.status, "finished"); assert.deepEqual(f.counts, before);
+  const page = await f.service.getUploadBatch({ jobId: f.request.jobId, expectedGeneration: f.generation, offset: 1, limit: 1 });
+  assert.equal(page.results[0].ordinal, 1); assert.equal(page.nextOffset, 2);
+  assert.equal(page.results[0].item?.name, "batch-1.bin");
+  assert.equal((await f.service.cancelUploadBatch({ jobId: f.request.jobId, expectedGeneration: f.generation })).status, "finished");
+});
+
+test("bulk Drive partial failures and lost acknowledgements never replay uncertain or confirmed files", async t => {
+  const f = await batchFixture(t, 2);
+  await f.service.createUploadBatch(f.request);
+  const identity = { jobId: f.request.jobId, expectedGeneration: f.generation };
+  for (let i = 0; i < 3; i++) await f.service.continueUploadBatch(identity);
+  const result = await f.service.getUploadBatch(identity);
+  assert.equal(result.status, "finished"); assert.equal(result.counts.confirmed, 2); assert.equal(result.counts.unknown, 1);
+  assert.equal(result.results[1].errorCode, "WRITE_OUTCOME_UNKNOWN");
+  const before = { ...f.counts };
+  await f.service.createUploadBatch(f.request); await f.service.continueUploadBatch(identity);
+  assert.deepEqual(f.counts, before); assert.equal(f.files.length, 3);
+});
+
+test("bulk Drive cancellation after permission revocation stops pending files and preserves receipts", async t => {
+  const f = await batchFixture(t); await f.service.createUploadBatch(f.request);
+  const identity = { jobId: f.request.jobId, expectedGeneration: f.generation };
+  await f.service.continueUploadBatch(identity);
+  const saved = await f.settings.load();
+  await f.settings.save({ expectedRevision: saved.revision, settings: { ...saved.settings, drive: { ...saved.settings.drive, upload: false } } });
+  await assert.rejects(f.service.continueUploadBatch(identity), { code: "FORBIDDEN" });
+  const cancelled = await f.service.cancelUploadBatch(identity);
+  assert.equal(cancelled.status, "cancelled"); assert.equal(cancelled.counts.confirmed, 1); assert.equal(cancelled.counts.cancelled, 2);
+  assert.equal((await f.service.cancelUploadBatch(identity)).status, "cancelled");
+  assert.equal(f.counts.commit, 1);
+});
+
+test("bulk Drive crash recovery never dispatches an unwitnessed running file and account changes invalidate work", async t => {
+  const f = await batchFixture(t); await f.service.createUploadBatch(f.request);
+  const scope = { account: await accountScope(owner, identity.dsid), generation: f.generation, permissionRevision: (await f.settings.load()).revision, expiresAt: Date.now() + 60_000 };
+  const repo = new DriveOperationRepository(f.env, owner);
+  const row = await repo.claim(await repo.get(f.request.jobId, scope), scope);
+  await repo.checkpoint(row, "uploading", { input: f.request, batch: { items: [{ phase: "running" }, { phase: "pending" }, { phase: "pending" }] } });
+  await repo.release(row);
+  const job = { jobId: f.request.jobId, expectedGeneration: f.generation };
+  const recovered = await f.service.continueUploadBatch(job);
+  assert.equal(recovered.counts.unknown, 1); assert.equal(f.counts.allocate, 0);
+  const outcomes = await Promise.allSettled([f.service.continueUploadBatch(job), f.service.continueUploadBatch(job)]);
+  assert.equal(outcomes.filter(value => value.status === "fulfilled").length, 1); assert.equal(f.counts.commit, 1);
+  await f.sessions.begin(f.generation);
+  await assert.rejects(f.service.continueUploadBatch(job));
+  assert.equal(f.counts.commit, 1);
+});
+
+test("bulk Drive enforces total decoded bytes and processes the maximum count within bounded per-call D1 queries", async t => {
+  const f = await batchFixture(t);
+  const big = new Uint8Array(20 * 1024);
+  const make = async (i: number, bytes: Uint8Array<ArrayBuffer>) => {
+    const { parentId, ...value } = await uploadInput(`bounded-${i}.bin`, bytes); void parentId; return value;
+  };
+  await assert.rejects(f.service.createUploadBatch({ ...f.request, files: await Promise.all([make(0, big), make(1, big)]) }), { code: "VALIDATION_ERROR" });
+  assert.equal(f.counts.allocate, 0);
+  f.request.files = await Promise.all(Array.from({ length: 25 }, (_, i) => make(i, new Uint8Array([i]))));
+  await f.service.createUploadBatch(f.request);
+  let queries = 0, maximum = 0;
+  f.db.afterStatement = async () => { queries++; };
+  for (let i = 0; i < 25; i++) {
+    queries = 0;
+    const next = await f.service.continueUploadBatch({ jobId: f.request.jobId, expectedGeneration: f.generation });
+    maximum = Math.max(maximum, queries);
+    assert.equal(next.counts.confirmed, i + 1); assert.ok(queries < 400, `single-file slice D1 queries: ${queries}`);
+  }
+  t.diagnostic(`25-file bulk job: maximum ${maximum} D1 statements per continuation`);
+});
+
+test("bulk Drive cancellation during started bytes fences the coordinator without replay or rollback", async t => {
+  const f = await batchFixture(t); await f.service.createUploadBatch(f.request);
+  const job = { jobId: f.request.jobId, expectedGeneration: f.generation };
+  f.hooks.transfer = async () => { delete f.hooks.transfer; await f.service.cancelUploadBatch(job); };
+  await assert.rejects(f.service.continueUploadBatch(job), { code: "CONFLICT" });
+  const state = await f.service.getUploadBatch(job);
+  assert.equal(state.status, "cancelled"); assert.equal(state.counts.confirmed, 1); assert.equal(state.counts.cancelled, 2);
+  await f.service.continueUploadBatch(job);
+  assert.deepEqual(f.counts, { allocate: 1, transfer: 1, commit: 1 });
+});
+
+test("bulk Drive reports an existing-name conflict and proceeds only with independently safe pending files", async t => {
+  const f = await batchFixture(t); f.files.push(file(f.request.files[1].name, "existing-batch-file", DRIVE_ROOT, 3));
+  await f.service.createUploadBatch(f.request);
+  const job = { jobId: f.request.jobId, expectedGeneration: f.generation };
+  for (let i = 0; i < 3; i++) await f.service.continueUploadBatch(job);
+  const state = await f.service.getUploadBatch(job);
+  assert.equal(state.counts.failed, 1); assert.equal(state.counts.confirmed, 2);
+  assert.equal(state.results[1].errorCode, "CONFLICT"); assert.equal(f.counts.allocate, 2);
+});
+
+test("bulk Drive recovers a confirmed child receipt after coordinator death without another upload", async t => {
+  const f = await batchFixture(t); await f.service.createUploadBatch(f.request);
+  const scope = { account: await accountScope(owner, identity.dsid), generation: f.generation, permissionRevision: (await f.settings.load()).revision, expiresAt: Date.now() + 60_000 };
+  const repo = new DriveOperationRepository(f.env, owner);
+  const row = await repo.claim(await repo.get(f.request.jobId, scope), scope);
+  await repo.checkpoint(row, "uploading", { input: f.request, batch: { items: [{ phase: "running" }, { phase: "pending" }, { phase: "pending" }] } });
+  await repo.release(row);
+  await f.service.upload({ ...f.request.files[0], parentId: DRIVE_ROOT, expectedGeneration: f.generation });
+  const before = { ...f.counts };
+  const state = await f.service.continueUploadBatch({ jobId: f.request.jobId, expectedGeneration: f.generation });
+  assert.equal(state.counts.confirmed, 1); assert.equal(state.counts.pending, 2);
+  assert.deepEqual(f.counts, before);
 });

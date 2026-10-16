@@ -19,6 +19,8 @@ export const TOOL_PERMISSIONS: Readonly<Record<string, ServicePermission>> = Obj
   resolve_icloud_drive_folder_path: "drive.browse",
   read_icloud_drive_file: "drive.contents", download_icloud_drive_file: "drive.contents", prepare_icloud_drive_download: "drive.contents",
   upload_icloud_drive_file: "drive.upload", prepare_icloud_drive_upload: "drive.upload", create_icloud_drive_folder: "drive.organize",
+  create_icloud_drive_upload_job: "drive.upload", continue_icloud_drive_upload_job: "drive.upload",
+  get_icloud_drive_upload_job: "drive.browse", cancel_icloud_drive_upload_job: "drive.browse",
   rename_icloud_drive_item: "drive.organize", move_icloud_drive_item: "drive.organize", get_icloud_drive_operation: "drive.browse",
 });
 export function enabledToolNames(settings: ServiceSettings): string[] {

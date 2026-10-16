@@ -121,3 +121,36 @@ test("Expired operation keys remain tombstones and authenticated ciphertext cann
   assert.equal(db.sqlite.prepare("SELECT envelope FROM drive_operations WHERE operation_id = ?").get(a.operation_id)?.envelope, null);
   db.sqlite.close();
 });
+
+test("expired Drive tombstones preserve key reuse protection without exhausting active receipt capacity", async () => {
+  const { db, repository, scope } = fixture();
+  const old = await repository.create(crypto.randomUUID(), "upload", { name: "expired" }, scope);
+  const insert = db.sqlite.prepare("INSERT INTO drive_operations (owner_id,operation_id,account_scope,generation,permission_revision,input_hash,kind,phase,expires_at,envelope) VALUES (?,?,?,?,?,?,?,'confirmed',0,NULL)");
+  for (let i = 0; i < 1024; i++) insert.run(repository.owner, crypto.randomUUID(), scope.account, scope.generation, scope.permissionRevision, old.input_hash, "upload");
+  const fresh = await repository.create(crypto.randomUUID(), "upload", { name: "fresh" }, scope);
+  assert.equal(fresh.phase, "prepared");
+  db.sqlite.prepare("UPDATE drive_operations SET expires_at = 0 WHERE operation_id = ?").run(old.operation_id);
+  await assert.rejects(repository.create(old.operation_id, "upload", { name: "expired" }, scope), { code: "AUTH_EXPIRED" });
+  const active = db.sqlite.prepare("INSERT INTO drive_operations (owner_id,operation_id,account_scope,generation,permission_revision,input_hash,kind,phase,expires_at,envelope) VALUES (?,?,?,?,?,?,?,'confirmed',?,?)");
+  for (let i = 0; i < 1023; i++) active.run(repository.owner, crypto.randomUUID(), scope.account, scope.generation, scope.permissionRevision, old.input_hash, "upload", scope.expiresAt, fresh.envelope);
+  await assert.rejects(repository.create(crypto.randomUUID(), "upload", { name: "full" }, scope), { code: "RATE_LIMITED", status: 429 });
+  assert.equal((await repository.create(fresh.operation_id, "upload", { name: "fresh" }, scope)).operation_id, fresh.operation_id);
+  db.sqlite.close();
+});
+
+test("receipt cleanup does not rewrite historical tombstones and active quota lookup uses the bounded index", async () => {
+  const { db, repository, scope } = fixture();
+  const expired = await repository.create(crypto.randomUUID(), "upload", { name: "expired once" }, scope);
+  db.sqlite.prepare("UPDATE drive_operations SET expires_at = 0 WHERE operation_id = ?").run(expired.operation_id);
+  const cleaned: number[] = [];
+  db.afterStatement = async sql => {
+    if (sql.startsWith("UPDATE drive_operations SET envelope = NULL")) cleaned.push(Number(db.sqlite.prepare("SELECT changes() AS n").get()?.n));
+  };
+  await repository.create(crypto.randomUUID(), "upload", { name: "first cleanup" }, scope);
+  await repository.create(crypto.randomUUID(), "upload", { name: "second cleanup" }, scope);
+  assert.deepEqual(cleaned, [1, 0]);
+  const plan = db.sqlite.prepare("EXPLAIN QUERY PLAN SELECT COUNT(*) FROM drive_operations WHERE owner_id = ? AND generation = ? AND envelope IS NOT NULL").all(repository.owner, scope.generation);
+  assert.match(JSON.stringify(plan), /drive_operations_active/);
+  await assert.rejects(repository.create(expired.operation_id, "upload", { name: "expired once" }, scope), { code: "AUTH_EXPIRED" });
+  db.sqlite.close();
+});
