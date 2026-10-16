@@ -1,7 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { copyFileSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -9,12 +10,19 @@ const root = fileURLToPath(new URL("../", import.meta.url));
 const linter = path.join(root, "node_modules/oxlint/bin/oxlint");
 
 function lint(source: string, parent = "src", filename = "example.tsx") {
-  const directory = mkdtempSync(path.join(root, parent, ".lint-check-"));
+  const directory = mkdtempSync(path.join(tmpdir(), "reminders-lint-check-"));
   try {
-    const file = path.join(directory, filename);
+    // Keep transient canaries outside public source directories: the source
+    // packaging tests enumerate and copy those directories concurrently.
+    copyFileSync(path.join(root, ".oxlintrc.json"), path.join(directory, ".oxlintrc.json"));
+    symlinkSync(path.join(root, "node_modules"), path.join(directory, "node_modules"), "junction");
+    mkdirSync(path.join(directory, "src/app"), { recursive: true });
+    writeFileSync(path.join(directory, "src/app/page.tsx"), "export default function Page() { return <main />; }");
+    mkdirSync(path.join(directory, parent), { recursive: true });
+    const file = path.join(directory, parent, filename);
     writeFileSync(file, source);
-    const result = spawnSync(process.execPath, [linter, "--deny-warnings", "--format=json", file], {
-      cwd: root, encoding: "utf8", timeout: 30_000,
+    const result = spawnSync(process.execPath, [linter, "--no-ignore", "--deny-warnings", "--format=json", file], {
+      cwd: directory, encoding: "utf8", timeout: 30_000,
     });
     assert.ifError(result.error);
     assert.equal(result.signal, null);
