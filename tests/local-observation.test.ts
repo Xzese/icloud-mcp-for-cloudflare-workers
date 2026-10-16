@@ -1,3 +1,4 @@
+import { DRIVE_FILE_BYTES } from "../src/drive/limits.ts";
 import assert from "node:assert/strict";
 import test from "node:test";
 import { classifyDriveRelayURL, localAppleContentHeaders, localAppleDownloadHeaders, summarizeAppleResponse, summarizeAppleFailure } from "../scripts/dev/local-icloud-observation.mjs";
@@ -41,7 +42,7 @@ test("signed content headers preserve multipart framing without forwarding Apple
 });
 
 test("local signed-content framing refuses malformed or oversized declared lengths", () => {
-  for (const length of ["-1", "12.5", "abc", "9007199254740992", String(2 * 1024 ** 3 + 16_385)])
+  for (const length of ["-1", "12.5", "abc", "9007199254740992", String(DRIVE_FILE_BYTES + 16_385)])
     assert.throws(() => localAppleContentHeaders({ "content-length": length }), /invalid declared length/);
 });
 

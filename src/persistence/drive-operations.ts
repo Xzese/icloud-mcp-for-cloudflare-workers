@@ -3,9 +3,10 @@ import { AppError } from "../errors.ts";
 import { configuredEnvelopes } from "./apple-sessions.ts";
 import { fingerprint } from "../lib/canonical.ts";
 import type { RuntimeEnv } from "../platform/sites.ts";
-import { DRIVE_UPLOAD_LEASE_MS } from "../drive/limits.ts";
+import { DRIVE_UPLOAD_LEASE_MS, DRIVE_RELAY_LEASE_MS } from "../drive/limits.ts";
 import { DriveSharedContext } from "../drive/shared.ts";
 import { UploadStaging, type UploadStagingData } from "../drive/staging.ts";
+import { BatchState } from "../drive/batch.ts";
 
 export interface DriveScope { account: string; generation: number; permissionRevision: number; expiresAt: number; }
 export type DrivePhase = "prepared" | "allocating" | "allocated" | "uploading" | "uploaded" | "committing" | "confirmed" | "unknown" | "failed";
@@ -14,9 +15,9 @@ export interface DriveOperation {
   input_hash: string; kind: string; phase: DrivePhase; revision: number; lease_id: string | null;
   lease_until: number; expires_at: number; envelope: string | null;
 }
-export interface DriveOperationData { input: Record<string, unknown>; allocation?: unknown; receipt?: unknown; result?: unknown; itemId?: string; staging?: UploadStagingData; }
+export interface DriveOperationData { input: Record<string, unknown>; allocation?: unknown; receipt?: unknown; result?: unknown; itemId?: string; staging?: UploadStagingData; batch?: z.infer<typeof BatchState>; }
 const EnvelopeSchema = z.object({ version: z.literal(1), keyId: z.string(), iv: z.string(), ciphertext: z.string() }).strict();
-const DataSchema = z.object({ input: z.record(z.unknown()), allocation: z.unknown().optional(), receipt: z.unknown().optional(), result: z.unknown().optional(), itemId: z.string().optional(), staging: UploadStaging.optional() }).strict();
+const DataSchema = z.object({ input: z.record(z.unknown()), allocation: z.unknown().optional(), receipt: z.unknown().optional(), result: z.unknown().optional(), itemId: z.string().optional(), staging: UploadStaging.optional(), batch: BatchState.optional() }).strict();
 const conflict = () => new AppError("CONFLICT", "The Drive operation changed or is already running. Inspect its operation ID before retrying.", 409);
 const canonicalOperationId = (value: string) => {
   const parsed = z.string().uuid().safeParse(value);
@@ -24,7 +25,8 @@ const canonicalOperationId = (value: string) => {
   return parsed.data.toLowerCase();
 };
 
-// Bodies are never stored. Inputs, Apple receipts and identifiers are sealed
+// Single-file bodies are never stored. Bounded bulk inline manifests, inputs,
+// Apple receipts and identifiers are sealed
 // under the same key ring, with a distinct record context for every operation.
 export class DriveOperationRepository {
   readonly db: D1DatabaseSession;
@@ -73,19 +75,32 @@ export class DriveOperationRepository {
     const inputHash = await fingerprint({ kind, input });
     const expires = Math.min(scope.expiresAt, Date.now() + 86_400_000);
     const envelope = JSON.stringify(await this.envelopes.encrypt({ input }, this.context(id, scope.account, scope.generation)));
-    await this.db.prepare("UPDATE drive_operations SET envelope = NULL WHERE owner_id = ? AND expires_at <= ? AND lease_until <= ?").bind(this.owner, Date.now(), Date.now()).run();
+    await this.db.prepare("UPDATE drive_operations SET envelope = NULL WHERE owner_id = ? AND envelope IS NOT NULL AND expires_at <= ? AND lease_until <= ?").bind(this.owner, Date.now(), Date.now()).run();
     await this.db.prepare(`INSERT OR IGNORE INTO drive_operations (owner_id,operation_id,account_scope,generation,permission_revision,input_hash,kind,phase,expires_at,envelope)
-      SELECT ?,?,?,?,?,?,?,'prepared',?,? WHERE (SELECT COUNT(*) FROM drive_operations WHERE owner_id = ? AND generation = ?) < 1024`)
+      SELECT ?,?,?,?,?,?,?,'prepared',?,? WHERE (SELECT COUNT(*) FROM drive_operations WHERE owner_id = ? AND generation = ? AND envelope IS NOT NULL) < 1024`)
       .bind(this.owner, id, scope.account, scope.generation, scope.permissionRevision, inputHash, kind, expires, envelope, this.owner, scope.generation).run();
+    const exists = await this.db.prepare("SELECT 1 FROM drive_operations WHERE owner_id = ? AND operation_id = ?").bind(this.owner, id).first();
+    if (!exists) throw new AppError("RATE_LIMITED", "The active Drive receipt quota is full. Retain this key; wait for receipts to expire before continuing.", 429, true);
     const row = await this.get(id, scope);
     if (row.input_hash !== inputHash || row.kind !== kind) throw new AppError("CONFLICT", "This operation key was already used for different input. Retain the original key and input for recovery.", 409);
     return row;
   }
-  async claim(row: DriveOperation, scope: DriveScope) {
+  async claim(row: DriveOperation, scope: DriveScope, leaseMs?: number) {
     if (row.permission_revision !== scope.permissionRevision) throw new AppError("CONFLICT", "Service settings changed after this operation began. Inspect the retained operation; do not replay it.", 409);
     const now = Date.now(), lease = crypto.randomUUID();
+    const maximum = row.kind === "relay-upload" ? DRIVE_RELAY_LEASE_MS : DRIVE_UPLOAD_LEASE_MS;
+    const duration = leaseMs ?? (row.kind === "relay-upload" ? maximum : ["upload", "stream-upload", "relay-upload", "resumable-upload", "bulk-upload"].includes(row.kind) ? DRIVE_UPLOAD_LEASE_MS : 150_000);
+    if (!Number.isSafeInteger(duration) || duration < 10_000 || duration > maximum) throw conflict();
     const next = await this.db.prepare("UPDATE drive_operations SET lease_id = ?, lease_until = ?, revision = revision + 1 WHERE owner_id = ? AND operation_id = ? AND revision = ? AND lease_until <= ? AND expires_at > ? RETURNING *")
-      .bind(lease, Math.min(now + (["upload", "stream-upload"].includes(row.kind) ? DRIVE_UPLOAD_LEASE_MS : 150_000), row.expires_at), this.owner, row.operation_id, row.revision, now, now).first<DriveOperation>();
+      .bind(lease, Math.min(now + duration, row.expires_at), this.owner, row.operation_id, row.revision, now, now).first<DriveOperation>();
+    if (!next) throw conflict();
+    return next;
+  }
+  async cancelBatch(row: DriveOperation) {
+    // Invalidates a running coordinator's CAS without undoing its started file.
+    // Keep the encrypted manifest and child keys for read-only reconciliation.
+    const next = await this.db.prepare("UPDATE drive_operations SET phase = 'failed', revision = revision + 1 WHERE owner_id = ? AND operation_id = ? AND kind = 'bulk-upload' AND revision = ? AND phase NOT IN ('confirmed','failed') RETURNING *")
+      .bind(this.owner, row.operation_id, row.revision).first<DriveOperation>();
     if (!next) throw conflict();
     return next;
   }

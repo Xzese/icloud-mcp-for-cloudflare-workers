@@ -3,12 +3,14 @@ import { AppError } from "../errors.ts";
 import { hex } from "../crypto/bytes.ts";
 import type { DriveOperation, DriveOperationData, DriveOperationRepository, DriveScope } from "../persistence/drive-operations.ts";
 import { DRIVE_FILE_BYTES, DRIVE_UPLOAD_PART_BYTES } from "./limits.ts";
+import { CheckpointSHA256, HashCheckpoint } from "./hash-checkpoint.ts";
 
 const Part = z.object({ partNumber: z.number().int().min(1).max(Math.ceil(DRIVE_FILE_BYTES / DRIVE_UPLOAD_PART_BYTES)), etag: z.string().max(256), sha256: z.string().regex(/^[a-f0-9]{64}$/) }).strict();
 export const UploadStaging = z.object({
   key: z.string().regex(/^drive-staging\/v1\/\d{13}\/[a-f0-9-]{36}$/),
   uploadId: z.string().min(1).max(2048), parts: z.array(Part).max(Math.ceil(DRIVE_FILE_BYTES / DRIVE_UPLOAD_PART_BYTES)),
   objectEtag: z.string().max(256).optional(), cancelled: z.boolean().default(false),
+  verification: z.object({ hash: HashCheckpoint, sha256: z.string().regex(/^[a-f0-9]{64}$/).optional() }).strict().optional(),
 }).strict();
 export type UploadStagingData = z.infer<typeof UploadStaging>;
 const conflict = (message: string) => new AppError("CONFLICT", message, 409);
@@ -54,8 +56,8 @@ export class DriveStaging {
 
   private async locked<T>(id: string, run: (row: DriveOperation, data: DriveOperationData, save: (data: DriveOperationData) => Promise<void>) => Promise<T>) {
     let row = await this.operations.get(id, this.scope);
-    if (row.kind !== "upload") throw conflict("This operation is not an upload.");
-    row = await this.operations.claim(row, this.scope);
+    if (!["upload", "resumable-upload"].includes(row.kind)) throw conflict("This operation is not a staged upload.");
+    row = await this.operations.claim(row, this.scope, 120_000);
     try {
       const data = await this.operations.data(row);
       return await run(row, data, async next => {
@@ -83,7 +85,8 @@ export class DriveStaging {
         this.active(row);
         const key = `${prefix}${row.expires_at}/${crypto.randomUUID()}`;
         const upload = await this.bucket.createMultipartUpload(key);
-        data.staging = { key, uploadId: upload.uploadId, parts: [], cancelled: false };
+        data.staging = { key, uploadId: upload.uploadId, parts: [], cancelled: false,
+          ...(row.kind === "resumable-upload" ? { verification: { hash: new CheckpointSHA256().checkpoint() } } : {}) };
         try { await save(data); } catch (error) { await upload.abort().catch(() => {}); throw error; }
       }
       return this.state(row, UploadStaging.parse(data.staging));
@@ -105,6 +108,18 @@ export class DriveStaging {
           if (existing.sha256 !== checksum) throw conflict("This part number already contains different bytes.");
           return this.state(row, staging);
         }
+        if (row.kind === "resumable-upload") {
+          if (!staging.verification || staging.verification.sha256 || partNumber !== staging.parts.length + 1
+            || staging.verification.hash.bytes !== (partNumber - 1) * DRIVE_UPLOAD_PART_BYTES) throw conflict("Resume at the next unacknowledged part using the retained operation.");
+          const hash = new CheckpointSHA256(staging.verification.hash);
+          hash.update(bytes);
+          if (partNumber === total) {
+            const actual = hex(hash.digest());
+            if (actual !== data.input.sha256) throw new AppError("VALIDATION_ERROR", "The full file SHA-256 did not match. No Apple upload was started.", 400);
+            staging.verification.sha256 = actual;
+          } else staging.verification.hash = hash.checkpoint();
+          hash.destroy();
+        }
         await this.guard(); await this.operations.assertLease(row);
         const part = await this.bucket.resumeMultipartUpload(staging.key, staging.uploadId).uploadPart(partNumber, bytes);
         staging.parts.push({ ...part, sha256: checksum });
@@ -119,6 +134,7 @@ export class DriveStaging {
       const staging = UploadStaging.parse(data.staging);
       if (row.phase === "confirmed") return staging;
       if (staging.cancelled) throw conflict("This staged upload was discarded.");
+      if (row.kind === "resumable-upload" && (!staging.verification?.sha256 || staging.verification.sha256 !== data.input.sha256)) throw conflict("Upload and verify every part before completing this file.");
       if (!staging.objectEtag) {
         this.active(row, staging);
         const total = Math.ceil(Number(data.input.size) / DRIVE_UPLOAD_PART_BYTES);

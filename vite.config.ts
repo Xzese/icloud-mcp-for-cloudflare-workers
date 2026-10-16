@@ -19,7 +19,7 @@ const standalone = process.env.REMINDERS_DEPLOYMENT === "cloudflare";
 
 const localBindingConfig = {
   main: fileURLToPath(new URL(standalone ? "./src/index.ts" : "./src/worker.ts", import.meta.url)),
-  compatibility_flags: ["nodejs_compat"],
+  compatibility_flags: ["nodejs_compat", "global_fetch_strictly_public"],
   d1_databases: d1
     ? [
         {

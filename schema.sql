@@ -161,6 +161,8 @@ CREATE TABLE IF NOT EXISTS drive_operations (
   envelope TEXT,
   PRIMARY KEY (owner_id, operation_id)
 );
+-- Keep receipt quota/expiry work bounded by live envelopes, not historical keys.
+CREATE INDEX IF NOT EXISTS drive_operations_active ON drive_operations(owner_id, generation, expires_at) WHERE envelope IS NOT NULL;
 CREATE TABLE IF NOT EXISTS drive_handles (
   owner_id TEXT NOT NULL,
   handle_id TEXT NOT NULL,

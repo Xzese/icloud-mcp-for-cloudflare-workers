@@ -18,7 +18,8 @@ Access and Managed OAuth. No containers, Python runtime, KV namespace or Durable
 The browser performs the Apple password proof exchange. The Worker stores Apple session cookies,
 tokens, list summaries, pagination state and private Drive operation receipts encrypted with
 AES-256-GCM in D1. Reminder contents and Drive file bodies are fetched on demand and are not
-cached in D1. Service preferences are ordinary owner-scoped configuration.
+cached in D1. Small-file upload jobs retain at most 32 KiB of encrypted content per
+immutable manifest until its receipt expires. Service preferences are ordinary owner-scoped configuration.
 
 **Experimental, unofficial integration.** This project uses Apple's undocumented web protocols,
 not Sign in with Apple or an official public iCloud API. The login page is served by your deployment;
@@ -114,11 +115,16 @@ files and folders. It excludes deletion, content replacement, sharing, packages 
 operations. Search is bounded and explicitly reports incomplete results.
 
 - Inline MCP full reads/uploads: **64 KiB** of decoded bytes, UTF-8 or base64.
-- MCP-authorized uploads/downloads: **2 GiB**. MCP returns a short-lived transfer URL and
-  required credential headers; an agent streams file bytes without another browser login.
-  Metadata-only uploads use direct WebSocket streaming without R2.
-- Text previews: **8 KiB** of leading UTF-8 bytes, with explicit truncation, for files up to **2 GiB**.
-- Dashboard/multipart uploads and private downloads: **2 GiB**, with a 30-minute transfer budget.
+- MCP-authorized uploads/downloads: **10 GiB**. MCP returns a short-lived transfer URL and
+  required credential headers, without another browser login. The default WebSocket relay
+  verifies 16 MiB frames in separate Worker requests and needs no R2. Keep its client
+  connected; it cannot resume interrupted Apple bytes. `resumable: true` opts into 8 MiB
+  R2 staging with durable checkpoints across client sessions and Worker instances. Apple
+  delivery still requires one connected request and is never automatically retried.
+- Small-file upload jobs: **1–25 separate files**, at most **32 KiB total decoded content**,
+  with one file executed per continuation and paginated per-file receipts.
+- Text previews: **8 KiB** of leading UTF-8 bytes, with explicit truncation, for files up to **10 GiB**.
+- Dashboard/multipart and direct-stream uploads: **4 GiB**, with a 30-minute transfer budget.
   Uploads above **64 MiB** use resumable **8 MiB** parts in private R2; direct HTTP uploads remain capped at 64 MiB.
 - Downloads require owner authentication. A returned URL is not a public share or an attachment
   automatically available to every MCP client; use the dashboard if the client cannot fetch it.
@@ -127,7 +133,12 @@ operations. Search is bounded and explicitly reports incomplete results.
 
 **Drive is experimental.** Live checks on one retained Apple account verified browsing,
 name search, reads, uploads/downloads, folder creation, rename and move on 13 October 2026.
-Multi-gigabyte transfers are verified synthetically, not yet against live Apple or the Sites gateway.
+A full 10 GiB resumable upload and complete matching download passed on the private ChatGPT
+Site on 16 October 2026. The browser's older direct-stream route retains its 4 GiB limit.
+The default no-R2 relay also passed a full live 10 GiB upload and matching complete download.
+It has a 45-minute budget; measured upload/download CPU was 27.9/28.3 seconds against the
+observed 32-second hosted ceiling. This is modest headroom, so 10 GiB remains the maximum.
+Live measurements and synthetic coverage are recorded separately in the Drive guide.
 Read [the Drive guide](docs/icloud-drive.md) for measured live transfer boundaries, every tool,
 exact HTTP transfer steps, consent troubleshooting, limits, migration and
 rollback instructions. The [extension research/design](docs/icloud-services-plan.md) records
@@ -145,7 +156,7 @@ native behaviour from connector safeguards and links the supporting live evidenc
 | `connection_status` | Report account/service readiness, saved permissions, session generation and tool availability; does not contact Apple. |
 | `list_icloud_drive_items`, `get_icloud_drive_item`, `search_icloud_drive` | Browse exact metadata and search names within a selected folder tree. |
 | `traverse_icloud_drive` | Recursively list or filter a folder tree with relative paths, encrypted resumable pages, configurable limits and explicit completeness. |
-| `prepare_icloud_drive_upload`, `prepare_icloud_drive_download` | Start a transfer up to 2 GiB and receive its absolute endpoint and private credential headers, without a dashboard sign-in. |
+| `prepare_icloud_drive_upload`, `prepare_icloud_drive_download` | Start a transfer up to 10 GiB and receive its absolute endpoint and private credential headers, without a dashboard sign-in. |
 | `read_icloud_drive_file`, `download_icloud_drive_file` | Read bounded text/base64 or prepare a private authenticated download. |
 | `upload_icloud_drive_file`, `create_icloud_drive_folder` | Add new files or folders using retained operation UUIDs. |
 | `rename_icloud_drive_item`, `move_icloud_drive_item` | Organise owned items using current etags. |
@@ -331,7 +342,8 @@ includes a command that creates, edits, completes, reopens and deletes only its 
 | Encryption | Operator-provided Worker secret | Operator-provided Worker secret |
 | MCP registration | Site-hosted plugin at `/mcp` | Register `/mcp` as a custom OAuth MCP connection. |
 
-R2 is used for resumable uploads above 64 MiB. Workers KV, Durable Objects, an Apple developer
+R2 is used for optional resumable staging and dashboard multipart uploads. MCP relay uploads
+and downloads work without a bucket. Workers KV, Durable Objects, an Apple developer
 application and an OpenAI API key are not required. Your Cloudflare plan must support the CPU/memory needs of login
 cryptography, streamed file hashing and your Access configuration; validate those limits in your deployment.
 

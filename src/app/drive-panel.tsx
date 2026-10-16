@@ -4,7 +4,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { Download, File, FileText, Folder, FolderPlus, RefreshCw, Search, Upload } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import type { DriveItem } from "@/icloud/drive";
-import { DRIVE_FILE_BYTES, DRIVE_FILE_LIMIT_LABEL } from "@/drive/limits";
+import { DRIVE_FILE_BYTES, DRIVE_STREAM_FILE_BYTES } from "@/drive/limits";
 import { uploadDriveFile, pendingDriveUpload, discardDriveUpload } from "@/lib/drive-upload";
 import { streamDriveFile, pendingDriveStreamUpload } from "@/lib/drive-stream-upload";
 
@@ -92,7 +92,7 @@ export default function DrivePanel() {
     setNotice(result.phase === "confirmed" ? "Change confirmed by Apple." : `Operation ${result.phase}. Inspect its status before starting another change.`);
   }
   async function upload(file: globalThis.File, direct = false) {
-    if (file.size > DRIVE_FILE_BYTES) throw new Error(`Choose a file no larger than ${DRIVE_FILE_LIMIT_LABEL}.`);
+    if (file.size > DRIVE_STREAM_FILE_BYTES) throw new Error("Dashboard uploads allow up to 4 GiB. Use an MCP resumable transfer for larger files.");
     const result = await (direct ? streamDriveFile : uploadDriveFile)(file, { ...context, parentId: folder.id }, (text, id) => { setNotice(text); if (id) setOperation(id); });
     retain(result); await browse();
   }
@@ -103,7 +103,7 @@ export default function DrivePanel() {
       <nav className="drive-breadcrumbs" aria-label="Drive folder">{trail.map((entry, index) => <Button variant="ghost" key={`${entry.id}-${index}`} disabled={busy} onClick={() => void run(() => browse(trail.slice(0, index + 1)))}>{entry.name}</Button>)}</nav>
       {folder.shareContext && <p className="fine-print">Shared folder: browsing and downloads are available. Changes to shared items are not supported.</p>}
       <div className="action-row"><Button variant="outline" disabled={busy} onClick={() => void run(() => browse())}><RefreshCw size={16} />Refresh folder</Button>
-        {access.upload && !folder.shareContext && <><input ref={fileInput} type="file" hidden onChange={event => { const file = event.target.files?.[0]; event.target.value = ""; if (file) void run(() => upload(file)); }} /><Button variant="outline" disabled={busy} onClick={() => fileInput.current?.click()}><Upload size={16} />Upload file (up to {DRIVE_FILE_LIMIT_LABEL})</Button></>}
+        {access.upload && !folder.shareContext && <><input ref={fileInput} type="file" hidden onChange={event => { const file = event.target.files?.[0]; event.target.value = ""; if (file) void run(() => upload(file)); }} /><Button variant="outline" disabled={busy} onClick={() => fileInput.current?.click()}><Upload size={16} />Upload file (up to 4 GiB)</Button></>}
       </div>
       {access.upload && !folder.shareContext && <div className="action-row"><input ref={streamInput} type="file" hidden onChange={event => { const file = event.target.files?.[0]; event.target.value = ""; if (file) void run(() => upload(file, true)); }} /><Button variant="outline" disabled={busy} onClick={() => streamInput.current?.click()}><Upload size={16} />Stream file directly (experimental)</Button><span className="fine-print">No temporary file copy. Keep this page open; an interrupted transfer cannot resume its bytes.</span></div>}
       {pendingUpload && access.upload && <p className="fine-print">Interrupted a large upload? Reselect the same file in its original folder to resume. <Button variant="ghost" disabled={busy} onClick={() => void run(async () => { await discardDriveUpload(pendingUpload); setNotice("Staged data discarded. Any Apple operation receipt is retained."); })}>Discard staged data</Button></p>}

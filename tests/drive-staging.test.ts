@@ -81,10 +81,48 @@ test("staging sweep deletes only expired complete objects; storage cleanup failu
   assert.equal(row.phase, "prepared"); assert.equal((await repo.data(row)).staging?.cancelled, true);
 });
 
-test("the 2 GiB boundary is accepted and larger uploads are refused", () => {
+test("the configured size boundary is accepted and larger uploads are refused", () => {
   const metadata = { parentId: "FOLDER::com.apple.CloudDocs::root", name: "synthetic.bin", operationId: crypto.randomUUID(), sha256: "a".repeat(64) };
   for (const size of [0, 64 * 1024 ** 2 + 1, DRIVE_FILE_BYTES]) assert.ok(UploadDriveMetadata.safeParse({ ...metadata, size }).success);
-  assert.equal(DRIVE_FILE_BYTES, 2 ** 31);
-  for (const size of [DRIVE_FILE_BYTES + 1, 2 ** 32 + 1]) assert.equal(UploadDriveMetadata.safeParse({ ...metadata, size }).success, false);
-  assert.equal(Math.ceil(DRIVE_FILE_BYTES / DRIVE_UPLOAD_PART_BYTES), 256);
+  assert.equal(DRIVE_FILE_BYTES, 10 * 1024 ** 3);
+  for (const size of [DRIVE_FILE_BYTES + 1, Number.MAX_SAFE_INTEGER]) assert.equal(UploadDriveMetadata.safeParse({ ...metadata, size }).success, false);
+  assert.equal(Math.ceil(DRIVE_FILE_BYTES / DRIVE_UPLOAD_PART_BYTES), 1280);
+});
+
+test("resumable staging checkpoints full hashes across instances, rejects reordering and corruption, and recovers a lost part checkpoint", async t => {
+  const db = new JobSQLiteD1(); t.after(() => db.sqlite.close());
+  const owner = "synthetic-resumable-owner", bucket = new DriveBucket();
+  const env = { ...db.env(), REMINDERS_OWNER_ID: owner, ENCRYPTION_KEY_ID: "synthetic", ENCRYPTION_KEYS_JSON: JSON.stringify({ synthetic: b64(crypto.getRandomValues(new Uint8Array(32))) }) };
+  const scope = { account: "synthetic-account", generation: 1, permissionRevision: 1, expiresAt: Date.now() + 86_400_000 };
+  const repo = new DriveOperationRepository(env, owner), id = crypto.randomUUID();
+  const first = new Uint8Array(DRIVE_UPLOAD_PART_BYTES).fill(37), last = new Uint8Array([6, 7, 8]);
+  const fullHash = createHash("sha256").update(first).update(last).digest("hex");
+  await repo.create(id, "resumable-upload", { operationId: id, size: first.length + last.length, sha256: fullHash }, scope);
+  let revoked = false;
+  const stage = () => new DriveStaging(bucket.binding(), new DriveOperationRepository(env, owner), scope, async () => { if (revoked) throw new Error("revoked"); });
+  await stage().prepare(id);
+  await assert.rejects(stage().part(id, 2, hash(last), stream(last)), /next unacknowledged/);
+  const brokenRepo = new DriveOperationRepository(env, owner);
+  t.mock.method(brokenRepo, "checkpoint", async () => { throw new Error("lost checkpoint"); });
+  await assert.rejects(new DriveStaging(bucket.binding(), brokenRepo, scope, async () => {}).part(id, 1, hash(first), stream(first)), /lost checkpoint/);
+  assert.equal(bucket.partWrites, 1);
+  assert.deepEqual((await stage().prepare(id)).uploadedParts, []);
+  await stage().part(id, 1, hash(first), stream(first));
+  const beforeReplay = (await repo.data(await repo.get(id, scope))).staging!.verification;
+  await stage().part(id, 1, hash(first), stream(first));
+  assert.deepEqual((await repo.data(await repo.get(id, scope))).staging!.verification, beforeReplay);
+  assert.equal(bucket.partWrites, 2, "acknowledged parts are not written or hashed twice");
+  const wrong = last.slice(); wrong[0]++;
+  await assert.rejects(stage().part(id, 2, hash(wrong), stream(wrong)), /full file SHA-256/);
+  assert.equal(bucket.partWrites, 2, "full-file mismatch is rejected before sealing the last part");
+  revoked = true;
+  await assert.rejects(stage().part(id, 2, hash(last), stream(last)), /revoked/);
+  revoked = false;
+  await stage().part(id, 2, hash(last), stream(last));
+  const sealed = await stage().complete(id);
+  assert.equal(sealed.verification!.sha256, fullHash);
+  assert.equal(hash(bucket.objects.get(sealed.key)!.bytes), fullHash);
+  const data = await repo.data(await repo.get(id, scope));
+  assert.equal(data.staging!.verification!.hash.bytes, first.length);
+  assert.ok((await stage().discard(id)).cancelled);
 });
