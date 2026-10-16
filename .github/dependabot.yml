@@ -3,6 +3,7 @@ multi-ecosystem-groups:
   dependencies:
     schedule:
       interval: weekly
+    open-pull-requests-limit: 1
 
 updates:
   - package-ecosystem: npm
@@ -14,7 +15,6 @@ updates:
       security-npm:
         applies-to: security-updates
         patterns: ["*"]
-    open-pull-requests-limit: 1
   - package-ecosystem: github-actions
     directory: /
     multi-ecosystem-group: dependencies
@@ -23,4 +23,3 @@ updates:
       security-actions:
         applies-to: security-updates
         patterns: ["*"]
-    open-pull-requests-limit: 1
