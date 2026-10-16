@@ -962,3 +962,34 @@ Both Sites and standalone production bundles passed full synthetic 10 GiB upload
 exact framing, full digest, range, resume and receipt-replay checks. Live Apple acceptance
 used ChatGPT Sites; a separate standalone Cloudflare deployment was not exercised. The
 independently verified small-file jobs retain their 25-file / 32 KiB total-content limit.
+
+### Direct client-to-Apple experiment (2026-10-16)
+
+A temporary owner-only MCP probe allocated a separately named 1 KiB synthetic upload.
+The local client sent all 1,024 bytes directly to Apple's HTTPS content endpoint, without
+Apple cookies, R2, Worker byte relay or another sign-in. Apple returned HTTP 200 in
+0.664 seconds. This verifies the small direct byte request only, not a complete Drive file
+or a multi-gigabyte direct transfer.
+
+The prerequisite integrity check did not pass. Before any document finalization, the
+Worker requested the allocated document through the existing authenticated download-by-ID
+endpoint. Apple returned HTTP 404. The reported content checksum decoded to 21 bytes with
+a leading version byte; it matched neither the source SHA-1 nor SHA-256. A checksum supplied
+by the client is not independent proof of the stored bytes. This experiment did not establish
+a server-verifiable binding between the receipt and the authorized SHA-256, or prove that
+the opaque Apple upload token is limited to one file and obeys connector revocation.
+It does not establish that every possible Apple pre-finalization read protocol is unavailable.
+
+The probe never called document finalization and its original operation remains `unknown`.
+Its accepted byte request was not retried. An earlier local URL-validation failure occurred
+before byte dispatch: Apple's explicit HTTPS port 443 was valid, and the same retained
+allocation was recovered after confirming the client's dispatch marker was absent. No new
+allocation was used to retry that failure. URLs and receipts stayed in process memory or
+the encrypted operation ledger; private diagnostic evidence contains no bearer values.
+
+The temporary tools were removed and the verified production version restored. No 10 GiB
+client-to-Apple upload was attempted or advertised. Resumable 10 GiB uploads retain R2;
+downloads and the existing direct Worker relay up to 4 GiB do not require it. Further direct
+upload work needs a verified Apple receipt/readback protocol, or a separately designed
+temporary-iCloud-file, full-readback and promotion workflow with explicit recovery,
+revocation, collision and cleanup semantics. The latter is not implemented or validated.
