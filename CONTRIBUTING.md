@@ -42,6 +42,15 @@ The last command checks the standalone bundle without deploying it. Run `npm run
 before using the Sites/local live runner. Follow the README for each deployment's separate
 identity and provisioning requirements.
 
+`npm run lint` uses Oxlint with TypeScript 7. `.oxlintrc.json` carries the former Next.js,
+React, accessibility and TypeScript rule severities, generated-file exclusions, and synthetic-test
+and vendored-UI exceptions. Native rules handle most checks. The official Next.js plugin retains
+relative-location assignment checks and route-aware HTML-link checks, so the dedicated Apple
+credential document still uses full-page navigation. The React plugin retains deprecated-API
+checks through Oxlint's JavaScript plugin bridge; ESLint is not run as a fallback. JSX usage is
+handled by the native unused-variable rule, and React Compiler options use Oxlint's fixed defaults.
+The lint toolchain tests exercise these checks with synthetic valid and invalid sources.
+
 Run the CI-pinned Gitleaks version against the public history before pushing. For a checkout
 with local orchestration/checkpoint refs, scan `HEAD` and the public remote refs rather than
 those private refs: `gitleaks git . --log-opts='--remotes=origin HEAD' --redact=100 --no-banner`.
@@ -82,13 +91,12 @@ They use synthetic inputs and require no Apple or deployment secrets. Keep each 
 and resolve review conversations before merging. For contributor PRs, **Enable auto-merge** is
 an explicit choice. Merged head branches are deleted automatically.
 
-Dependabot groups weekly minor/patch npm updates into one PR and GitHub Actions updates into
-another. Its metadata-only workflow enables squash auto-merge for routine updates from this
-repository's Dependabot bot; all four protected-branch checks must pass against an up-to-date
-branch. Failed checks remain blocked. Major upgrades require manual review and are not opted into
-auto-merge. Keep the write-token workflow free of PR checkouts, installs or scripts from PR branches.
-Minor/patch npm security fixes use their own grouped PR and the same merge gates; they do not
-wait for the weekly version-update schedule. Major security upgrades still require manual review.
+Dependabot combines weekly npm and GitHub Actions version updates, including major upgrades,
+into one PR. Its workflow enables squash auto-merge for this repository's Dependabot PRs;
+all four protected-branch checks must pass against an up-to-date branch, and conversations must
+be resolved. Failed checks remain blocked. Keep the write-token workflow free of PR checkouts,
+installs or scripts from PR branches. Security fixes are grouped separately per ecosystem and
+use the same merge gates without waiting for the weekly version-update schedule.
 
 The acceptance runners and local launcher use the explicitly declared Miniflare 4 API and
 Undici dependencies. Keep Miniflare major upgrades in a reviewed migration rather than
