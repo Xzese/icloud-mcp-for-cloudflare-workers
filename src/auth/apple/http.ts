@@ -22,7 +22,7 @@ const signInSteps = new Map([
 ]);
 const token = z.string().max(16_384).refine(value => !/[\r\n\x00]/.test(value));
 const CookieSchema = z.object({ name: z.string().min(1).max(256).regex(/^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/), value: z.string().max(8192).refine(value => !/[\x00-\x20\x7f;,]/.test(value)), domain: z.string().max(253).regex(/^(?:[a-z0-9-]+\.)*(?:apple\.com|icloud\.com)$/), hostOnly: z.boolean(), path: z.string().max(4096).startsWith("/"), secure: z.boolean(), expiresAt: z.number().finite().nullable() }).strict();
-export const AuthSnapshotSchema = z.object({ clientId: z.string().min(1).max(100).regex(/^[A-Za-z0-9-]+$/), headers: z.record(z.enum(responseHeaders), token), cookies: z.array(CookieSchema).max(200) }).strict();
+export const AuthSnapshotSchema = z.object({ clientId: z.string().min(1).max(100).regex(/^[A-Za-z0-9-]+$/), headers: z.partialRecord(z.enum(responseHeaders), token), cookies: z.array(CookieSchema).max(200) }).strict();
 export type AuthSnapshot = z.infer<typeof AuthSnapshotSchema>;
 type AuthPath = "" | "/federate?isRememberMeEnabled=true" | "/signin/init" | "/signin/complete?isRememberMeEnabled=true" | "/2sv/trust" | "/verify/phone" | "/verify/phone/securitycode" | "/verify/trusteddevice/securitycode" | "/bridge/step/0" | "/bridge/step/2" | "/bridge/step/4" | "/bridge/step/6" | "/bridge/code/validate";
 type SetupPath = "/accountLogin" | "/validate" | "/requestWebAccessState" | "/enableDeviceConsentForPCS" | "/requestPCS";

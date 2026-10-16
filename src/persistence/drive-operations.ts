@@ -17,7 +17,7 @@ export interface DriveOperation {
 }
 export interface DriveOperationData { input: Record<string, unknown>; allocation?: unknown; receipt?: unknown; result?: unknown; itemId?: string; staging?: UploadStagingData; batch?: z.infer<typeof BatchState>; }
 const EnvelopeSchema = z.object({ version: z.literal(1), keyId: z.string(), iv: z.string(), ciphertext: z.string() }).strict();
-const DataSchema = z.object({ input: z.record(z.unknown()), allocation: z.unknown().optional(), receipt: z.unknown().optional(), result: z.unknown().optional(), itemId: z.string().optional(), staging: UploadStaging.optional(), batch: BatchState.optional() }).strict();
+const DataSchema = z.object({ input: z.record(z.string(), z.unknown()), allocation: z.unknown().optional(), receipt: z.unknown().optional(), result: z.unknown().optional(), itemId: z.string().optional(), staging: UploadStaging.optional(), batch: BatchState.optional() }).strict();
 const conflict = () => new AppError("CONFLICT", "The Drive operation changed or is already running. Inspect its operation ID before retrying.", 409);
 const canonicalOperationId = (value: string) => {
   const parsed = z.string().uuid().safeParse(value);

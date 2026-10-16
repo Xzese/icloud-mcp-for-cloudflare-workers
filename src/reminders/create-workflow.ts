@@ -48,9 +48,9 @@ const Version = ReminderTargetInput.shape.recordChangeTag;
 const RootReceipt = z.object({ id: ReminderTargetInput.shape.reminderId, listId: CreateReminderInput.shape.listId, recordChangeTag: Version }).strict();
 const Failure = z.enum(["CONFLICT", "UNSUPPORTED_FEATURE", "UPSTREAM_UNAVAILABLE", "WRITE_OUTCOME_UNKNOWN"]);
 const Stage = z.object({ stage: StageName, status: StageStatus, inputVersion: Version.nullable(),
-  outcome: z.record(z.unknown()).nullable(), failure: Failure.nullable() }).strict();
+  outcome: z.record(z.string(), z.unknown()).nullable(), failure: Failure.nullable() }).strict();
 const Payload = z.object({ request: CreateWorkflowInput, stages: z.array(Stage).min(1).max(4),
-  rootOutcome: z.record(z.unknown()).nullable(), version: Version.nullable() }).strict();
+  rootOutcome: z.record(z.string(), z.unknown()).nullable(), version: Version.nullable() }).strict();
 type PayloadData = z.infer<typeof Payload>;
 type StageData = z.infer<typeof Stage>;
 
