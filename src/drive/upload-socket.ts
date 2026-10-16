@@ -1,7 +1,9 @@
 import { AppError, publicError } from "../errors.ts";
 import type { DriveService } from "./service.ts";
 import type { RuntimeEnv } from "../platform/sites.ts";
-import { DRIVE_STREAM_CHUNK_BYTES, DRIVE_STREAM_PROTOCOL, DRIVE_STREAM_LEGACY_PROTOCOL, DRIVE_TRANSFER_TIMEOUT_MS } from "./limits.ts";
+import { DRIVE_STREAM_CHUNK_BYTES, DRIVE_STREAM_PROTOCOL, DRIVE_STREAM_LEGACY_PROTOCOL, DRIVE_TRANSFER_TIMEOUT_MS, DRIVE_RELAY_TIMEOUT_MS } from "./limits.ts";
+import { createRelayUpload, relayFrameSize } from "./relay-upload.ts";
+import { DRIVE_RELAY_PROTOCOL, DRIVE_RELAY_CHUNK_BYTES } from "./relay-state.ts";
 import type { TransferClaim } from "./transfer-capability.ts";
 
 // A control-only socket keeps final R2 delivery attached to a live request. No
@@ -42,14 +44,19 @@ export async function driveUploadSocket(request: Request, env: RuntimeEnv, servi
   if (request.method !== "GET" || request.headers.get("upgrade")?.toLowerCase() !== "websocket") throw new AppError("VALIDATION_ERROR", "A WebSocket upgrade is required.", 426);
   if ((!claim || request.headers.has("origin")) && request.headers.get("origin") !== env.APP_ORIGIN || request.headers.get("sec-fetch-site") === "cross-site") throw new AppError("FORBIDDEN", "Use this private Site's upload form or an authorized transfer client.", 403);
   const protocol = request.headers.get("sec-websocket-protocol");
-  const chunkBytes = protocol === DRIVE_STREAM_LEGACY_PROTOCOL ? 1024 * 1024 : DRIVE_STREAM_CHUNK_BYTES;
-  if (![DRIVE_STREAM_PROTOCOL, DRIVE_STREAM_LEGACY_PROTOCOL].includes(protocol ?? "") || new URL(request.url).search) throw new AppError("VALIDATION_ERROR", "Use the supported direct upload protocol.", 400);
+  const relayProtocol = protocol === DRIVE_RELAY_PROTOCOL;
+  const chunkBytes = relayProtocol ? DRIVE_RELAY_CHUNK_BYTES : protocol === DRIVE_STREAM_LEGACY_PROTOCOL ? 1024 * 1024 : DRIVE_STREAM_CHUNK_BYTES;
+  if (![DRIVE_RELAY_PROTOCOL, DRIVE_STREAM_PROTOCOL, DRIVE_STREAM_LEGACY_PROTOCOL].includes(protocol ?? "") || new URL(request.url).search) throw new AppError("VALIDATION_ERROR", "Use the supported direct upload protocol.", 400);
   const intent = await service.streamUploadStatus(operationId, claim);
+  if (relayProtocol !== (intent.protocol === DRIVE_RELAY_PROTOCOL)) throw new AppError("CONFLICT", "Use the protocol pinned to this upload intent.", 409);
   const [client, server] = Object.values(new WebSocketPair());
   const abort = new AbortController();
   let received = 0, credit = false, finished = false, closed = false;
-  const framed = new FixedLengthStream(intent.size);
-  const source = framed.readable;
+  let processing = Promise.resolve();
+  const relay = relayProtocol && intent.size ? createRelayUpload(intent.size) : null;
+  const framed = relay ? null : new FixedLengthStream(intent.size);
+  const source = relay?.stream ?? framed!.readable;
+  const closeInput = () => relay ? relay.close() : framed!.writable.close();
   let idle: ReturnType<typeof setTimeout> | undefined;
   const send = (message: object) => server.send(JSON.stringify({ ...message, operationId }));
   const stop = (reason: unknown) => {
@@ -57,7 +64,7 @@ export async function driveUploadSocket(request: Request, env: RuntimeEnv, servi
     closed = true; clearTimeout(idle); clearTimeout(lifetime);
     if (!finished) {
       abort.abort(reason);
-      void framed.writable.abort(reason).catch(() => {});
+      void (relay ? relay.cancel(reason) : framed!.writable.abort(reason)).catch(() => {});
     }
   };
   const fail = (error: unknown) => {
@@ -72,10 +79,10 @@ export async function driveUploadSocket(request: Request, env: RuntimeEnv, servi
     idle = setTimeout(() => fail(new AppError("CONFLICT", "The direct upload stopped receiving data. Inspect its original operation ID.", 409)), 60_000);
     send({ type: "pull", offset: received, bytes: Math.min(chunkBytes, intent.size - received) });
   };
-  const lifetime = setTimeout(() => fail(new AppError("AUTH_EXPIRED", "The direct upload exceeded its transfer budget. Inspect its operation.", 409)), DRIVE_TRANSFER_TIMEOUT_MS);
-  // Blob-backed messages can pipe through the runtime without materializing
-  // multi-megabyte ArrayBuffers in JS. Retain older runtime compatibility.
-  try { server.binaryType = "blob"; } catch { server.binaryType = "arraybuffer"; }
+  const lifetime = setTimeout(() => fail(new AppError("AUTH_EXPIRED", "The direct upload exceeded its transfer budget. Inspect its operation.", 409)), relayProtocol ? DRIVE_RELAY_TIMEOUT_MS : DRIVE_TRANSFER_TIMEOUT_MS);
+  // Relay frames go directly to fetch as ArrayBuffers. Older direct-stream
+  // protocols retain their Blob-backed native piping.
+  try { server.binaryType = relayProtocol ? "arraybuffer" : "blob"; } catch { server.binaryType = "arraybuffer"; }
   server.accept();
   server.addEventListener("close", event => {
     if (!closed && !finished) console.error({ event: "drive-upload-peer-closed", receivedBytes: received, expectedSize: intent.size, closeCode: event.code });
@@ -85,16 +92,30 @@ export async function driveUploadSocket(request: Request, env: RuntimeEnv, servi
   server.addEventListener("message", event => {
     void (async () => {
       if (closed) return;
-      const blob = event.data instanceof Blob ? event.data : event.data instanceof ArrayBuffer ? new Blob([event.data]) : null;
-      if (!credit || !blob || blob.size !== Math.min(chunkBytes, intent.size - received)) throw new AppError("VALIDATION_ERROR", "Send only the exact binary frame requested by the server.", 400);
+      const bytes = relayProtocol ? event.data instanceof Blob ? event.data : event.data instanceof ArrayBuffer ? new Uint8Array(event.data) : null : null;
+      const blob = relayProtocol ? null : event.data instanceof Blob ? event.data : event.data instanceof ArrayBuffer ? new Blob([event.data]) : null;
+      const length = bytes ? relayFrameSize(bytes) : blob?.size;
+      if (!credit || length === undefined || length !== Math.min(chunkBytes, intent.size - received)) throw new AppError("VALIDATION_ERROR", "Send only the exact binary frame requested by the server.", 400);
       credit = false; clearTimeout(idle);
-      received += blob.size;
-      await blob.stream().pipeTo(framed.writable, { preventClose: true, signal: abort.signal });
-      if (received === intent.size) await framed.writable.close();
-      else pull();
+      received += length;
+      const endOffset = received;
+      if (relay) {
+        // A single prefetched frame overlaps client upload with Apple delivery.
+        // Only the exact credited frame is admitted, and verifier/hash state and
+        // Apple writes stay serialized through this chain.
+        processing = processing.then(async () => {
+          await relay.write(bytes!, () => { if (endOffset < intent.size) pull(); });
+          if (endOffset === intent.size) await closeInput();
+        });
+        await processing;
+      } else {
+        await blob!.stream().pipeTo(framed!.writable, { preventClose: true, signal: abort.signal });
+        if (endOffset === intent.size) await closeInput();
+        else pull();
+      }
     })().catch(fail);
   });
-  if (intent.size === 0) void framed.writable.close().catch(fail);
+  if (intent.size === 0) void closeInput().catch(fail);
   void service.uploadStreamContent(operationId, source, abort.signal, claim, pull).then(result => {
     if (closed) return;
     send({ type: "result", operation: result });

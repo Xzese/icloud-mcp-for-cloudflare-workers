@@ -575,6 +575,23 @@ export class AppleSessionRepository {
     return row.permission_revision === permissionRevision && row.version === fence.version && row.transaction_id === null && ["READY", "DEVICE_APPROVAL_PENDING"].includes(row.state);
   }
 
+  // A short relay verifier must check both the account fence and the retained
+  // Apple write lease. One primary read avoids reloading/decrypting an unchanged
+  // session for every frame; a changed version still requires the full guard.
+  async driveRelayCurrent(fence: SessionFence, permissionRevision: number, operation: { id: string; inputHash: string; account: string; leaseId: string }) {
+    const now = Date.now();
+    const row = await this.db.prepare(`SELECT a.generation, a.version, a.state, a.transaction_id, s.revision AS permission_revision
+      FROM apple_session_state a LEFT JOIN owner_service_settings s ON s.owner_id = a.owner_id
+      INNER JOIN drive_operations d ON d.owner_id = a.owner_id
+      WHERE a.owner_id = ? AND a.account_id = ? AND d.operation_id = ? AND d.input_hash = ? AND d.account_scope = ?
+      AND d.generation = ? AND d.permission_revision = ? AND d.kind = 'relay-upload' AND d.phase = 'uploading'
+      AND d.lease_id = ? AND d.lease_until > ? AND d.expires_at > ?`)
+      .bind(this.owner, ACCOUNT, operation.id, operation.inputHash, operation.account, fence.generation, permissionRevision, operation.leaseId, now + 10_000, now + 10_000)
+      .first<{ generation: number; version: number; state: string; transaction_id: string | null; permission_revision: number | null }>();
+    if (!row || row.generation !== fence.generation) throw new AppError("CONFLICT", "The relay's account or original upload lease changed.", 409);
+    return row.permission_revision === permissionRevision && row.version === fence.version && row.transaction_id === null && ["READY", "DEVICE_APPROVAL_PENDING"].includes(row.state);
+  }
+
   async claimRenewal(expectedGeneration: number, expectedVersion: number) {
     const saved = await this.load();
     return saved.state === "READY" ? this.claimRead(expectedGeneration, expectedVersion) : this.claimResume(expectedGeneration, expectedVersion);

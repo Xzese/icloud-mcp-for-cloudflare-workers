@@ -1,3 +1,4 @@
+import { DRIVE_RELAY_ACTION } from "../drive/relay-state.ts";
 import { AppError, publicError } from "../errors.ts";
 import { requireOwner, requireSameOrigin, type RuntimeEnv } from "../platform/sites.ts";
 import { handleMCP } from "../mcp/handler.ts";
@@ -32,6 +33,7 @@ export async function applicationRoute(request: Request, env: RuntimeEnv, creden
     if (transfer) {
       const claim = await authorizeDriveTransfer(request, env, transfer);
       const service = new DriveService(env, claim.owner);
+      if (request.headers.get("x-drive-transfer-action") === DRIVE_RELAY_ACTION) return await service.verifyRelayChunk(request, claim);
       if (transfer.kind === "staged-upload") return request.headers.get("upgrade")?.toLowerCase() === "websocket"
         ? await driveStoredUploadSocket(request, service, claim) : json(await service.resumableTransfer(request, claim));
       if (transfer.kind === "upload" && request.headers.get("x-drive-transfer-action") === "diagnose") {

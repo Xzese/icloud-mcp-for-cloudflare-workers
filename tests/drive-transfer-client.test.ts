@@ -20,10 +20,10 @@ test("transfer clients accept the configured maximum and reject one byte above t
   }
 });
 
-for (const protocol of ["icloud-drive-upload-v1", "icloud-drive-upload-v2"]) test(`transfer client uses ${protocol} credits, verifies disk bytes, and never reconnects after loss`, async t => {
+for (const protocol of ["icloud-drive-upload-v1", "icloud-drive-upload-v2", "icloud-drive-upload-v3"]) test(`transfer client uses ${protocol} credits, verifies disk bytes, and never reconnects after loss`, async t => {
   const directory = await mkdtemp(join(tmpdir(), "drive-transfer-client-"));
   t.after(() => rm(directory, { recursive: true, force: true }));
-  const path = join(directory, "synthetic.bin"), bytes = Buffer.alloc(2 * (protocol.endsWith("v2") ? 8 : 1) * 1024 ** 2 + 17, 90);
+  const path = join(directory, "synthetic.bin"), bytes = Buffer.alloc(2 * (protocol.endsWith("v3") ? 16 : protocol.endsWith("v2") ? 8 : 1) * 1024 ** 2 + 17, 90);
   await writeFile(path, bytes);
   const metadata = await fileMetadata(path), id = crypto.randomUUID(), token = Buffer.from(crypto.randomUUID()).toString("base64");
   const server = createServer(), websocket = new WebSocketServer({ server });
@@ -31,7 +31,7 @@ for (const protocol of ["icloud-drive-upload-v1", "icloud-drive-upload-v2"]) tes
   websocket.on("connection", (socket: any, request: any) => {
     connections++; assert.equal(request.headers.authorization, `Bearer ${token}`);
     let offset = 0; const hash = createHash("sha256");
-    const pull = () => socket.send(JSON.stringify({ type: "pull", operationId: id, offset, bytes: Math.min((protocol.endsWith("v2") ? 8 : 1) * 1024 ** 2, bytes.length - offset) }));
+    const pull = () => socket.send(JSON.stringify({ type: "pull", operationId: id, offset, bytes: Math.min((protocol.endsWith("v3") ? 16 : protocol.endsWith("v2") ? 8 : 1) * 1024 ** 2, bytes.length - offset) }));
     socket.on("message", (chunk: Buffer) => {
       if (dropped) { socket.terminate(); return; }
       hash.update(chunk); offset += chunk.length;

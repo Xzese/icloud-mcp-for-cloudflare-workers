@@ -1,8 +1,9 @@
+import { relayUploadProof } from "../drive/relay-upload.ts";
 import { storedUploadProof } from "../drive/stored-upload.ts";
 import { retainVerifiedUploadBody } from "./drive-upload-socket.ts";
 import { AppError } from "../errors.ts";
 import type { AppleHTTP } from "./apple-http.ts";
-import { DRIVE_FILE_BYTES, DRIVE_TRANSFER_TIMEOUT_MS } from "../drive/limits.ts";
+import { DRIVE_FILE_BYTES, DRIVE_TRANSFER_TIMEOUT_MS, DRIVE_RELAY_TIMEOUT_MS } from "../drive/limits.ts";
 export { DRIVE_TRANSFER_TIMEOUT_MS } from "../drive/limits.ts";
 
 export const DRIVE_MAX_METADATA_BYTES = 1_048_576;
@@ -54,9 +55,9 @@ export function driveContentURL(value: unknown, kind: "download" | "upload", dsi
   return url;
 }
 
-function timeoutSignal(signal?: AbortSignal): { signal: AbortSignal; dispose: () => void } {
+function timeoutSignal(signal?: AbortSignal, timeoutMs = DRIVE_TRANSFER_TIMEOUT_MS): { signal: AbortSignal; dispose: () => void } {
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(new DOMException("Transfer timed out", "TimeoutError")), DRIVE_TRANSFER_TIMEOUT_MS);
+  const timer = setTimeout(() => controller.abort(new DOMException("Transfer timed out", "TimeoutError")), timeoutMs);
   const cancel = () => controller.abort(signal?.reason);
   if (signal?.aborted) cancel();
   else signal?.addEventListener("abort", cancel, { once: true });
@@ -266,7 +267,7 @@ export class DriveHTTP {
     let total = 0, complete = false;
     let sourceFailure: unknown;
     let stopped: { reason: unknown } | undefined, cancellation: Promise<void> | undefined;
-    const stored = storedUploadProof(body);
+    const stored = storedUploadProof(body) ?? relayUploadProof(body);
     if (stored && stored.size !== expectedSize) throw new AppError("CONFLICT", "The verified stored file length changed.", 409);
     const reader = stored ? undefined : body.getReader();
     const isComplete = () => stored?.complete() ?? complete;
@@ -314,7 +315,7 @@ export class DriveHTTP {
       },
       cancel: stop,
     });
-    const budget = timeoutSignal(signal);
+    const budget = timeoutSignal(signal, relayUploadProof(body) ? DRIVE_RELAY_TIMEOUT_MS : DRIVE_TRANSFER_TIMEOUT_MS);
     // Apple's current web client posts the native File bytes, without multipart
     // form framing. Workers needs FixedLengthStream to preserve Content-Length
     // on streaming fetch bodies without buffering the file.

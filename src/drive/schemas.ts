@@ -3,7 +3,7 @@ import { INLINE_FILE_BYTES, TEXT_PREVIEW_BYTES, DRIVE_FILE_BYTES, DRIVE_FILE_LIM
 import { SharedContextId } from "./shared.ts";
 export { INLINE_FILE_BYTES, TEXT_PREVIEW_BYTES, INLINE_REQUEST_BYTES, DRIVE_FILE_BYTES } from "./limits.ts";
 
-export const INLINE_UPLOAD_GUIDANCE = `Inline uploads allow at most 64 KiB of file bytes. For files up to ${DRIVE_FILE_LIMIT_LABEL}, omit contentBase64 (or pass an empty string for a nonempty file) to authorize a byte transfer and receive its short-lived URL and headers. Stream bytes to that endpoint without another browser sign-in. The dashboard Upload remains available up to 4 GiB; larger uploads require the resumable MCP transfer.`;
+export const INLINE_UPLOAD_GUIDANCE = `Inline uploads allow at most 64 KiB of file bytes. For files up to ${DRIVE_FILE_LIMIT_LABEL}, omit contentBase64 (or pass an empty string for a nonempty file) to authorize a byte transfer and receive its short-lived URL and headers. Stream bytes to that endpoint without another browser sign-in. The dashboard Upload remains available up to 4 GiB; larger uploads require the MCP transfer.`;
 export const OwnedDriveId = z.string().max(512).regex(/^(?:FOLDER|FILE)::com\.apple\.CloudDocs::[A-Za-z0-9._-]{1,256}$/)
   .describe("Exact owned item ID returned by Drive listing; never a local path or URL.");
 export const DriveId = z.string().max(512).regex(/^(?:(?:FOLDER|FILE)(?:_IN_SHARED_FOLDER)?|SHARED_FOLDER)::com\.apple\.CloudDocs::[A-Za-z0-9._-]{1,256}$/)
@@ -49,6 +49,6 @@ export const UploadDrive = UploadDriveMetadata.extend({
   contentBase64: z.string().max(Math.ceil(INLINE_FILE_BYTES / 3) * 4, INLINE_UPLOAD_GUIDANCE).optional()
     .describe("Inline bytes up to 64 KiB. Omit, or pass an empty string for a nonempty file, to prepare a capability-authorized streaming transfer instead."),
 });
-export const PrepareDriveUpload = UploadDriveMetadata.extend({ resumable: z.boolean().optional().describe("Use private R2 staging and durable per-part verification to resume across client sessions. Required above the direct-stream limit; no extra sign-in.") });
+export const PrepareDriveUpload = UploadDriveMetadata.extend({ resumable: z.boolean().optional().describe("Use private R2 staging and durable per-part verification to resume across client sessions. Optional for nonempty files; the default verified WebSocket relay needs no R2 and cannot resume interrupted bytes. No extra sign-in.") });
 export const GetDriveOperation = z.object({ ...common, operationId: OperationId }).strict();
 export const DriveConsent = z.object({ expectedGeneration: z.number().int().nonnegative().safe(), restartApproval: z.boolean().optional() }).strict();

@@ -3,7 +3,7 @@ import { AppError } from "../errors.ts";
 import { configuredEnvelopes } from "./apple-sessions.ts";
 import { fingerprint } from "../lib/canonical.ts";
 import type { RuntimeEnv } from "../platform/sites.ts";
-import { DRIVE_UPLOAD_LEASE_MS } from "../drive/limits.ts";
+import { DRIVE_UPLOAD_LEASE_MS, DRIVE_RELAY_LEASE_MS } from "../drive/limits.ts";
 import { DriveSharedContext } from "../drive/shared.ts";
 import { UploadStaging, type UploadStagingData } from "../drive/staging.ts";
 import { BatchState } from "../drive/batch.ts";
@@ -88,8 +88,9 @@ export class DriveOperationRepository {
   async claim(row: DriveOperation, scope: DriveScope, leaseMs?: number) {
     if (row.permission_revision !== scope.permissionRevision) throw new AppError("CONFLICT", "Service settings changed after this operation began. Inspect the retained operation; do not replay it.", 409);
     const now = Date.now(), lease = crypto.randomUUID();
-    const duration = leaseMs ?? (["upload", "stream-upload", "resumable-upload", "bulk-upload"].includes(row.kind) ? DRIVE_UPLOAD_LEASE_MS : 150_000);
-    if (!Number.isSafeInteger(duration) || duration < 10_000 || duration > DRIVE_UPLOAD_LEASE_MS) throw conflict();
+    const maximum = row.kind === "relay-upload" ? DRIVE_RELAY_LEASE_MS : DRIVE_UPLOAD_LEASE_MS;
+    const duration = leaseMs ?? (row.kind === "relay-upload" ? maximum : ["upload", "stream-upload", "relay-upload", "resumable-upload", "bulk-upload"].includes(row.kind) ? DRIVE_UPLOAD_LEASE_MS : 150_000);
+    if (!Number.isSafeInteger(duration) || duration < 10_000 || duration > maximum) throw conflict();
     const next = await this.db.prepare("UPDATE drive_operations SET lease_id = ?, lease_until = ?, revision = revision + 1 WHERE owner_id = ? AND operation_id = ? AND revision = ? AND lease_until <= ? AND expires_at > ? RETURNING *")
       .bind(lease, Math.min(now + duration, row.expires_at), this.owner, row.operation_id, row.revision, now, now).first<DriveOperation>();
     if (!next) throw conflict();

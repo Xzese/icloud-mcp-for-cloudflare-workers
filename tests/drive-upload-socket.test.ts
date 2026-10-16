@@ -8,11 +8,11 @@ import { uploadDriveSocket, parseUploadSocketResponse, retainVerifiedUploadBody 
 
 const encode = (value: string) => new TextEncoder().encode(value);
 const url = new URL("https://cws.icloud-content.com/123/singleFileUpload?tk=synthetic");
-function socketFor(reply: string, inspect?: (bytes: Uint8Array) => void) {
+function socketFor(reply: string, inspect?: (bytes: Uint8Array) => void, keepOpen = false) {
   let controller: ReadableStreamDefaultController<Uint8Array>, closed = false;
   const readable = new ReadableStream<Uint8Array>({ start(value) { controller = value; } });
   return { readable, writable: new WritableStream<Uint8Array>({ write(bytes) { inspect?.(bytes); } }), opened: Promise.resolve({}), closed: Promise.resolve(),
-    respond() { if (!closed) { closed = true; controller.enqueue(encode(reply)); controller.close(); } },
+    respond() { if (!closed) { controller.enqueue(encode(reply)); if (!keepOpen) { closed = true; controller.close(); } } },
     close: async () => { if (!closed) { closed = true; controller.close(); } },
   };
 }
@@ -94,4 +94,27 @@ test("socket uploads refuse arbitrary origins, account headers, redirects and ma
   for (const [target, extra] of [[new URL('https://attacker.example/123/singleFileUpload?tk=synthetic'), {}], [url, { cookie: 'synthetic' }], [url, { 'content-length': '2147483648junk' }], [url, { 'content-length': String(DRIVE_FILE_BYTES + 1) }]] as const) {
     await assert.rejects(uploadDriveSocket(target, { method: 'POST', redirect: 'manual', body: new ReadableStream(), headers: { 'content-length': '10', 'content-type': 'application/octet-stream', ...extra } }, () => { assert.fail('Invalid requests must not open a socket'); }), { code: 'PROTOCOL_CHANGED' });
   }
+});
+
+
+test("complete framed Apple receipts finish without waiting for TCP EOF", async () => {
+  for (const reply of [
+    'HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}',
+    'HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\n{}\r\n0\r\nX-Receipt: complete\r\n\r\n',
+  ]) {
+    const bytes = encode(reply);
+    for (let end = 0; end < bytes.length; end++) assert.equal(parseUploadSocketResponse(bytes.subarray(0, end), false), null);
+    assert.equal(await parseUploadSocketResponse(bytes, false)!.text(), '{}');
+    let header = false;
+    const socket = socketFor(reply, () => {
+      if (!header) { header = true; return; }
+      queueMicrotask(() => socket.respond());
+    }, true);
+    const source = new ReadableStream<Uint8Array>({ start(controller) { controller.enqueue(encode('abc')); controller.close(); } });
+    const response = await uploadDriveSocket(url, { method: 'POST', redirect: 'manual', headers: { 'content-length': '3', 'content-type': 'application/octet-stream' }, body: source, signal: AbortSignal.timeout(1000) }, () => socket as unknown as Socket);
+    assert.equal(await response.text(), '{}');
+  }
+  const unframed = encode('HTTP/1.1 200 OK\r\n\r\n{}');
+  assert.equal(parseUploadSocketResponse(unframed, false), null);
+  assert.equal(await parseUploadSocketResponse(unframed).text(), '{}');
 });

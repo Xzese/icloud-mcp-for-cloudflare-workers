@@ -16,6 +16,8 @@ import { DRIVE_FILE_BYTES, DRIVE_TRANSFER_BLOCK_BYTES } from "../src/drive/limit
 import { DriveBucket } from "./helpers/drive-bucket.ts";
 import { authorizeDriveTransfer, driveTransferRoute, DriveTransferPlan } from "../src/drive/transfer-capability.ts";
 import { UploadDriveMetadata } from "../src/drive/schemas.ts";
+import { relayAuthorization } from "../src/drive/transfer-capability.ts";
+import { initialRelayState, sealRelayState, openRelayState } from "../src/drive/relay-state.ts";
 import { applicationRoute } from "../src/api/router.ts";
 
 function syntheticDownloadURL() {
@@ -1281,4 +1283,50 @@ test("bulk Drive recovers a confirmed child receipt after coordinator death with
   const state = await f.service.continueUploadBatch({ jobId: f.request.jobId, expectedGeneration: f.generation });
   assert.equal(state.counts.confirmed, 1); assert.equal(state.counts.pending, 2);
   assert.deepEqual(f.counts, before);
+});
+
+
+test("relay verification requires the original active lease, checksum, generation and permission fence", async t => {
+  const f = await fixture(t, () => json([{ ...root, items: [], directChildrenCount: 0 }]));
+  const input = UploadDriveMetadata.parse(Object.fromEntries(Object.entries(await uploadInput("relay.txt")).filter(([key]) => key !== "contentBase64")));
+  const prepared = await f.service.prepareTransferUpload(input);
+  assert.ok("transfer" in prepared && prepared.transfer);
+  const plan = DriveTransferPlan.parse(prepared.transfer);
+  assert.equal(plan.protocol, "icloud-drive-upload-v3");
+  const url = plan.url.replace("wss:", "https:"), route = driveTransferRoute(new URL(url).pathname)!;
+  const claim = await authorizeDriveTransfer(new Request(url, { headers: plan.headers }), f.env, route);
+  const repo = new DriveOperationRepository(f.env, owner);
+  let row = await repo.claim(await repo.get(input.operationId, claim.scope), claim.scope);
+  row = await repo.checkpoint(row, "uploading", await repo.data(row));
+  const version = (await f.sessions.load()).fence.version;
+  const authority = { owner, operationId: row.operation_id, inputHash: row.input_hash, scope: claim.scope, leaseId: row.lease_id!, leaseUntil: row.lease_until, size: input.size, sha256: input.sha256 };
+  const token = await sealRelayState(f.env, authority, initialRelayState(authority, version));
+  const request = (body = "abc", checkpoint = token) => new Request(url, { method: "POST", headers: { ...plan.headers, "content-type": "application/octet-stream", "content-length": "3", "x-drive-transfer-action": "verify-relay-chunk", Authorization: relayAuthorization(plan.headers.Authorization, checkpoint) }, body });
+  // A slow relay must keep its outer capability, internal verifier and dispatch
+  // lease valid after the legacy 30-minute deadline, without renewing intent.
+  const clock = Date.now, began = clock();
+  let result: Response;
+  try {
+    Date.now = () => began + 31 * 60_000;
+    const currentClaim = await authorizeDriveTransfer(request(), f.env, route);
+    result = await f.service.verifyRelayChunk(request(), currentClaim);
+  } finally { Date.now = clock; }
+  assert.equal(await result.text(), "abc");
+  const completed = await openRelayState(f.env, authority, result.headers.get("x-drive-relay-state"));
+  assert.equal(completed.complete, true); assert.equal(completed.offset, 3);
+  await assert.rejects(f.service.verifyRelayChunk(request("bad"), claim), { code: "VALIDATION_ERROR" });
+  await assert.rejects(f.service.verifyRelayChunk(request("abc", "guessed"), claim), { code: "FORBIDDEN" });
+  await assert.rejects(f.service.verifyRelayChunk(request("abc", result.headers.get("x-drive-relay-state")!), claim), { code: "CONFLICT" });
+  f.db.sqlite.prepare("UPDATE drive_operations SET lease_id = ? WHERE operation_id = ?").run(crypto.randomUUID(), row.operation_id);
+  await assert.rejects(f.service.verifyRelayChunk(request(), claim), { code: "CONFLICT" });
+  f.db.sqlite.prepare("UPDATE drive_operations SET lease_id = ? WHERE operation_id = ?").run(row.lease_id, row.operation_id);
+  const settings = await f.settings.load();
+  const revokedBody = new ReadableStream({ async pull(controller) {
+    await f.settings.save({ expectedRevision: settings.revision, settings: { ...settings.settings, drive: { ...settings.settings.drive, upload: false } } });
+    controller.enqueue(new TextEncoder().encode("abc")); controller.close();
+  } }, { highWaterMark: 0 });
+  await assert.rejects(f.service.verifyRelayChunk(new Request(url, { method: "POST", headers: request().headers, body: revokedBody, duplex: "half" } as RequestInit), claim), { code: "FORBIDDEN" });
+  await assert.rejects(f.service.verifyRelayChunk(request(), claim), { code: "FORBIDDEN" });
+  await f.sessions.begin(f.generation);
+  await assert.rejects(f.service.verifyRelayChunk(request(), claim), { code: "CONFLICT" });
 });

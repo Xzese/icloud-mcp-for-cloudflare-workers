@@ -237,10 +237,53 @@ content downloads and `docws` fallback remain covered by synthetic tests rather 
 
 ## File transfer limits and client support
 
+### Verified relay without R2
+
+The default metadata-only MCP upload prepares a distinct `relay-upload` intent and returns
+`icloud-drive-upload-v3`. The CLI follows exact server credits of at most 16 MiB. Each frame
+travels to a short authenticated request on the same Worker origin. That verifier checks the
+original operation lease, account generation and permission revision, advances the server-owned
+SHA-256 checkpoint, checks authorization again, and returns the same bytes. The last verifier
+must match the original full-file SHA-256 before its bytes can reach Apple.
+
+The coordinator checks the response's framing and encrypted next checkpoint, then pipes the
+native response stream into the existing fixed-length Apple TLS upload. It can prefetch one
+next client frame while the previous verified frame drains, but hash advancement and Apple
+writes stay ordered. The full file is never accumulated in memory or stored in R2/D1. The
+operation ledger retains the original intent and final receipt; an interrupted dispatched
+upload remains uncertain and must not be retried under a fresh key.
+
+Checkpoint envelopes bind the owner, account, generation, permission revision, operation ID,
+input fingerprint, lease, expiry, file size/hash, nonce and next byte offset. Internal request
+credentials use the standard authorization header so request logs mask them. The ordinary MCP
+capability alone cannot invoke a verifier without the separate server-issued checkpoint.
+Redirects, inconsistent checkpoints, truncated framing and checksum failures stop delivery.
+
+The `global_fetch_strictly_public` compatibility flag routes verifier requests back through the
+public front door. Each receives its own CPU budget; this does not preserve the coordinator's
+TCP connection across a crash, deployment or client disconnect. The relay has a bounded
+45-minute capability and transfer budget, including Apple's final acknowledgment. At 10 GiB, the coordinator makes 640 sequential verifier requests,
+with two primary D1 fence reads per verifier in the unchanged-session case. Revalidation adds
+reads only when the session changes. One Apple socket and one verifier request are active at
+once; client prefetch is limited to one extra frame. These counts follow the implementation;
+recorded hosted CPU and wall-time measurements are separate below.
+
+Standalone deployments need a plan that supports this subrequest/CPU workload and an ingress
+configuration that admits the capability route. The Free plan's 50 external subrequests cannot
+cover 640 verifier requests. D1's per-invocation query limit applies separately to the short
+verifiers. See [Worker limits](https://developers.cloudflare.com/workers/platform/limits/),
+[D1 limits](https://developers.cloudflare.com/d1/platform/limits/) and
+[public self-fetch routing](https://developers.cloudflare.com/workers/configuration/compatibility-flags/#global-fetch-strictly-public).
+
+Local Sites and standalone bundles passed complete 10 GiB upload/download SHA-256 checks with
+no R2 binding. A full hosted relay round trip also passed, with the resource qualifications
+recorded below. Retained v1/v2 and staged intents keep their original transport and cannot
+silently switch to this relay.
+
 ### Resuming an upload across client sessions
 
-`prepare_icloud_drive_upload` automatically chooses private R2 staging above 4 GiB.
-For smaller nonempty files, `resumable: true` selects the same path instead of a direct byte stream. Preserve that flag, the operation UUID and every original
+`prepare_icloud_drive_upload` uses the no-R2 relay by default. For nonempty files,
+`resumable: true` selects private R2 staging instead. Preserve that flag, the operation UUID and every original
 metadata field when preparing the same intent again. An operation cannot change transports.
 No Apple allocation or file write happens while its phase remains `prepared`.
 
@@ -291,7 +334,7 @@ and R2 data do not make an uncertain Apple write replayable. The operation expir
 | --- | --- | --- |
 | MCP inline read/upload | 64 KiB of decoded file bytes | UTF-8/base64 response or base64 upload input |
 | MCP-authorized resumable upload | 10 GiB | Metadata through MCP, private 8 MiB R2 parts, then a control WebSocket for final delivery; no second login |
-| MCP-authorized direct upload | 4 GiB | Default for smaller files; capability-authenticated WebSocket bytes without R2 |
+| MCP-authorized relay upload | 10 GiB | Default; capability-authenticated 16 MiB WebSocket frames, separate verification requests, no R2 |
 | Text preview | Up to 8 KiB of leading UTF-8 bytes | Set `previewBytes` on the read tool/HTTP route; file must be within 10 GiB |
 | Direct HTTP upload | 64 MiB | Prepare metadata, then stream binary bytes |
 | Dashboard/multipart upload | 4 GiB | Stage 8 MiB parts in private R2, then stream to Apple |
@@ -303,7 +346,7 @@ MCP is the authenticated control endpoint for both transfer directions. Upload m
 intent without sending file bytes to Apple. The returned `transfer` supplies its absolute endpoint,
 protocol, required headers, size, checksum and expiry. Follow that protocol: resumable plans use
 ordered HTTP parts and a completion WebSocket; direct plans use server-credited binary WebSocket
-frames of at most 8 MiB. Both read bytes from disk/network outside the conversation, without a browser
+frames of at most 16 MiB for v3 (8 MiB for retained v2 intents). Both read bytes from disk/network outside the conversation, without a browser
 session or another sign-in. Only staged parts can resume. Inspect the original operation through
 MCP and never automatically mint a replacement operation for an uncertain Apple write.
 
@@ -375,8 +418,9 @@ requests direct clients to a metadata-only MCP transfer, dashboard Upload or the
 
 Uploads require exact byte size and lowercase SHA-256. The server verifies both before
 finalizing the new file. Single-file bodies are never persisted in D1. Bounded small-file job manifests retain
-up to 32 KiB of encrypted content until receipt expiry. Transfers have a 30-minute
-budget; the exclusive Apple upload lease lasts 31 minutes, capped by the saved session.
+up to 32 KiB of encrypted content until receipt expiry. The no-R2 relay has a 45-minute
+budget and a 46-minute exclusive upload lease. Other upload transports retain their
+30-minute budget and 31-minute lease. Every lease is capped by the saved session.
 The browser hashes files incrementally and never loads a complete large file into memory.
 Downloads are streamed attachments with exact Workers fixed-length framing, no caching,
 and no forwarded Apple credentials, signed URLs or private receipt fields.
@@ -418,9 +462,9 @@ Run `DRIVE_LARGE_TEST_TRANSPORT=stream npm run test:drive:large` after building 
 for the 4 GiB direct-stream boundary journey without an R2 binding. Standard Worker journeys
 also cover malformed frames, disconnects and full-file checksum failures without unsafe replay.
 
-MCP resumable transfers and private downloads have a 10 GiB application ceiling. Direct
-streams and the existing browser multipart flow retain their separately verified 4 GiB ceiling.
-Both targets use the same R2 `BUCKET` binding. Sites provisions it from the logical
+MCP relay/resumable transfers and private downloads have a 10 GiB application ceiling.
+The older browser direct-stream route and browser multipart flow retain their 4 GiB ceiling.
+Optional staging on both targets uses the same R2 `BUCKET` binding. Sites provisions it from the logical
 `r2: "BUCKET"` manifest entry. For standalone Workers, create a private R2 bucket and replace
 `bucket_name` in ignored `wrangler.production.toml`; the generator retains this binding.
 Existing metadata, downloads and direct uploads still work without R2. Multipart preparation
@@ -488,8 +532,9 @@ References: [Workers limits](https://developers.cloudflare.com/workers/platform/
 
 Run `npm run test:drive:large` after building either target to exercise the complete **10 GiB**
 resumable MCP boundary through real local workerd D1/R2 bindings and a local HTTP synthetic
-Apple endpoint. Explicit `DRIVE_LARGE_TEST_TRANSPORT=stream` or `multipart` selects the
-separate **4 GiB** boundary. Set `TMPDIR` to a private directory on a disk with enough room
+Apple endpoint. `DRIVE_LARGE_TEST_TRANSPORT=stream DRIVE_LARGE_TEST_CAPABILITY=1`
+exercises the separate **10 GiB no-R2 relay**. Explicit `stream` without capabilities or
+`multipart` selects the dashboard's **4 GiB** boundary. Set `TMPDIR` to a private directory on a disk with enough room
 for multipart and completed staging objects; a small RAM-backed `/tmp` can fill during this test.
 The fixture generates, streams and hashes bytes incrementally, verifies the complete
 upload/download SHA-256, checks final-byte ranges, safe part replay, durable resume, confirmed
@@ -751,7 +796,8 @@ validated framing while stripping account cookies and authorization headers.
 
 Add `DRIVE_LARGE_TEST_DELAY_MS=1500` to pause the synthetic receiver after each 32 MiB,
 exercising backpressure and a transfer longer than the previous live failure. The payload
-defaults to 10 GiB for the resumable transport and 4 GiB for direct stream or legacy multipart,
+defaults to 10 GiB for resumable transport or MCP-authorized relay (`DRIVE_LARGE_TEST_CAPABILITY=1`),
+and 4 GiB for the browser direct stream or legacy multipart,
 unless `DRIVE_LARGE_TEST_BYTES` is explicitly set. Use
 `DRIVE_LARGE_TEST_FAULT=reject` or `early-success` for a peer returning 413 or a premature
 200; the upload must remain uncertain, perform no document commit, and refuse a second
@@ -763,8 +809,8 @@ host. This avoids the hosted HTTP fetch path that returned a Cloudflare 413 duri
 live 2 GiB test. TLS certificate verification stays enabled. The sender accepts only Apple
 content-upload hosts and paths, sends no account cookies, bounds and validates the receipt's
 HTTP framing, and never retries or switches transport after dispatch. Account/settings
-checks and full SHA-256 verification still run on the same streamed bytes. Workers uses
-its native `crypto.DigestStream` for incremental hashing; JavaScript hashing exceeded the
+checks and full SHA-256 verification still run on the same streamed bytes. Legacy v1/v2
+streams use native `crypto.DigestStream` for incremental hashing; JavaScript hashing exceeded the
 hosted 32-second CPU budget during a live transfer near 1 GiB. A portable incremental
 fallback remains for runtimes without DigestStream. Native BYOB bulk reads avoid JavaScript
 work per small CDN chunk. Version-two WebSocket credits use 8 MiB frames; version-one
@@ -774,7 +820,8 @@ interrupted a live download. Incoming WebSocket Blob frames pipe into a native f
 stream, and the verified outgoing stream pipes directly to the TLS socket. This avoids
 materializing those network bytes in JavaScript a second time. The sender still withholds
 the final file chunk until exact EOF and the full digest pass. R2 completion uses this
-same sender.
+same sender. The v3 relay instead distributes full-file hash checkpoints across the short
+verifier requests described above and keeps the coordinator's Apple byte pipe native.
 
 `DRIVE_UPLOAD_TRANSPORT=fetch` explicitly selects the ordinary fetch transport for a runtime
 whose egress accepts the full file size. The synthetic Worker harness uses this setting to
@@ -989,7 +1036,80 @@ the encrypted operation ledger; private diagnostic evidence contains no bearer v
 
 The temporary tools were removed and the verified production version restored. No 10 GiB
 client-to-Apple upload was attempted or advertised. Resumable 10 GiB uploads retain R2;
-downloads and the existing direct Worker relay up to 4 GiB do not require it. Further direct
+downloads and the verified Worker relay do not require it. Further direct client-to-Apple
 upload work needs a verified Apple receipt/readback protocol, or a separately designed
 temporary-iCloud-file, full-readback and promotion workflow with explicit recovery,
 revocation, collision and cleanup semantics. The latter is not implemented or validated.
+
+### No-R2 relay acceptance (2026-10-16)
+
+The first full hosted relay test uploaded a real, fully allocated 10 GiB disk file through
+MCP authorization and the capability CLI. Apple confirmed its exact size and identity.
+A complete download matched the source SHA-256 and a separate byte-for-byte comparison.
+Replaying the original confirmed intent returned its saved receipt with zero bytes sent.
+An earlier 64 MiB plus 17-byte live canary also passed a full matching download.
+
+| First live 10 GiB relay measurement | Result |
+| --- | --- |
+| Upload coordinator CPU / wall time | 30,563 ms / 1,681,830 ms |
+| Upload client elapsed / peak RSS | 1,689.016 seconds / 236,424 KiB |
+| Download Worker CPU / wall time | 17,511 ms / 235,500 ms |
+| Download client elapsed / peak RSS | 235.934 seconds / 157,312 KiB |
+| Verifier CPU observed in retained logs | 524 sampled requests; maximum 634 ms |
+
+The protocol required 640 verifier requests; the sampled log count is not the complete
+request count. The platform labeled the closed upload and download invocations `canceled`,
+while the durable confirmed receipt and complete matching bytes independently established
+success. Hosted heap and billed D1 totals were not exposed; client RSS is not Worker memory.
+
+This first candidate used Blob frames. Its upload CPU was only 1,437 ms below the previously
+observed 32,000 ms ceiling, leaving insufficient comfortable production headroom. A paired
+1 GiB hosted diagnostic then measured 15,412 ms for ArrayBuffer frames versus 22,680 ms for
+Blob frames. Both diagnostics used the same native digest sink, verified every byte and made
+zero Apple writes. The sink contributes CPU, so those absolute numbers cannot predict a real
+Apple upload. The subsequent ArrayBuffer candidate received the separate full live acceptance
+recorded below.
+
+The subsequent ArrayBuffer live test sent all 10 GiB in 1,666.417 seconds but reached the
+client's 1,800-second deadline before confirmation. Its retained operation is `unknown` and
+was not replayed. Client elapsed time was 1,806.283 seconds including local hashing, with
+243,048 KiB peak RSS. This exposed insufficient wall-time margin in the original 30-minute
+relay budget. The candidate now uses 45 minutes consistently for relay capabilities, leases,
+client and Apple transport; older protocols retain 30 minutes. The fixed candidate subsequently
+passed the independent full live acceptance below.
+
+The socket receipt reader now recognizes complete `Content-Length` and chunked HTTP
+responses before TCP EOF, following [HTTP/1.1 message framing](https://www.rfc-editor.org/rfc/rfc9112.html#section-6.3).
+Close-delimited responses still require EOF. Regression coverage holds the peer socket open
+after a complete receipt, checks every fragmented prefix, and retains ambiguous/truncated
+framing and early-success rejection. The previous reader's unconditional EOF wait is a
+confirmed implementation issue; available live logs do not establish that it caused the
+timed-out 10 GiB attempt. A separate live 64 MiB plus 33-byte canary passed full upload and
+matching download after this change, using 641 ms upload CPU and 36,168 ms wall time.
+
+
+The final candidate uploaded a separately generated, fully allocated 10 GiB random file and
+received Apple's confirmed exact item identity and size. A fresh full download matched its
+SHA-256, and an independent byte-for-byte disk comparison passed. Neither direction used R2.
+The timed-out operation retained its original key and unknown status; it was not replayed.
+
+| Final live 10 GiB no-R2 measurement | Result |
+| --- | --- |
+| Upload coordinator CPU / wall time | 27,925 ms / 1,602,161 ms |
+| Upload client elapsed / peak RSS | 1,608.520 seconds / 242,720 KiB |
+| Download Worker CPU / wall time | 28,284 ms / 271,748 ms |
+| Download client elapsed / peak RSS | 272.201 seconds / 157,612 KiB |
+| Verifier CPU in retained logs | 522 sampled requests; maximum 543 ms; sampled sum 229,675 ms |
+| Source and download disk usage | Two fully allocated 10 GiB files; about 47 GiB local free space afterward |
+
+The upload has 4,075 ms (12.7%) and download 3,716 ms (11.6%) margin below the previously
+observed 32,000 ms hosted CPU ceiling. This margin is modest, and CPU varies with runtime and
+network behavior: it is evidence for the tested 10 GiB ceiling, not a guarantee for every
+connection or permission-change workload. Do not raise the cap without another full live
+round trip and resource review. The upload took about 27 minutes within its 45-minute budget;
+the complete download took about 4.5 minutes within its ten-minute authorization. Both closing
+invocations were labeled `canceled` by platform logs despite the saved receipt and complete
+matching bytes. Standalone live Apple acceptance and hosted heap/billing measurements remain
+unavailable; both standalone and Sites production bundles passed full synthetic 10 GiB round
+trips without an R2 binding, plus checksum, frame, credit, disconnect, rejection and early-success
+fault checks. The independently verified 25-file / 32 KiB bulk-job limits are unchanged.

@@ -15,6 +15,7 @@ import { loginAssurance } from "../../src/auth/apple/policy.ts";
 import { DEFAULT_SERVICE_SETTINGS } from "../../src/services/settings.ts";
 import { DRIVE_ROOT } from "../../src/icloud/drive.ts";
 import { DRIVE_UPLOAD_PART_BYTES, DRIVE_FILE_BYTES, DRIVE_STREAM_FILE_BYTES, DRIVE_STREAM_CHUNK_BYTES, DRIVE_STREAM_PROTOCOL, DRIVE_STREAM_LEGACY_PROTOCOL } from "../../src/drive/limits.ts";
+import { DRIVE_RELAY_CHUNK_BYTES, DRIVE_RELAY_PROTOCOL } from "../../src/drive/relay-state.ts";
 import { localAppleContentHeaders } from "../../scripts/dev/local-icloud-observation.mjs";
 
 const root = resolve(new URL("../..", import.meta.url).pathname);
@@ -63,11 +64,12 @@ async function inspectRawUpload(request, size, expected, report, delayMs = 0) {
 
 export async function verifyMultipartDrive(options, { bytes = DRIVE_UPLOAD_PART_BYTES + 17, report = () => {}, transport = "multipart", fault, network = false, delayMs = 0, capability = false, legacyProtocol = false } = {}) {
   assert.ok(["multipart", "stream", "resumable"].includes(transport));
-  assert.ok([undefined, "disconnect", "frame", "checksum", "reject", "early-success"].includes(fault));
+  assert.ok([undefined, "disconnect", "frame", "credit", "checksum", "reject", "early-success"].includes(fault));
   assert.ok(Number.isInteger(delayMs) && delayMs >= 0 && delayMs <= 5000);
   const streaming = transport === "stream";
-  const frameBytes = legacyProtocol ? 1024 * 1024 : DRIVE_STREAM_CHUNK_BYTES;
-  assert.ok(Number.isSafeInteger(bytes) && bytes > DRIVE_UPLOAD_PART_BYTES && bytes <= (transport === "resumable" ? DRIVE_FILE_BYTES : DRIVE_STREAM_FILE_BYTES));
+  const relay = streaming && capability;
+  const frameBytes = relay ? DRIVE_RELAY_CHUNK_BYTES : legacyProtocol ? 1024 * 1024 : DRIVE_STREAM_CHUNK_BYTES;
+  assert.ok(Number.isSafeInteger(bytes) && bytes > DRIVE_UPLOAD_PART_BYTES && bytes <= (transport === "resumable" || relay ? DRIVE_FILE_BYTES : DRIVE_STREAM_FILE_BYTES));
   const hash = expectedHash(bytes), secret = randomBytes(32).toString("base64");
   const team = "https://multipart.cloudflareaccess.com", audience = "synthetic-multipart-audience";
   const { publicKey, privateKey } = await generateKeyPair("RS256"), kid = randomUUID();
@@ -75,7 +77,7 @@ export async function verifyMultipartDrive(options, { bytes = DRIVE_UPLOAD_PART_
   const assertion = await new SignJWT({ email: "synthetic@example.invalid" }).setProtectedHeader({ alg: "RS256", kid }).setIssuer(team).setAudience(audience).setSubject(owner).setIssuedAt().setExpirationTime("1h").sign(privateKey);
   const itemId = "FILE::com.apple.CloudDocs::synthetic-multigig", name = "synthetic-multigig.bin";
   const item = { drivewsid: itemId, docwsid: "synthetic-multigig", zone: "com.apple.CloudDocs", type: "FILE", name, etag: "synthetic-multigig-etag", parentId: DRIVE_ROOT, size: bytes, dateModified: 0 };
-  let uploaded = false, allocations = 0, transfers = 0, commits = 0, upstreamFailure = null;
+  let uploaded = false, allocations = 0, transfers = 0, commits = 0, upstreamFailure = null, relayRequests = 0;
   let server, upstreamOrigin;
   if (network) {
     server = http.createServer((request, response) => {
@@ -102,6 +104,7 @@ export async function verifyMultipartDrive(options, { bytes = DRIVE_UPLOAD_PART_
   const content = new URL("/B/synthetic-multigig/file", "https://cvws.icloud-content.com"); content.searchParams.set("token", randomUUID());
   const outboundService = async request => {
     const url = new URL(request.url);
+    if (url.origin === origin) { relayRequests++; return worker.dispatchFetch(request); }
     if (url.origin === team) return json({ keys: [jwk] });
     if (url.hostname === "p01-drivews.icloud.com") {
       const body = await request.json();
@@ -163,12 +166,12 @@ export async function verifyMultipartDrive(options, { bytes = DRIVE_UPLOAD_PART_
       const authorized = capability ? await mcp("prepare_icloud_drive_upload", input) : null;
       const prepared = capability ? { ...authorized, socketPath: new URL(authorized.transfer.url).pathname } : await post("/api/drive/prepare-stream-upload", input);
       assert.deepEqual([allocations, transfers, commits], [0, 0, 0]);
-      const headers = { ...(capability ? authorized.transfer.headers : { "oai-authenticated-user-id": owner, "cf-access-jwt-assertion": assertion, origin }), upgrade: "websocket", "sec-websocket-protocol": legacyProtocol ? DRIVE_STREAM_LEGACY_PROTOCOL : DRIVE_STREAM_PROTOCOL };
+      const headers = { ...(capability ? authorized.transfer.headers : { "oai-authenticated-user-id": owner, "cf-access-jwt-assertion": assertion, origin }), upgrade: "websocket", "sec-websocket-protocol": relay ? DRIVE_RELAY_PROTOCOL : legacyProtocol ? DRIVE_STREAM_LEGACY_PROTOCOL : DRIVE_STREAM_PROTOCOL };
       assert.equal((await worker.dispatchFetch(origin + prepared.socketPath, { headers: { ...headers, origin: "https://other.example.test" } })).status, 403);
       assert.equal((await worker.dispatchFetch(origin + prepared.socketPath, { headers: { ...headers, "sec-websocket-protocol": "invalid" } })).status, 400);
       assert.equal((await worker.dispatchFetch(origin + prepared.socketPath, { headers: { ...headers, upgrade: "" } })).status, 426);
       if (capability) {
-        assert.equal((await worker.dispatchFetch(origin + prepared.socketPath, { headers: { upgrade: "websocket", "sec-websocket-protocol": legacyProtocol ? DRIVE_STREAM_LEGACY_PROTOCOL : DRIVE_STREAM_PROTOCOL } })).status, 403);
+        assert.equal((await worker.dispatchFetch(origin + prepared.socketPath, { headers: { upgrade: "websocket", "sec-websocket-protocol": relay ? DRIVE_RELAY_PROTOCOL : legacyProtocol ? DRIVE_STREAM_LEGACY_PROTOCOL : DRIVE_STREAM_PROTOCOL } })).status, 403);
         assert.equal((await worker.dispatchFetch(origin + prepared.socketPath, { headers: { ...headers, Authorization: "Bearer guessed" } })).status, 403);
         assert.deepEqual([allocations, transfers, commits], [0, 0, 0]);
       }
@@ -209,6 +212,7 @@ export async function verifyMultipartDrive(options, { bytes = DRIVE_UPLOAD_PART_
             assert.equal(message.bytes, Math.min(frameBytes, bytes - offset));
             if (fault === "disconnect") { socket.close(); return; }
             if (fault === "frame") { socket.send(new Uint8Array(1)); continue; }
+            if (fault === "credit") { socket.send(new Uint8Array(message.bytes).fill(90)); socket.send(new Uint8Array(message.bytes).fill(90)); continue; }
             socket.send(new Uint8Array(message.bytes).fill(90)); offset += message.bytes;
             if (offset % (256 * 1024 ** 2) === 0) report(`Streamed ${offset} of ${bytes} bytes without R2.`);
           }
@@ -311,6 +315,7 @@ export async function verifyMultipartDrive(options, { bytes = DRIVE_UPLOAD_PART_
     assert.equal((await bucket.list()).objects.length, 0, "confirmed staged bytes are deleted");
     }
     assert.deepEqual([allocations, transfers, commits], [1, 1, 1]);
+    if (relay) assert.equal(relayRequests, Math.ceil(bytes / DRIVE_RELAY_CHUNK_BYTES), "one verifier request per frame, with no repeated byte writes on receipt replay");
     report("Downloading the complete generated file through the production Worker.");
     const handle = capability ? await mcp("prepare_icloud_drive_download", { itemId }) : await post("/api/drive/download", { itemId });
     const download = capability ? await worker.dispatchFetch(handle.transfer.url, { headers: handle.transfer.headers }) : await request(handle.url);
@@ -323,7 +328,7 @@ export async function verifyMultipartDrive(options, { bytes = DRIVE_UPLOAD_PART_
     assert.equal(ranged.status, 206); assert.equal(ranged.headers.get("content-range"), `bytes ${start}-${bytes - 1}/${bytes}`);
     assert.deepEqual(await hashStream(ranged.body), { size: 17, sha256: expectedHash(17) });
     assert.equal((capability ? await worker.dispatchFetch(fresh.transfer.url, { headers: fresh.transfer.headers }) : await request(fresh.url)).status, 409);
-    return { bytes, sha256: hash, appleUploads: transfers, ...(capability ? { mcpAuthorized: true, browserIdentityOnTransfers: false } : {}), ...(network ? { upstream: "real-local-http", exactContentLength: true, delayPer32MiBMs: delayMs } : {}), ...(streaming ? { transport: "websocket", r2Bound: false, confirmedReplayWithoutBytes: true } : { resumedParts: true }), rangeVerified: true };
+    return { bytes, sha256: hash, appleUploads: transfers, ...(relay ? { relayRequests, relayFrameBytes: DRIVE_RELAY_CHUNK_BYTES } : {}), ...(capability ? { mcpAuthorized: true, browserIdentityOnTransfers: false } : {}), ...(network ? { upstream: "real-local-http", exactContentLength: true, delayPer32MiBMs: delayMs } : {}), ...(streaming ? { transport: "websocket", r2Bound: false, confirmedReplayWithoutBytes: true } : { resumedParts: true }), rangeVerified: true };
   } finally {
     await worker?.dispose();
     if (server) { server.closeAllConnections(); await new Promise(resolve => server.close(resolve)); }
@@ -335,6 +340,6 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
   const paths = (await readdir(server, { recursive: true, withFileTypes: true })).filter(file => file.isFile() && /\.(?:js|mjs)$/.test(file.name)).map(file => join(file.parentPath, file.name));
   const entry = join(server, "index.js");
   const transport = process.env.DRIVE_LARGE_TEST_TRANSPORT ?? "resumable";
-  const result = await verifyMultipartDrive({ modulesRoot: server, modules: [entry, ...paths.filter(path => path !== entry)].map(path => ({ type: "ESModule", path })), compatibilityDate: config.compatibility_date, compatibilityFlags: config.compatibility_flags, assets: { directory: join(root, "dist/client"), routerConfig: { has_user_worker: true } } }, { bytes: Number(process.env.DRIVE_LARGE_TEST_BYTES ?? (transport === "resumable" ? DRIVE_FILE_BYTES : DRIVE_STREAM_FILE_BYTES)), transport, network: process.env.DRIVE_LARGE_TEST_NETWORK === "1" || process.env.DRIVE_LARGE_TEST_NETWORK === undefined && transport === "resumable", delayMs: Number(process.env.DRIVE_LARGE_TEST_DELAY_MS ?? 0), fault: process.env.DRIVE_LARGE_TEST_FAULT, capability: transport === "resumable" || process.env.DRIVE_LARGE_TEST_CAPABILITY === "1", report: console.log });
+  const result = await verifyMultipartDrive({ modulesRoot: server, modules: [entry, ...paths.filter(path => path !== entry)].map(path => ({ type: "ESModule", path })), compatibilityDate: config.compatibility_date, compatibilityFlags: config.compatibility_flags, assets: { directory: join(root, "dist/client"), routerConfig: { has_user_worker: true } } }, { bytes: Number(process.env.DRIVE_LARGE_TEST_BYTES ?? (transport === "resumable" || process.env.DRIVE_LARGE_TEST_CAPABILITY === "1" ? DRIVE_FILE_BYTES : DRIVE_STREAM_FILE_BYTES)), transport, network: process.env.DRIVE_LARGE_TEST_NETWORK === "1" || process.env.DRIVE_LARGE_TEST_NETWORK === undefined && transport === "resumable", delayMs: Number(process.env.DRIVE_LARGE_TEST_DELAY_MS ?? 0), fault: process.env.DRIVE_LARGE_TEST_FAULT, capability: transport === "resumable" || process.env.DRIVE_LARGE_TEST_CAPABILITY === "1", report: console.log });
   console.log(JSON.stringify(result));
 }

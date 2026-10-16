@@ -16,14 +16,17 @@ export function retainVerifiedUploadBody(body: ReadableStream<Uint8Array>, size:
 }
 
 // Only the bounded receipt is buffered. File bytes retain stream backpressure.
-export function parseUploadSocketResponse(bytes: Uint8Array): Response {
+export function parseUploadSocketResponse(bytes: Uint8Array): Response;
+export function parseUploadSocketResponse(bytes: Uint8Array, eof: boolean): Response | null;
+export function parseUploadSocketResponse(bytes: Uint8Array, eof = true): Response | null {
   let offset = 0, status = 0, headers = new Headers();
   for (let interim = 0; ; interim++) {
     let end = -1;
     for (let i = offset; i + 3 < bytes.length && i - offset < HEADER_LIMIT; i++) {
       if (bytes[i] === 13 && bytes[i + 1] === 10 && bytes[i + 2] === 13 && bytes[i + 3] === 10) { end = i; break; }
     }
-    if (end < 0 || interim > 4) throw protocol();
+    if (interim > 4) throw protocol();
+    if (end < 0) { if (!eof && bytes.length - offset < HEADER_LIMIT) return null; throw protocol(); }
     const lines = new TextDecoder().decode(bytes.subarray(offset, end)).split("\r\n");
     const match = /^HTTP\/1\.[01] ([1-5]\d\d)(?: [\x20-\x7e]*)?$/.exec(lines.shift() ?? "");
     if (!match) throw protocol();
@@ -52,25 +55,38 @@ export function parseUploadSocketResponse(bytes: Uint8Array): Response {
         }
         cursor++;
       }
+      if (!eof && cursor - start <= HEADER_LIMIT) return null;
       throw protocol();
     };
     for (;;) {
       const value = line();
+      if (value === null) return null;
       if (!/^[0-9a-fA-F]{1,8}(?:;[\x20-\x7e]*)?$/.test(value)) throw protocol();
       const size = parseInt(value, 16);
       if (size === 0) {
         const trailerStart = cursor;
-        while (line() !== "") if (cursor - trailerStart > HEADER_LIMIT) throw protocol();
+        for (;;) {
+          const trailer = line();
+          if (cursor - trailerStart > HEADER_LIMIT) throw protocol();
+          if (trailer === null) return null;
+          if (trailer === "") break;
+        }
         if (cursor !== body.length) throw protocol();
         break;
       }
-      if (total + size > RESPONSE_LIMIT || cursor + size + 2 > body.length || body[cursor + size] !== 13 || body[cursor + size + 1] !== 10) throw protocol();
+      if (total + size > RESPONSE_LIMIT) throw protocol();
+      if (cursor + size + 2 > body.length) { if (!eof) return null; throw protocol(); }
+      if (body[cursor + size] !== 13 || body[cursor + size + 1] !== 10) throw protocol();
       chunks.push(body.subarray(cursor, cursor + size)); total += size; cursor += size + 2;
     }
     body = new Uint8Array(total); let at = 0;
     for (const chunk of chunks) { body.set(chunk, at); at += chunk.length; }
     headers.delete("transfer-encoding"); headers.set("content-length", String(total));
-  } else if (length !== null && (!/^\d+$/.test(length) || Number(length) !== body.length)) throw protocol();
+  } else if (length !== null) {
+    if (!/^\d+$/.test(length) || Number(length) > RESPONSE_LIMIT) throw protocol();
+    if (body.length < Number(length) && !eof) return null;
+    if (Number(length) !== body.length) throw protocol();
+  } else if (!eof && ![204, 205, 304].includes(status)) return null;
   if (body.length > RESPONSE_LIMIT || [204, 205, 304].includes(status) && body.length) throw protocol();
   return new Response([204, 205, 304].includes(status) ? null : new Uint8Array(body), { status, headers });
 }
@@ -129,18 +145,20 @@ export async function uploadDriveSocket(url: URL, init: RequestInit, connector?:
       })();
     }
     void pump.catch(() => {});
-    const chunks: Uint8Array[] = []; let received = 0;
+    // HTTP framing, not a delayed TCP close, determines when a receipt is
+    // complete. Close-delimited responses still require EOF. This buffer holds
+    // only the bounded receipt and headers, never uploaded file bytes.
+    const bytes = new Uint8Array(RESPONSE_LIMIT + HEADER_LIMIT * 6);
+    let received = 0, response: Response | null = null;
     for (;;) {
       const next = await reader.read();
       if (init.signal?.aborted) throw init.signal.reason;
-      if (next.done) break;
-      received += next.value.length;
-      if (received > RESPONSE_LIMIT + HEADER_LIMIT * 6) throw protocol();
-      chunks.push(next.value);
+      if (next.done) { response = parseUploadSocketResponse(bytes.subarray(0, received)); break; }
+      if (received + next.value.length > bytes.length) throw protocol();
+      bytes.set(next.value, received); received += next.value.length;
+      response = parseUploadSocketResponse(bytes.subarray(0, received), false);
+      if (response) break;
     }
-    const bytes = new Uint8Array(received); let offset = 0;
-    for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.length; }
-    const response = parseUploadSocketResponse(bytes);
     if (response.ok) {
       if (!ended && (nativePipe ? !retained!.complete() : sent !== Number(length))) throw new AppError("PROTOCOL_CHANGED", "Apple responded before the complete upload was sent.");
       await pump;

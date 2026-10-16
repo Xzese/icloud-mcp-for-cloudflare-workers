@@ -7,9 +7,9 @@ import { createHash } from "node:crypto";
 import { pathToFileURL } from "node:url";
 import { Readable } from "node:stream";
 import WebSocket from "ws";
-import { DRIVE_FILE_BYTES, DRIVE_FILE_LIMIT_LABEL } from "../src/drive/limits.ts";
+import { DRIVE_FILE_BYTES, DRIVE_FILE_LIMIT_LABEL, DRIVE_RELAY_TIMEOUT_MS } from "../src/drive/limits.ts";
 
-const protocols = ["icloud-drive-upload-v1", "icloud-drive-upload-v2"], timeoutMs = 30 * 60_000;
+const protocols = ["icloud-drive-upload-v1", "icloud-drive-upload-v2", "icloud-drive-upload-v3"], timeoutMs = 30 * 60_000;
 export async function fileMetadata(path) {
   const info = await stat(path);
   if (!info.isFile() || !Number.isSafeInteger(info.size) || info.size > DRIVE_FILE_BYTES) throw new Error(`Choose an ordinary file up to ${DRIVE_FILE_LIMIT_LABEL}.`);
@@ -39,7 +39,7 @@ export async function uploadFile(path, value, report = () => {}, stageOnly = fal
   if (metadata.size !== plan.size || metadata.sha256 !== plan.sha256) throw new Error("The local file differs from the exact file authorized through MCP.");
   if (plan.protocol === "icloud-drive-upload-parts-v1") return uploadParts(path, value, plan, report, stageOnly);
   if (stageOnly) throw new Error("This transfer does not support staging.");
-  const chunkBytes = plan.protocol === protocols[0] ? 1024 * 1024 : 8 * 1024 * 1024;
+  const chunkBytes = plan.protocol === protocols[0] ? 1024 * 1024 : plan.protocol === protocols[2] ? 16 * 1024 * 1024 : 8 * 1024 * 1024;
   const file = await open(path, "r");
   try {
     return await new Promise((resolve, reject) => {
@@ -53,7 +53,7 @@ export async function uploadFile(path, value, report = () => {}, stageOnly = fal
         if (error) socket.terminate(); else socket.close();
         if (error) reject(error); else resolve(result);
       };
-      const timer = setTimeout(() => end(new Error("Transfer timed out. Inspect the original MCP operation; no automatic retry was made.")), timeoutMs);
+      const timer = setTimeout(() => end(new Error("Transfer timed out. Inspect the original MCP operation; no automatic retry was made.")), plan.protocol === protocols[2] ? DRIVE_RELAY_TIMEOUT_MS : timeoutMs);
       socket.on("unexpected-response", (_request, response) => {
         response.resume(); end(new Error(`Transfer handshake returned HTTP ${response.statusCode}. Inspect the original operation before another request.`));
       });

@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { issueDriveTransfer, authorizeDriveTransfer, driveTransferRoute } from "../src/drive/transfer-capability.ts";
+import { relayAuthorization, relayCredentials, issueDriveTransfer, authorizeDriveTransfer, driveTransferRoute } from "../src/drive/transfer-capability.ts";
 import { applicationRoute } from "../src/api/router.ts";
 import { b64 } from "../src/crypto/bytes.ts";
 
@@ -62,4 +62,37 @@ test("unguessable transfer IDs confer no identity or general API access, and fai
   const response = (await applicationRoute(new Request(f.env.APP_ORIGIN + "/api/connection", { headers: plan.headers }), f.env))!;
   assert.equal(response.status, 401);
   assert.equal(driveTransferRoute("/api/drive/transfers/download/guess"), null);
+});
+
+
+test("internal relay credentials use one redacted bearer header and cannot authorize ordinary routes", async () => {
+  const f = fixture(), plan = await issueDriveTransfer(f.env, f.env.REMINDERS_OWNER_ID, "upload", f.id, f.hash, f.scope, { size: 17, sha256: f.hash });
+  const url = plan.url.replace("wss:", "https:"), route = driveTransferRoute(new URL(url).pathname)!;
+  const checkpoint = crypto.randomUUID();
+  const authorization = relayAuthorization(plan.headers.Authorization, checkpoint);
+  assert.equal(relayCredentials(authorization).checkpoint, checkpoint);
+  const request = new Request(url, { method: "POST", headers: { Authorization: authorization, "x-drive-transfer-action": "verify-relay-chunk" } });
+  assert.equal((await authorizeDriveTransfer(request, f.env, route)).id, f.id);
+  await assert.rejects(authorizeDriveTransfer(new Request(url, { headers: { Authorization: authorization } }), f.env, route), { code: "FORBIDDEN" });
+  await assert.rejects(authorizeDriveTransfer(new Request(url, { method: "POST", headers: { ...plan.headers, "x-drive-transfer-action": "verify-relay-chunk" } }), f.env, route), { code: "FORBIDDEN" });
+});
+
+test("relay authorization lasts at most 45 minutes while older uploads retain 30 minutes", async () => {
+  const f = fixture(), clock = Date.now, began = clock();
+  try {
+    Date.now = () => began;
+    const relay = await issueDriveTransfer(f.env, f.env.REMINDERS_OWNER_ID, "upload", f.id, f.hash, f.scope, { size: 17, sha256: f.hash, protocol: "icloud-drive-upload-v3" });
+    const legacy = await issueDriveTransfer(f.env, f.env.REMINDERS_OWNER_ID, "upload", f.id, f.hash, f.scope, { size: 17, sha256: f.hash });
+    assert.equal(relay.expiresAt, began + 45 * 60_000);
+    assert.equal(legacy.expiresAt, began + 30 * 60_000);
+    const authorize = (plan: typeof relay) => {
+      const url = plan.url.replace("wss:", "https:");
+      return authorizeDriveTransfer(new Request(url, { headers: plan.headers }), f.env, driveTransferRoute(new URL(url).pathname)!);
+    };
+    Date.now = () => began + 31 * 60_000;
+    assert.equal((await authorize(relay)).id, f.id);
+    await assert.rejects(authorize(legacy), { code: "FORBIDDEN" });
+    Date.now = () => began + 45 * 60_000;
+    await assert.rejects(authorize(relay), { code: "FORBIDDEN" });
+  } finally { Date.now = clock; }
 });

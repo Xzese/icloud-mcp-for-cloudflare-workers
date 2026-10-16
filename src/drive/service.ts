@@ -1,6 +1,13 @@
+import { relayCredentials } from "./transfer-capability.ts";
+import { CheckpointSHA256 } from "./hash-checkpoint.ts";
+import { bindRelayUpload, relayUploadProof } from "./relay-upload.ts";
+import { relayForwarder } from "./relay-forward.ts";
+import { DRIVE_RELAY_PROTOCOL, DRIVE_RELAY_CHUNK_BYTES, DRIVE_RELAY_STATE_HEADER, openRelayState, sealRelayState } from "./relay-state.ts";
+import { DRIVE_STREAM_PROTOCOL } from "./limits.ts";
+import { limitedBytes } from "../transport/apple-http.ts";
 import { uploadDriveSocket } from "../transport/drive-upload-socket.ts";
 import { z } from "zod";
-import { DRIVE_FILE_LIMIT_LABEL, DRIVE_STREAM_FILE_BYTES, DRIVE_DIRECT_UPLOAD_BYTES, DRIVE_UPLOAD_PART_BYTES, DRIVE_UPLOAD_MINIMUM_LEASE_MS, DRIVE_TRANSFER_BLOCK_BYTES } from "./limits.ts";
+import { DRIVE_FILE_LIMIT_LABEL, DRIVE_STREAM_FILE_BYTES, DRIVE_DIRECT_UPLOAD_BYTES, DRIVE_UPLOAD_PART_BYTES, DRIVE_UPLOAD_MINIMUM_LEASE_MS, DRIVE_RELAY_TIMEOUT_MS, DRIVE_TRANSFER_BLOCK_BYTES } from "./limits.ts";
 import { storedUpload } from "./stored-upload.ts";
 import { DriveStaging } from "./staging.ts";
 import { sha256 } from "@noble/hashes/sha2.js";
@@ -559,35 +566,36 @@ export class DriveService {
   }
   async prepareTransferUpload(input: unknown) {
     const { resumable, ...request } = parse(PrepareDriveUpload, input);
-    if (resumable || request.size > DRIVE_STREAM_FILE_BYTES) return this.prepareResumableUpload(request);
     return this.metadata("drive.upload", request.expectedGeneration, async c => {
-      const row = await this.operations.create(request.operationId, "stream-upload", request, c.scope);
+      let kind = resumable ? "resumable-upload" : "relay-upload";
+      if (!resumable) {
+        try {
+          const previous = await this.operations.get(request.operationId, c.scope);
+          if (previous.kind === "stream-upload" || previous.kind === "resumable-upload" && request.size > DRIVE_STREAM_FILE_BYTES) kind = previous.kind;
+        } catch (error) { if (!(error instanceof AppError && error.code === "FORBIDDEN")) throw error; }
+      }
+      if (kind === "resumable-upload") return this.prepareResumableUpload(request, c);
+      const row = await this.operations.create(request.operationId, kind, request, c.scope);
       if (row.permission_revision !== c.scope.permissionRevision) conflict("Upload permissions changed since this intent was prepared.");
       if (row.phase === "prepared") await this.destination(c, request.parentId, request.name);
       const result = this.publicOperation(row, await this.operations.data(row));
-      // Inspect uncertain work through MCP; never mint a fresh dispatch right
-      // for an operation whose Apple outcome is not provably replayable.
       if (!["prepared", "allocated", "uploaded", "confirmed"].includes(row.phase)) return result;
       return { ...result, transfer: await issueDriveTransfer(this.env, this.owner, "upload", row.operation_id, row.input_hash,
-        { ...c.scope, expiresAt: Math.min(c.scope.expiresAt, row.expires_at) }, { size: request.size, sha256: request.sha256 }) };
+        { ...c.scope, expiresAt: Math.min(c.scope.expiresAt, row.expires_at) }, { size: request.size, sha256: request.sha256,
+          protocol: kind === "relay-upload" ? DRIVE_RELAY_PROTOCOL : DRIVE_STREAM_PROTOCOL }) };
     });
   }
-  private async prepareResumableUpload(request: Upload) {
+  private async prepareResumableUpload(request: Upload, c: Context) {
     this.requireStagingBucket();
     if (!request.size) throw new AppError("VALIDATION_ERROR", "Use the direct transfer for an empty file.", 400);
-    return this.metadata("drive.upload", request.expectedGeneration, async c => {
-      const row = await this.operations.create(request.operationId, "resumable-upload", request, c.scope);
-      if (row.permission_revision !== c.scope.permissionRevision) conflict("Upload permissions changed since this intent was prepared.");
-      if (row.phase === "prepared") {
-        await this.destination(c, request.parentId, request.name);
-        await this.staging(c).prepare(row.operation_id);
-      }
-      const current = await this.operations.get(row.operation_id, c.scope);
-      const result = this.publicOperation(current, await this.operations.data(current));
-      if (!["prepared", "uploaded", "confirmed"].includes(current.phase)) return result;
-      return { ...result, transfer: await issueDriveTransfer(this.env, this.owner, "staged-upload", current.operation_id, current.input_hash,
-        { ...c.scope, expiresAt: Math.min(c.scope.expiresAt, current.expires_at) }, { size: request.size, sha256: request.sha256 }) };
-    });
+    const row = await this.operations.create(request.operationId, "resumable-upload", request, c.scope);
+    if (row.permission_revision !== c.scope.permissionRevision) conflict("Upload permissions changed since this intent was prepared.");
+    if (row.phase === "prepared") { await this.destination(c, request.parentId, request.name); await this.staging(c).prepare(row.operation_id); }
+    const current = await this.operations.get(row.operation_id, c.scope);
+    const result = this.publicOperation(current, await this.operations.data(current));
+    if (!["prepared", "uploaded", "confirmed"].includes(current.phase)) return result;
+    return { ...result, transfer: await issueDriveTransfer(this.env, this.owner, "staged-upload", current.operation_id, current.input_hash,
+      { ...c.scope, expiresAt: Math.min(c.scope.expiresAt, current.expires_at) }, { size: request.size, sha256: request.sha256 }) };
   }
   async resumableTransfer(request: Request, claim: TransferClaim) {
     if (claim.kind !== "staged-upload" || claim.owner !== this.owner) conflict("This is not a staged transfer capability.");
@@ -621,14 +629,47 @@ export class DriveService {
     if (claim && (claim.kind !== "upload" || claim.id !== operationId || claim.owner !== this.owner)) conflict("This capability belongs to another upload.");
     return this.metadata("drive.upload", undefined, async c => {
       const row = await this.operations.get(parse(OperationId, operationId), c.scope);
-      if (row.kind !== "stream-upload") conflict("This operation was not prepared for direct streaming.");
+      if (!["stream-upload", "relay-upload"].includes(row.kind)) conflict("This operation was not prepared for direct streaming.");
       if (claim && (row.input_hash !== claim.inputHash || row.permission_revision !== c.scope.permissionRevision)) conflict("This capability belongs to different upload input or permissions.");
       if (!["prepared", "allocated", "uploaded", "confirmed"].includes(row.phase)) throw unknownOutcome(row.operation_id);
-      return { operationId: row.operation_id, phase: row.phase, size: parse(UploadDriveMetadata, (await this.operations.data(row)).input).size };
+      return { operationId: row.operation_id, phase: row.phase, size: parse(UploadDriveMetadata, (await this.operations.data(row)).input).size, protocol: row.kind === "relay-upload" ? DRIVE_RELAY_PROTOCOL : DRIVE_STREAM_PROTOCOL };
     }, claim?.scope);
   }
   async uploadStreamContent(operationId: string, body: ReadableStream<Uint8Array>, signal: AbortSignal, claim?: TransferClaim, ready?: () => void) {
     return this.uploadContent(operationId, body, signal, false, true, claim, ready);
+  }
+  async verifyRelayChunk(request: Request, claim: TransferClaim) {
+    if (request.method !== "POST" || claim.kind !== "upload" || claim.owner !== this.owner) conflict("This is not a relay verification request.");
+    const authority = { owner: this.owner, operationId: claim.id, inputHash: claim.inputHash, scope: claim.scope };
+    const state = await openRelayState(this.env, authority, relayCredentials(request.headers.get("authorization")).checkpoint);
+    if (state.complete) conflict("This relay checkpoint has already reached its final byte.");
+    const operation = { id: claim.id, inputHash: claim.inputHash, account: claim.scope.account, leaseId: state.leaseId };
+    const guard = async () => {
+      if (request.signal.aborted) throw request.signal.reason;
+      if (Date.now() >= state.expiresAt) throw new AppError("AUTH_EXPIRED", "The relay checkpoint expired.", 409);
+      if (!await this.sessions.driveRelayCurrent({ generation: claim.scope.generation, version: state.sessionVersion }, claim.scope.permissionRevision, operation)) {
+        state.sessionVersion = (await this.guard(claim.scope, "drive.upload")).fence.version;
+        if (!await this.sessions.driveRelayCurrent({ generation: claim.scope.generation, version: state.sessionVersion }, claim.scope.permissionRevision, operation)) conflict("The relay account fence is changing.");
+      }
+    };
+    await guard();
+    const length = Math.min(DRIVE_RELAY_CHUNK_BYTES, state.size - state.offset);
+    if (request.headers.get("content-length") !== String(length) || request.headers.get("content-type") !== "application/octet-stream") throw new AppError("VALIDATION_ERROR", "The relay frame headers do not match its checkpoint.", 400);
+    const bytes = await limitedBytes(new Response(request.body), length);
+    if (bytes.byteLength !== length) throw new AppError("VALIDATION_ERROR", "The relay frame length does not match its checkpoint.", 400);
+    const digest = new CheckpointSHA256(state.hash!);
+    try {
+      digest.update(bytes); state.offset += length;
+      if (state.offset === state.size) {
+        if (hex(digest.digest()) !== state.sha256) throw new AppError("VALIDATION_ERROR", "The complete relay SHA-256 did not match its retained input.", 400);
+        state.hash = null; state.complete = true;
+      } else state.hash = digest.checkpoint();
+    } finally { digest.destroy(); }
+    await guard();
+    const checkpoint = await sealRelayState(this.env, authority, state);
+    console.info({ event: "drive-relay-chunk-verified", bytes: length, offset: state.offset, complete: state.complete });
+    return new Response(bytes as BodyInit, { headers: { "content-type": "application/octet-stream", "content-length": String(length),
+      "cache-control": "private, no-store", "x-robots-tag": "noindex, nofollow, noarchive, nosnippet", "referrer-policy": "no-referrer", [DRIVE_RELAY_STATE_HEADER]: checkpoint } });
   }
   private staging(context: Context) {
     return new DriveStaging(this.requireStagingBucket(), this.operations, context.scope, () => this.guard(context.scope, "drive.upload"));
@@ -699,8 +740,9 @@ export class DriveService {
       row = await this.operations.get(operationId, scope);
       if (claim && (row.input_hash !== claim.inputHash || row.permission_revision !== scope.permissionRevision)) conflict("This capability belongs to different upload input or permissions.");
       data = await this.operations.data(row);
-      if (!(streamed ? ["stream-upload"] : staged ? ["upload", "resumable-upload"] : ["upload"]).includes(row.kind)) conflict("This operation belongs to a different upload transport.");
+      if (!(streamed ? ["stream-upload", "relay-upload"] : staged ? ["upload", "resumable-upload"] : ["upload"]).includes(row.kind)) conflict("This operation belongs to a different upload transport.");
       request = parse(UploadDriveMetadata, data.input);
+      if (row.kind === "relay-upload" && request.size && !relayUploadProof(body)) conflict("This upload requires its pinned relay transport.");
       if (row.phase !== "confirmed" && (data.staging?.cancelled || staged && !data.staging?.objectEtag)) conflict("This staged upload is unavailable.");
       if (row.phase !== "confirmed" && !staged && !streamed && (request.size > DRIVE_DIRECT_UPLOAD_BYTES || data.staging)) throw new AppError("VALIDATION_ERROR", "Use prepare-multipart-upload, numbered parts and complete-multipart-upload for this file. Direct uploads allow at most 64 MiB.", 413);
     } catch (error) {
@@ -730,7 +772,7 @@ export class DriveService {
       }
       if (row.phase === "allocated") {
         const allocation = parse(Allocation, data.allocation);
-        await this.operations.assertLease(row, DRIVE_UPLOAD_MINIMUM_LEASE_MS);
+        await this.operations.assertLease(row, row.kind === "relay-upload" ? DRIVE_RELAY_TIMEOUT_MS + 5_000 : DRIVE_UPLOAD_MINIMUM_LEASE_MS);
         row = await this.operations.checkpoint(row, "uploading", data);
         await this.finish(c);
         const auth = c.http.snapshot(); c = null;
@@ -745,7 +787,11 @@ export class DriveService {
         };
         const checked = row.kind === "resumable-upload"
           ? storedUpload(this.requireStagingBucket(), data.staging!, request.size, request.sha256, storedGuard, signal)
-          : this.checkedStream(body, scope, "drive.upload", request.size, signal, request.sha256);
+          : row.kind === "relay-upload" && request.size
+            ? bindRelayUpload(body, { size: request.size, expiresAt: scope.expiresAt, signal,
+              forward: await relayForwarder(this.env, { owner: this.owner, operationId, inputHash: row.input_hash, scope,
+                leaseId: row.lease_id!, leaseUntil: row.lease_until, size: request.size, sha256: request.sha256 }, saved.fence.version, signal) })!
+            : this.checkedStream(body, scope, "drive.upload", request.size, signal, request.sha256);
         let receipt;
         try {
           ready?.();

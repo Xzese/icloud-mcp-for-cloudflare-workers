@@ -270,7 +270,10 @@ export async function verifyDrive(options) {
     assert.equal(rejectedLimit.status, 413);
     const stagedLimit = await mcp("tools/call", { name: "prepare_icloud_drive_upload", arguments: { ...limitIntent, operationId: randomUUID(), size: DRIVE_FILE_BYTES } });
     assert.equal(stagedLimit.result.isError, undefined, JSON.stringify(stagedLimit));
-    assert.equal(stagedLimit.result.structuredContent.transfer.protocol, "icloud-drive-upload-parts-v1");
+    assert.equal(stagedLimit.result.structuredContent.transfer.protocol, "icloud-drive-upload-v3");
+    const resumableLimit = await mcp("tools/call", { name: "prepare_icloud_drive_upload", arguments: { ...limitIntent, operationId: randomUUID(), size: DRIVE_FILE_BYTES, resumable: true } });
+    assert.equal(resumableLimit.result.isError, undefined, JSON.stringify(resumableLimit));
+    assert.equal(resumableLimit.result.structuredContent.transfer.protocol, "icloud-drive-upload-parts-v1");
     const overLimit = await mcp("tools/call", { name: "prepare_icloud_drive_upload", arguments: { ...limitIntent, operationId: randomUUID(), size: DRIVE_FILE_BYTES + 1 } });
     assert.ok(overLimit.result?.isError || overLimit.error, "the larger application cap is still enforced");
     assert.equal(allocations, 0, "Preparing the boundary or refusing oversize must not allocate Apple storage");
