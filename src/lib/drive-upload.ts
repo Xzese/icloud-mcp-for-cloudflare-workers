@@ -1,4 +1,4 @@
-import { DRIVE_DIRECT_UPLOAD_BYTES, DRIVE_UPLOAD_PART_BYTES } from "../drive/limits.ts";
+import { DRIVE_DIRECT_UPLOAD_BYTES, DRIVE_UPLOAD_PART_BYTES, DRIVE_STREAM_FILE_BYTES } from "../drive/limits.ts";
 import { UploadDriveMetadata } from "../drive/schemas.ts";
 import { sha256Stream } from "./file-digest.ts";
 
@@ -31,6 +31,7 @@ export async function discardDriveUpload(operationId: string) {
   if (retained?.operationId === operationId) sessionStorage.removeItem(pendingKey);
 }
 export async function uploadDriveFile(file: File, context: { parentId: string; expectedGeneration?: number }, progress: (text: string, operationId?: string) => void): Promise<Operation> {
+  if (file.size > DRIVE_STREAM_FILE_BYTES) throw new Error("Dashboard uploads allow up to 4 GiB; use an MCP resumable transfer for larger files.");
   progress("Calculating the file checksum…");
   const sha256 = await sha256Stream(file.stream());
   const validated = UploadDriveMetadata.safeParse({ ...context, name: file.name, size: file.size, sha256,

@@ -12,7 +12,7 @@ import { ServiceSettingsRepository } from "../persistence/service-settings.ts";
 import { ServiceSettingsSchema } from "../services/settings.ts";
 import { DriveService } from "../drive/service.ts";
 import { probeDriveContentSocket } from "../transport/drive-socket-probe.ts";
-import { driveUploadSocket } from "../drive/upload-socket.ts";
+import { driveUploadSocket, driveStoredUploadSocket } from "../drive/upload-socket.ts";
 import { authorizeDriveTransfer, driveTransferRoute } from "../drive/transfer-capability.ts";
 import { DriveConsent, INLINE_REQUEST_BYTES, INLINE_UPLOAD_GUIDANCE } from "../drive/schemas.ts";
 
@@ -32,6 +32,8 @@ export async function applicationRoute(request: Request, env: RuntimeEnv, creden
     if (transfer) {
       const claim = await authorizeDriveTransfer(request, env, transfer);
       const service = new DriveService(env, claim.owner);
+      if (transfer.kind === "staged-upload") return request.headers.get("upgrade")?.toLowerCase() === "websocket"
+        ? await driveStoredUploadSocket(request, service, claim) : json(await service.resumableTransfer(request, claim));
       if (transfer.kind === "upload" && request.headers.get("x-drive-transfer-action") === "diagnose") {
         await service.streamUploadStatus(claim.id, claim);
         return json(await probeDriveContentSocket());

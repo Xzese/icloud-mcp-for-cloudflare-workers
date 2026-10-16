@@ -1,4 +1,4 @@
-import { DRIVE_FILE_BYTES } from "../../src/drive/limits.ts";
+import { DRIVE_FILE_BYTES, DRIVE_STREAM_FILE_BYTES } from "../../src/drive/limits.ts";
 // One production-bundle Drive journey in workerd, backed only by synthetic Apple responses.
 import assert from "node:assert/strict";
 import { randomBytes, createHash, randomUUID } from "node:crypto";
@@ -263,11 +263,16 @@ export async function verifyDrive(options) {
     assert.equal(continueCancelled.result.structuredContent.status, "cancelled");
     assert.deepEqual([allocations, transfers, finalizations], [0, 0, 0], "Preparing, inspecting and cancelling a job never sends Apple mutations");
 
-    const limitIntent = { operationId: randomUUID(), parentId: DRIVE_ROOT, name: "limit-boundary.bin", size: DRIVE_FILE_BYTES, sha256: "a".repeat(64), contentType: "application/octet-stream" };
+    const limitIntent = { operationId: randomUUID(), parentId: DRIVE_ROOT, name: "limit-boundary.bin", size: DRIVE_STREAM_FILE_BYTES, sha256: "a".repeat(64), contentType: "application/octet-stream" };
     const acceptedLimit = await request("/api/drive/prepare-upload", { method: "POST", body: JSON.stringify(limitIntent) });
     assert.equal(acceptedLimit.status, 200);
     const rejectedLimit = await request("/api/drive/prepare-upload", { method: "POST", body: JSON.stringify({ ...limitIntent, operationId: randomUUID(), size: limitIntent.size + 1 }) });
-    assert.equal(rejectedLimit.status, 400);
+    assert.equal(rejectedLimit.status, 413);
+    const stagedLimit = await mcp("tools/call", { name: "prepare_icloud_drive_upload", arguments: { ...limitIntent, operationId: randomUUID(), size: DRIVE_FILE_BYTES } });
+    assert.equal(stagedLimit.result.isError, undefined, JSON.stringify(stagedLimit));
+    assert.equal(stagedLimit.result.structuredContent.transfer.protocol, "icloud-drive-upload-parts-v1");
+    const overLimit = await mcp("tools/call", { name: "prepare_icloud_drive_upload", arguments: { ...limitIntent, operationId: randomUUID(), size: DRIVE_FILE_BYTES + 1 } });
+    assert.ok(overLimit.result?.isError || overLimit.error, "the larger application cap is still enforced");
     assert.equal(allocations, 0, "Preparing the boundary or refusing oversize must not allocate Apple storage");
 
     const operationId = randomUUID();

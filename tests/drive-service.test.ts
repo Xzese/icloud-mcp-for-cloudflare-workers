@@ -15,6 +15,7 @@ import { accountScope } from "../src/lib/canonical.ts";
 import { DRIVE_FILE_BYTES, DRIVE_TRANSFER_BLOCK_BYTES } from "../src/drive/limits.ts";
 import { DriveBucket } from "./helpers/drive-bucket.ts";
 import { authorizeDriveTransfer, driveTransferRoute, DriveTransferPlan } from "../src/drive/transfer-capability.ts";
+import { UploadDriveMetadata } from "../src/drive/schemas.ts";
 import { applicationRoute } from "../src/api/router.ts";
 
 function syntheticDownloadURL() {
@@ -73,6 +74,38 @@ test("MCP metadata-only upload authorizes one large direct transfer without R2 o
   const settings = await f.settings.load();
   await f.settings.save({ expectedRevision: settings.revision, settings: { ...settings.settings, drive: { ...settings.settings.drive, upload: false } } });
   await assert.rejects(f.service.streamUploadStatus(input.operationId, claim), { code: "FORBIDDEN" });
+});
+
+test("resumable capability renews the same staged intent, fences routes and revisions, and never authorizes uncertain Apple delivery", async t => {
+  let reads = 0;
+  const f = await fixture(t, url => {
+    assert.equal(url.pathname, "/retrieveItemDetailsInFolders"); reads++;
+    return json([{ ...root, items: [], directChildrenCount: 0 }]);
+  });
+  const env = { ...f.env, BUCKET: new DriveBucket().binding() }, service = () => new DriveService(env, owner);
+  const input = UploadDriveMetadata.parse(Object.fromEntries(Object.entries(await uploadInput("resumable.bin")).filter(([key]) => key !== "contentBase64")));
+  const prepared = await service().prepareTransferUpload({ ...input, resumable: true });
+  assert.ok("transfer" in prepared && prepared.transfer);
+  const transfer = DriveTransferPlan.parse(prepared.transfer);
+  assert.equal(transfer.method, "POST");
+  const sessionVersion = f.db.sqlite.prepare("SELECT version FROM apple_session_state").get()?.version;
+  const call = (method = "GET", extra = {}, body?: string) => applicationRoute(new Request(transfer.url, { method, headers: { ...transfer.headers, ...extra }, body }), env);
+  assert.equal((await call())!.status, 200);
+  assert.equal((await call("DELETE"))!.status, 403);
+  assert.equal((await call("POST", { "x-drive-transfer-action": "part", "x-drive-part-number": "1", "content-type": "application/octet-stream", "x-content-sha256": input.sha256 }, "abc"))!.status, 200);
+  assert.equal(f.db.sqlite.prepare("SELECT version FROM apple_session_state").get()?.version, sessionVersion, "R2-only progress and parts do not rewrite the Apple session");
+  const resumed = await service().prepareTransferUpload({ ...input, resumable: true });
+  assert.deepEqual(resumed.staging?.uploadedParts, [1]);
+  assert.ok("transfer" in resumed);
+  assert.notEqual(DriveTransferPlan.parse(resumed.transfer).url, transfer.url);
+  await assert.rejects(service().prepareTransferUpload(input), { code: "CONFLICT" });
+  f.db.sqlite.prepare("UPDATE drive_operations SET phase = 'unknown' WHERE operation_id = ?").run(input.operationId);
+  const uncertain = await service().prepareTransferUpload({ ...input, resumable: true });
+  assert.equal(uncertain.phase, "unknown"); assert.equal("transfer" in uncertain, false);
+  assert.equal(reads, 2, "only destination reads before an uncertain delivery");
+  const settings = await f.settings.load();
+  await f.settings.save({ expectedRevision: settings.revision, settings: { ...settings.settings, drive: { ...settings.settings.drive, upload: false } } });
+  assert.equal((await call())!.status, 403);
 });
 
 test("MCP download capability streams without a browser identity, checks exact versions, consumes once and dies on settings/account change", async t => {

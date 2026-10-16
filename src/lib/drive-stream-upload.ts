@@ -1,5 +1,5 @@
 import { UploadDriveMetadata } from "../drive/schemas.ts";
-import { DRIVE_STREAM_CHUNK_BYTES, DRIVE_STREAM_PROTOCOL, DRIVE_TRANSFER_TIMEOUT_MS } from "../drive/limits.ts";
+import { DRIVE_STREAM_CHUNK_BYTES, DRIVE_STREAM_FILE_BYTES, DRIVE_STREAM_PROTOCOL, DRIVE_TRANSFER_TIMEOUT_MS } from "../drive/limits.ts";
 import { sha256Stream } from "./file-digest.ts";
 
 const key = "icloud-drive-stream-upload-v1";
@@ -14,6 +14,7 @@ function retained(): Metadata | null {
 export function pendingDriveStreamUpload() { return retained()?.operationId ?? null; }
 
 export async function streamDriveFile(file: File, context: { parentId: string; expectedGeneration?: number }, progress: (text: string, id?: string) => void): Promise<Operation> {
+  if (file.size > DRIVE_STREAM_FILE_BYTES) throw new Error("Direct streaming allows up to 4 GiB; use an MCP resumable transfer for larger files.");
   const previous = retained();
   if (previous) progress("Checking the retained direct upload…", previous.operationId);
   progress("Calculating the file checksum…", previous?.operationId);

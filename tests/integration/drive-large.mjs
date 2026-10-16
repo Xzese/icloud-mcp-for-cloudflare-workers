@@ -14,7 +14,7 @@ import { Envelopes } from "../../src/crypto/envelopes.ts";
 import { loginAssurance } from "../../src/auth/apple/policy.ts";
 import { DEFAULT_SERVICE_SETTINGS } from "../../src/services/settings.ts";
 import { DRIVE_ROOT } from "../../src/icloud/drive.ts";
-import { DRIVE_UPLOAD_PART_BYTES, DRIVE_FILE_BYTES, DRIVE_STREAM_CHUNK_BYTES, DRIVE_STREAM_PROTOCOL, DRIVE_STREAM_LEGACY_PROTOCOL } from "../../src/drive/limits.ts";
+import { DRIVE_UPLOAD_PART_BYTES, DRIVE_FILE_BYTES, DRIVE_STREAM_FILE_BYTES, DRIVE_STREAM_CHUNK_BYTES, DRIVE_STREAM_PROTOCOL, DRIVE_STREAM_LEGACY_PROTOCOL } from "../../src/drive/limits.ts";
 import { localAppleContentHeaders } from "../../scripts/dev/local-icloud-observation.mjs";
 
 const root = resolve(new URL("../..", import.meta.url).pathname);
@@ -62,12 +62,12 @@ async function inspectRawUpload(request, size, expected, report, delayMs = 0) {
 }
 
 export async function verifyMultipartDrive(options, { bytes = DRIVE_UPLOAD_PART_BYTES + 17, report = () => {}, transport = "multipart", fault, network = false, delayMs = 0, capability = false, legacyProtocol = false } = {}) {
-  assert.ok(["multipart", "stream"].includes(transport));
+  assert.ok(["multipart", "stream", "resumable"].includes(transport));
   assert.ok([undefined, "disconnect", "frame", "checksum", "reject", "early-success"].includes(fault));
   assert.ok(Number.isInteger(delayMs) && delayMs >= 0 && delayMs <= 5000);
   const streaming = transport === "stream";
   const frameBytes = legacyProtocol ? 1024 * 1024 : DRIVE_STREAM_CHUNK_BYTES;
-  assert.ok(Number.isSafeInteger(bytes) && bytes > DRIVE_UPLOAD_PART_BYTES && bytes <= DRIVE_FILE_BYTES);
+  assert.ok(Number.isSafeInteger(bytes) && bytes > DRIVE_UPLOAD_PART_BYTES && bytes <= (transport === "resumable" ? DRIVE_FILE_BYTES : DRIVE_STREAM_FILE_BYTES));
   const hash = expectedHash(bytes), secret = randomBytes(32).toString("base64");
   const team = "https://multipart.cloudflareaccess.com", audience = "synthetic-multipart-audience";
   const { publicKey, privateKey } = await generateKeyPair("RS256"), kid = randomUUID();
@@ -233,6 +233,60 @@ export async function verifyMultipartDrive(options, { bytes = DRIVE_UPLOAD_PART_
         return { result: "passed", transport: "websocket", r2Bound: false, ...(network ? { upstream: "real-local-http" } : {}), fault, unsafeReplayPrevented: true };
       }
       await sendFile(true);
+    } else if (transport === "resumable") {
+      const prepared = await mcp("prepare_icloud_drive_upload", { ...input, resumable: true });
+      assert.equal(prepared.transfer.protocol, "icloud-drive-upload-parts-v1");
+      assert.deepEqual([allocations, transfers, commits], [0, 0, 0]);
+      const endpoint = prepared.transfer.url, headers = prepared.transfer.headers;
+      assert.equal((await worker.dispatchFetch(endpoint)).status, 403);
+      for (let offset = 0, part = 1; offset < bytes; offset += DRIVE_UPLOAD_PART_BYTES, part++) {
+        const count = Math.min(DRIVE_UPLOAD_PART_BYTES, bytes - offset), body = new Uint8Array(count).fill(90);
+        const sendPart = () => worker.dispatchFetch(endpoint, { method: "POST", headers: { ...headers, "content-type": "application/octet-stream", "x-drive-transfer-action": "part", "x-drive-part-number": String(part), "x-content-sha256": expectedHash(count) }, body });
+        const response = await sendPart();
+        if (fault === "checksum" && offset + count === bytes) {
+          assert.equal(response.status, 400); assert.deepEqual([allocations, transfers, commits], [0, 0, 0]);
+          return { result: "passed", transport, fullHashBeforeApple: true };
+        }
+        assert.equal(response.status, 200, await response.text());
+        if (part === 1) {
+          const resumed = await mcp("prepare_icloud_drive_upload", { ...input, resumable: true });
+          assert.deepEqual(resumed.staging.uploadedParts, [1]);
+          assert.equal((await sendPart()).status, 200);
+        }
+        if (part % 32 === 0) report(`Verified and staged ${offset + count} of ${bytes} bytes.`);
+      }
+      assert.deepEqual([allocations, transfers, commits], [0, 0, 0]);
+      const complete = async () => {
+        const fresh = await mcp("prepare_icloud_drive_upload", { ...input, resumable: true });
+        const response = await worker.dispatchFetch(fresh.transfer.url, { headers: { ...fresh.transfer.headers, upgrade: "websocket", "sec-websocket-protocol": fresh.transfer.protocol } });
+        assert.equal(response.status, 101, response.status === 101 ? undefined : await response.text());
+        const socket = response.webSocket;
+        return new Promise((resolve, reject) => {
+          const timer = setTimeout(() => { socket.close(); reject(new Error("Stored completion timeout")); }, 30 * 60_000);
+          socket.addEventListener("message", event => {
+            const message = JSON.parse(event.data);
+            if (message.type === "pending") return;
+            clearTimeout(timer); socket.close();
+            try { assert.equal(message.type, "result", JSON.stringify({ message, upstreamFailure })); assert.equal(message.operation.phase, "confirmed"); resolve(message.operation); }
+            catch (error) { reject(error); }
+          });
+          socket.addEventListener("close", () => { clearTimeout(timer); reject(new Error("Stored completion closed")); });
+          socket.accept();
+        });
+      };
+      report("All parts verified across separate requests; native R2 delivery starting.");
+      if (["reject", "early-success"].includes(fault)) {
+        await assert.rejects(complete());
+        const operation = await post("/api/drive/operation", { operationId });
+        assert.equal(operation.phase, "unknown");
+        const retained = await mcp("prepare_icloud_drive_upload", { ...input, resumable: true });
+        assert.equal(retained.phase, "unknown"); assert.equal(retained.transfer, undefined);
+        assert.equal(commits, 0);
+        return { result: "passed", transport, fault, unsafeReplayPrevented: true };
+      }
+      await complete(); await complete();
+      assert.deepEqual([allocations, transfers, commits], [1, 1, 1]);
+      assert.equal((await bucket.list()).objects.length, 0);
     } else {
     const prepared = await post("/api/drive/prepare-multipart-upload", input);
     assert.equal(prepared.partBytes, DRIVE_UPLOAD_PART_BYTES);
@@ -280,6 +334,7 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
   const config = JSON.parse(await readFile(join(root, "dist/server/wrangler.json"), "utf8")), server = join(root, "dist/server");
   const paths = (await readdir(server, { recursive: true, withFileTypes: true })).filter(file => file.isFile() && /\.(?:js|mjs)$/.test(file.name)).map(file => join(file.parentPath, file.name));
   const entry = join(server, "index.js");
-  const result = await verifyMultipartDrive({ modulesRoot: server, modules: [entry, ...paths.filter(path => path !== entry)].map(path => ({ type: "ESModule", path })), compatibilityDate: config.compatibility_date, compatibilityFlags: config.compatibility_flags, assets: { directory: join(root, "dist/client"), routerConfig: { has_user_worker: true } } }, { bytes: Number(process.env.DRIVE_LARGE_TEST_BYTES ?? DRIVE_FILE_BYTES), transport: process.env.DRIVE_LARGE_TEST_TRANSPORT ?? "multipart", network: process.env.DRIVE_LARGE_TEST_NETWORK === "1", delayMs: Number(process.env.DRIVE_LARGE_TEST_DELAY_MS ?? 0), fault: process.env.DRIVE_LARGE_TEST_FAULT, capability: process.env.DRIVE_LARGE_TEST_CAPABILITY === "1", report: console.log });
+  const transport = process.env.DRIVE_LARGE_TEST_TRANSPORT ?? "resumable";
+  const result = await verifyMultipartDrive({ modulesRoot: server, modules: [entry, ...paths.filter(path => path !== entry)].map(path => ({ type: "ESModule", path })), compatibilityDate: config.compatibility_date, compatibilityFlags: config.compatibility_flags, assets: { directory: join(root, "dist/client"), routerConfig: { has_user_worker: true } } }, { bytes: Number(process.env.DRIVE_LARGE_TEST_BYTES ?? (transport === "resumable" ? DRIVE_FILE_BYTES : DRIVE_STREAM_FILE_BYTES)), transport, network: process.env.DRIVE_LARGE_TEST_NETWORK === "1" || process.env.DRIVE_LARGE_TEST_NETWORK === undefined && transport === "resumable", delayMs: Number(process.env.DRIVE_LARGE_TEST_DELAY_MS ?? 0), fault: process.env.DRIVE_LARGE_TEST_FAULT, capability: transport === "resumable" || process.env.DRIVE_LARGE_TEST_CAPABILITY === "1", report: console.log });
   console.log(JSON.stringify(result));
 }

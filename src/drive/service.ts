@@ -1,6 +1,7 @@
 import { uploadDriveSocket } from "../transport/drive-upload-socket.ts";
 import { z } from "zod";
-import { DRIVE_FILE_LIMIT_LABEL, DRIVE_DIRECT_UPLOAD_BYTES, DRIVE_UPLOAD_PART_BYTES, DRIVE_UPLOAD_MINIMUM_LEASE_MS, DRIVE_TRANSFER_BLOCK_BYTES } from "./limits.ts";
+import { DRIVE_FILE_LIMIT_LABEL, DRIVE_STREAM_FILE_BYTES, DRIVE_DIRECT_UPLOAD_BYTES, DRIVE_UPLOAD_PART_BYTES, DRIVE_UPLOAD_MINIMUM_LEASE_MS, DRIVE_TRANSFER_BLOCK_BYTES } from "./limits.ts";
+import { storedUpload } from "./stored-upload.ts";
 import { DriveStaging } from "./staging.ts";
 import { sha256 } from "@noble/hashes/sha2.js";
 import { AppError } from "../errors.ts";
@@ -24,7 +25,7 @@ import { accountScope, fingerprint } from "../lib/canonical.ts";
 import { b64, unb64, hex } from "../crypto/bytes.ts";
 import type { RuntimeEnv } from "../platform/sites.ts";
 import { issueDriveTransfer, type TransferClaim } from "./transfer-capability.ts";
-import { ListDrive, GetDriveItem, SearchDrive, TraverseDrive, ResolveDriveFolderPath, ReadDrive, DownloadDrive, UploadDrive, UploadDriveMetadata, CreateDriveFolder, RenameDriveItem, MoveDriveItem, GetDriveOperation, OperationId, INLINE_FILE_BYTES, DRIVE_FILE_BYTES, INLINE_UPLOAD_GUIDANCE } from "./schemas.ts";
+import { ListDrive, GetDriveItem, SearchDrive, TraverseDrive, ResolveDriveFolderPath, ReadDrive, DownloadDrive, UploadDrive, UploadDriveMetadata, PrepareDriveUpload, CreateDriveFolder, RenameDriveItem, MoveDriveItem, GetDriveOperation, OperationId, INLINE_FILE_BYTES, DRIVE_FILE_BYTES, INLINE_UPLOAD_GUIDANCE } from "./schemas.ts";
 
 type Saved = Awaited<ReturnType<AppleSessionRepository["load"]>>;
 type Upload = z.infer<typeof UploadDriveMetadata>;
@@ -531,6 +532,7 @@ export class DriveService {
   }
   async prepareUpload(input: unknown) {
     const request = parse(UploadDriveMetadata, input);
+    if (request.size > DRIVE_STREAM_FILE_BYTES) throw new AppError("VALIDATION_ERROR", "Use an MCP resumable transfer above the dashboard's 4 GiB limit.", 413);
     if (request.size > DRIVE_DIRECT_UPLOAD_BYTES) this.requireStagingBucket();
     return this.metadata("drive.upload", request.expectedGeneration, async c => {
       const row = await this.operations.create(request.operationId, "upload", request, c.scope);
@@ -545,6 +547,7 @@ export class DriveService {
   }
   async prepareStreamUpload(input: unknown) {
     const request = parse(UploadDriveMetadata, input);
+    if (request.size > DRIVE_STREAM_FILE_BYTES) throw new AppError("VALIDATION_ERROR", "Use a resumable transfer above 4 GiB.", 413);
     return this.metadata("drive.upload", request.expectedGeneration, async c => {
       // A distinct kind pins the transport in the idempotency fingerprint.
       // Neither a staged intent nor the ordinary HTTP route can use this key.
@@ -555,7 +558,8 @@ export class DriveService {
     });
   }
   async prepareTransferUpload(input: unknown) {
-    const request = parse(UploadDriveMetadata, input);
+    const { resumable, ...request } = parse(PrepareDriveUpload, input);
+    if (resumable || request.size > DRIVE_STREAM_FILE_BYTES) return this.prepareResumableUpload(request);
     return this.metadata("drive.upload", request.expectedGeneration, async c => {
       const row = await this.operations.create(request.operationId, "stream-upload", request, c.scope);
       if (row.permission_revision !== c.scope.permissionRevision) conflict("Upload permissions changed since this intent was prepared.");
@@ -567,6 +571,51 @@ export class DriveService {
       return { ...result, transfer: await issueDriveTransfer(this.env, this.owner, "upload", row.operation_id, row.input_hash,
         { ...c.scope, expiresAt: Math.min(c.scope.expiresAt, row.expires_at) }, { size: request.size, sha256: request.sha256 }) };
     });
+  }
+  private async prepareResumableUpload(request: Upload) {
+    this.requireStagingBucket();
+    if (!request.size) throw new AppError("VALIDATION_ERROR", "Use the direct transfer for an empty file.", 400);
+    return this.metadata("drive.upload", request.expectedGeneration, async c => {
+      const row = await this.operations.create(request.operationId, "resumable-upload", request, c.scope);
+      if (row.permission_revision !== c.scope.permissionRevision) conflict("Upload permissions changed since this intent was prepared.");
+      if (row.phase === "prepared") {
+        await this.destination(c, request.parentId, request.name);
+        await this.staging(c).prepare(row.operation_id);
+      }
+      const current = await this.operations.get(row.operation_id, c.scope);
+      const result = this.publicOperation(current, await this.operations.data(current));
+      if (!["prepared", "uploaded", "confirmed"].includes(current.phase)) return result;
+      return { ...result, transfer: await issueDriveTransfer(this.env, this.owner, "staged-upload", current.operation_id, current.input_hash,
+        { ...c.scope, expiresAt: Math.min(c.scope.expiresAt, current.expires_at) }, { size: request.size, sha256: request.sha256 }) };
+    });
+  }
+  async resumableTransfer(request: Request, claim: TransferClaim) {
+    if (claim.kind !== "staged-upload" || claim.owner !== this.owner) conflict("This is not a staged transfer capability.");
+    // R2 preparation has no Apple calls. Revalidate the pinned account and
+    // permissions, but do not acquire or rewrite the Apple metadata session on
+    // each part. The operation's own CAS lease serializes durable hash progress.
+    let saved = await this.guard(claim.scope, "drive.upload");
+    const guard = async () => {
+      for (let attempt = 0; attempt < 3; attempt++) {
+        if (Date.now() >= claim.scope.expiresAt) throw new AppError("AUTH_EXPIRED", "This staged transfer authorization expired.", 409);
+        if (await this.sessions.driveTransferCurrent(saved.fence, claim.scope.permissionRevision)) return;
+        saved = await this.guard(claim.scope, "drive.upload");
+      }
+      conflict("The Apple session is busy updating. Resume the retained staged operation after inspecting progress.");
+    };
+    const row = await this.operations.get(claim.id, claim.scope);
+    if (row.kind !== "resumable-upload" || row.input_hash !== claim.inputHash || row.permission_revision !== claim.scope.permissionRevision) conflict("The staged transfer input or permissions changed.");
+    const staging = new DriveStaging(this.requireStagingBucket(), this.operations, claim.scope, guard);
+    if (request.method === "GET") return this.publicOperation(row, await this.operations.data(row));
+    const action = request.headers.get("x-drive-transfer-action");
+    if (action === "part") {
+      if (request.headers.get("content-type") !== "application/octet-stream" || !request.body) throw new AppError("VALIDATION_ERROR", "Send one binary file part.", 400);
+      return staging.part(row.operation_id, Number(request.headers.get("x-drive-part-number")), request.headers.get("x-content-sha256") ?? "", request.body, request.signal);
+    }
+    if (request.body) { await request.body.cancel(); throw new AppError("VALIDATION_ERROR", "This transfer action takes no request body.", 400); }
+    if (action === "complete") return this.completeMultipartUpload({ operationId: row.operation_id, expectedGeneration: claim.scope.generation }, request.signal, claim);
+    if (action === "discard") return staging.discard(row.operation_id);
+    throw new AppError("VALIDATION_ERROR", "Use part, complete or discard, or GET for progress.", 400);
   }
   async streamUploadStatus(operationId: string, claim?: TransferClaim) {
     if (claim && (claim.kind !== "upload" || claim.id !== operationId || claim.owner !== this.owner)) conflict("This capability belongs to another upload.");
@@ -599,15 +648,21 @@ export class DriveService {
       return await this.staging(context).part(parse(OperationId, operationId), partNumber, checksum, body, signal);
     } finally { await body.cancel().catch(() => {}); }
   }
-  async completeMultipartUpload(input: unknown, signal?: AbortSignal) {
+  async completeMultipartUpload(input: unknown, signal?: AbortSignal, claim?: TransferClaim) {
     const request = parse(GetDriveOperation, input), bucket = this.requireStagingBucket();
     const ready = await this.metadata("drive.upload", request.expectedGeneration, async c => {
       const staging = await this.staging(c).complete(request.operationId);
       const row = await this.operations.get(request.operationId, c.scope);
       return { staging, operation: this.publicOperation(row, await this.operations.data(row)) };
-    });
+    }, claim?.scope);
     if (ready.operation.phase === "confirmed") {
       await bucket.delete(ready.staging.key); return ready.operation;
+    }
+    if (ready.staging.verification) {
+      const empty = new ReadableStream<Uint8Array>({ start(controller) { controller.close(); } });
+      const result = await this.uploadContent(request.operationId, empty, signal, true, false, claim);
+      if (result.phase === "confirmed") await bucket.delete(ready.staging.key);
+      return result;
     }
     const object = await bucket.get(ready.staging.key, { onlyIf: { etagMatches: ready.staging.objectEtag! } });
     if (!object || !("body" in object)) throw new AppError("CONFLICT", "The staged upload expired or changed. Inspect its operation before continuing.", 409);
@@ -634,7 +689,7 @@ export class DriveService {
   }
   async uploadContent(operationId: string, body: ReadableStream<Uint8Array>, signal?: AbortSignal, staged = false, streamed = false, claim?: TransferClaim, ready?: () => void) {
     operationId = parse(OperationId, operationId);
-    if (claim && (claim.kind !== "upload" || claim.id !== operationId || claim.owner !== this.owner)) conflict("This capability belongs to another upload.");
+    if (claim && (claim.kind !== (staged ? "staged-upload" : "upload") || claim.id !== operationId || claim.owner !== this.owner)) conflict("This capability belongs to another upload.");
     let c: Context | null = await this.open("drive.upload", claim?.scope.generation, claim?.scope);
     const scope = c.scope;
     let row: DriveOperation;
@@ -644,7 +699,7 @@ export class DriveService {
       row = await this.operations.get(operationId, scope);
       if (claim && (row.input_hash !== claim.inputHash || row.permission_revision !== scope.permissionRevision)) conflict("This capability belongs to different upload input or permissions.");
       data = await this.operations.data(row);
-      if (row.kind !== (streamed ? "stream-upload" : "upload")) conflict("This operation belongs to a different upload transport.");
+      if (!(streamed ? ["stream-upload"] : staged ? ["upload", "resumable-upload"] : ["upload"]).includes(row.kind)) conflict("This operation belongs to a different upload transport.");
       request = parse(UploadDriveMetadata, data.input);
       if (row.phase !== "confirmed" && (data.staging?.cancelled || staged && !data.staging?.objectEtag)) conflict("This staged upload is unavailable.");
       if (row.phase !== "confirmed" && !staged && !streamed && (request.size > DRIVE_DIRECT_UPLOAD_BYTES || data.staging)) throw new AppError("VALIDATION_ERROR", "Use prepare-multipart-upload, numbered parts and complete-multipart-upload for this file. Direct uploads allow at most 64 MiB.", 413);
@@ -683,7 +738,14 @@ export class DriveService {
         const saved = await this.guard(scope, "drive.upload");
         const client = new DriveClient(http.http, requireDriveConnection(saved.session));
         client.restoreUploadAllocation(allocation, request);
-        const checked = this.checkedStream(body, scope, "drive.upload", request.size, signal, request.sha256);
+        let cached = saved;
+        const storedGuard = async () => {
+          if (Date.now() >= scope.expiresAt) throw new AppError("AUTH_EXPIRED", "The stored transfer authorization expired.", 409);
+          if (!await this.sessions.driveTransferCurrent(cached.fence, scope.permissionRevision)) cached = await this.guard(scope, "drive.upload");
+        };
+        const checked = row.kind === "resumable-upload"
+          ? storedUpload(this.requireStagingBucket(), data.staging!, request.size, request.sha256, storedGuard, signal)
+          : this.checkedStream(body, scope, "drive.upload", request.size, signal, request.sha256);
         let receipt;
         try {
           ready?.();

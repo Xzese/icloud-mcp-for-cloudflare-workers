@@ -85,11 +85,13 @@ export class DriveOperationRepository {
     if (row.input_hash !== inputHash || row.kind !== kind) throw new AppError("CONFLICT", "This operation key was already used for different input. Retain the original key and input for recovery.", 409);
     return row;
   }
-  async claim(row: DriveOperation, scope: DriveScope) {
+  async claim(row: DriveOperation, scope: DriveScope, leaseMs?: number) {
     if (row.permission_revision !== scope.permissionRevision) throw new AppError("CONFLICT", "Service settings changed after this operation began. Inspect the retained operation; do not replay it.", 409);
     const now = Date.now(), lease = crypto.randomUUID();
+    const duration = leaseMs ?? (["upload", "stream-upload", "resumable-upload", "bulk-upload"].includes(row.kind) ? DRIVE_UPLOAD_LEASE_MS : 150_000);
+    if (!Number.isSafeInteger(duration) || duration < 10_000 || duration > DRIVE_UPLOAD_LEASE_MS) throw conflict();
     const next = await this.db.prepare("UPDATE drive_operations SET lease_id = ?, lease_until = ?, revision = revision + 1 WHERE owner_id = ? AND operation_id = ? AND revision = ? AND lease_until <= ? AND expires_at > ? RETURNING *")
-      .bind(lease, Math.min(now + (["upload", "stream-upload", "bulk-upload"].includes(row.kind) ? DRIVE_UPLOAD_LEASE_MS : 150_000), row.expires_at), this.owner, row.operation_id, row.revision, now, now).first<DriveOperation>();
+      .bind(lease, Math.min(now + duration, row.expires_at), this.owner, row.operation_id, row.revision, now, now).first<DriveOperation>();
     if (!next) throw conflict();
     return next;
   }

@@ -1,3 +1,4 @@
+import { storedUploadProof } from "../drive/stored-upload.ts";
 import { retainVerifiedUploadBody } from "./drive-upload-socket.ts";
 import { AppError } from "../errors.ts";
 import type { AppleHTTP } from "./apple-http.ts";
@@ -265,17 +266,20 @@ export class DriveHTTP {
     let total = 0, complete = false;
     let sourceFailure: unknown;
     let stopped: { reason: unknown } | undefined, cancellation: Promise<void> | undefined;
-    const reader = body.getReader();
+    const stored = storedUploadProof(body);
+    if (stored && stored.size !== expectedSize) throw new AppError("CONFLICT", "The verified stored file length changed.", 409);
+    const reader = stored ? undefined : body.getReader();
+    const isComplete = () => stored?.complete() ?? complete;
     const stop = (reason: unknown) => {
-      if (complete) return Promise.resolve();
+      if (isComplete()) return Promise.resolve();
       stopped ??= { reason };
-      return cancellation ??= reader.cancel(stopped.reason).catch(() => {});
+      return cancellation ??= (stored ? stored.cancel(stopped.reason) : reader!.cancel(stopped.reason)).catch(() => {});
     };
     const checkStopped = () => { if (stopped) throw stopped.reason; };
-    const raw = new ReadableStream<Uint8Array>({
+    const raw = stored ? body : new ReadableStream<Uint8Array>({
       async pull(controller) {
         try {
-          const chunk = await reader.read();
+          const chunk = await reader!.read();
           // cancel() resolves pending reads as EOF. That is transport cleanup,
           // not evidence that the caller supplied a truncated file.
           checkStopped();
@@ -283,7 +287,7 @@ export class DriveHTTP {
             if (total !== expectedSize) throw new AppError("VALIDATION_ERROR", "The upload stream length did not match its declared size.");
             controller.close();
             complete = true;
-            reader.releaseLock();
+            reader?.releaseLock();
             return;
           }
           total += chunk.value.byteLength;
@@ -292,11 +296,11 @@ export class DriveHTTP {
             // A fixed-length consumer can stop pulling at exactly Content-Length.
             // Verify EOF (including the caller's final hash check) before releasing
             // the final bytes, so an early receipt cannot bypass verification.
-            const end = await reader.read();
+            const end = await reader!.read();
             checkStopped();
             if (!end.done) throw new AppError("VALIDATION_ERROR", "The upload stream exceeded its declared byte budget.");
             complete = true;
-            reader.releaseLock();
+            reader?.releaseLock();
             controller.enqueue(chunk.value);
             controller.close();
             return;
@@ -318,13 +322,13 @@ export class DriveHTTP {
     let framed = raw;
     const pumpAbort = new AbortController();
     let pump: Promise<void> | undefined, framingFailed = false;
-    if (typeof FixedLengthStream === "function") {
+    if (!stored && typeof FixedLengthStream === "function") {
       const fixed = new FixedLengthStream(length);
       pump = raw.pipeTo(fixed.writable, { signal: pumpAbort.signal });
       void pump.catch(() => { framingFailed = true; });
       framed = fixed.readable;
     }
-    const releaseBodyProof = retainVerifiedUploadBody(framed, length, () => complete);
+    const releaseBodyProof = retainVerifiedUploadBody(framed, length, isComplete);
     let stage: "request" | "response" | "completion" = "request", upstreamStatus: number | null = null;
     let responseDiagnostic: ReturnType<typeof uploadResponseDiagnostics> | undefined;
     let failure: AppError | undefined;
@@ -347,23 +351,25 @@ export class DriveHTTP {
       }
       const receipt = await readBounded(response, DRIVE_MAX_METADATA_BYTES, budget.signal);
       stage = "completion";
-      if (!complete) throw new AppError("PROTOCOL_CHANGED", "The upload server responded before consuming the complete upload body.");
+      if (!isComplete()) throw new AppError("PROTOCOL_CHANGED", "The upload server responded before consuming the complete upload body.");
       await pump;
+      await stored?.drained;
       return receipt;
     } catch (error) {
-      const cause = sourceFailure ?? error;
+      const cause = stored?.failure() ?? sourceFailure ?? error;
       failure = cause instanceof AppError ? cause : new AppError("UPSTREAM_UNAVAILABLE", "The iCloud Drive upload could not complete within its transfer budget.", 503, false);
       // Numeric counters and fixed codes only. Signed URLs, raw fetch errors,
       // filenames, Apple receipts and request headers remain private.
       console.error({ event: "drive-upload-failed", stage: sourceFailure ? "source" : stage, upstreamStatus,
-        bytesRead: total, expectedSize, requestBodySize: length, sourceComplete: complete, framingFailed, aborted: budget.signal.aborted, code: failure.code, ...responseDiagnostic });
+        bytesRead: stored?.bytes() ?? total, expectedSize, requestBodySize: length, sourceComplete: isComplete(), framingFailed, aborted: budget.signal.aborted, code: failure.code, ...responseDiagnostic });
       throw failure;
     } finally {
       releaseBodyProof();
       await stop(failure ?? new AppError("CONFLICT", "The upload transport finished before its source.", 409));
       pumpAbort.abort(failure);
       await pump?.catch(() => {});
-      try { reader.releaseLock(); } catch { /* The source may already be released. */ }
+      await stored?.drained.catch(() => {});
+      try { reader?.releaseLock(); } catch { /* The source may already be released. */ }
       budget.dispose();
     }
   }

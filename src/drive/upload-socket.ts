@@ -4,6 +4,38 @@ import type { RuntimeEnv } from "../platform/sites.ts";
 import { DRIVE_STREAM_CHUNK_BYTES, DRIVE_STREAM_PROTOCOL, DRIVE_STREAM_LEGACY_PROTOCOL, DRIVE_TRANSFER_TIMEOUT_MS } from "./limits.ts";
 import type { TransferClaim } from "./transfer-capability.ts";
 
+// A control-only socket keeps final R2 delivery attached to a live request. No
+// giant HTTP response wait, background waitUntil job, or file frames are used.
+export async function driveStoredUploadSocket(request: Request, service: DriveService, claim: TransferClaim) {
+  const protocol = "icloud-drive-upload-parts-v1";
+  if (request.method !== "GET" || request.headers.get("upgrade")?.toLowerCase() !== "websocket" || request.headers.get("sec-websocket-protocol") !== protocol) throw new AppError("VALIDATION_ERROR", "Use the staged completion WebSocket protocol.", 426);
+  const intent = await service.resumableTransfer(request, claim);
+  if (!("phase" in intent) || !["prepared", "uploaded", "confirmed"].includes(intent.phase)) throw new AppError("WRITE_OUTCOME_UNKNOWN", "Inspect this operation; its Apple write cannot be retried.", 503);
+  const [client, server] = Object.values(new WebSocketPair());
+  const abort = new AbortController(); let closed = false;
+  const send = (message: object) => server.send(JSON.stringify({ ...message, operationId: claim.id }));
+  const stop = (reason?: unknown) => {
+    if (closed) return;
+    closed = true; clearInterval(heartbeat); clearTimeout(timer); abort.abort(reason);
+  };
+  const fail = (error: unknown) => {
+    if (closed) return;
+    try { send({ type: "failed", error: publicError(error, crypto.randomUUID()) }); } catch { /* Disconnected. */ }
+    stop(error); try { server.close(1008, "Inspect the retained operation."); } catch { /* Disconnected. */ }
+  };
+  server.accept();
+  const heartbeat = setInterval(() => { try { send({ type: "pending" }); } catch (error) { stop(error); } }, 15_000);
+  const timer = setTimeout(() => fail(new AppError("AUTH_EXPIRED", "The stored delivery exceeded its transfer budget.", 409)), DRIVE_TRANSFER_TIMEOUT_MS);
+  server.addEventListener("close", () => stop(new AppError("CONFLICT", "The completion connection closed; inspect the operation.", 409)));
+  server.addEventListener("error", () => fail(new AppError("CONFLICT", "The completion connection failed; inspect the operation.", 409)));
+  server.addEventListener("message", () => fail(new AppError("VALIDATION_ERROR", "No client frames are accepted during stored delivery.", 400)));
+  void service.completeMultipartUpload({ operationId: claim.id, expectedGeneration: claim.scope.generation }, abort.signal, claim).then(operation => {
+    if (closed) return;
+    send({ type: "result", operation }); stop(); server.close(1000, "Upload receipt saved.");
+  }).catch(fail);
+  return new Response(null, { status: 101, webSocket: client, headers: { "sec-websocket-protocol": protocol, "cache-control": "private, no-store", "x-robots-tag": "noindex, nofollow, noarchive, nosnippet", "referrer-policy": "no-referrer" } });
+}
+
 // The browser sends exactly one frame per server credit. Credits follow reads
 // by the existing Apple upload stream, bounding queued bytes without R2.
 export async function driveUploadSocket(request: Request, env: RuntimeEnv, service: DriveService, operationId: string, claim?: TransferClaim) {
