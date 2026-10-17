@@ -407,3 +407,51 @@ test("copy transport creates fresh related IDs and tolerates only signed urgency
   corruptChecksum = true;
   await assert.rejects(client.modifyTransfer("create", rootWrite, [destinationWrite], [destination], dependencies, guards, undefined, sourceListId), (error: unknown) => error instanceof WriteOutcomeUnknownError);
 });
+
+test("atomic write diagnostics distinguish failed HTTP responses, invalid confirmations and transport loss", async () => {
+  const current = currentRecord();
+  const write = buildUpdateReminder({ listId: baseInput.listId, reminderId: current.recordName,
+    recordChangeTag: current.recordChangeTag!, changes: { title: "Synthetic diagnostic" } }, current, owner);
+  const cases = [
+    { send: async () => Response.json({ privateBody: "must never escape" }, { status: 500 }), phase: "upstream_response", status: 500 },
+    { send: async () => Response.json({ records: [] }), phase: "confirmation", status: 200 },
+    { send: async () => { throw new Error("private transport detail"); }, phase: "transport", status: null },
+  ];
+  for (const sample of cases) {
+    const client = new CloudKitRemindersClient(new AppleHTTP(new CookieJar(), sample.send), {
+      dsid: "123456789", clientId: "synthetic-client", clientBuildNumber: "2534Project66", clientMasteringNumber: "2534B22",
+      cloudKitURL: "https://p01-ckdatabasews.icloud.com/database/1/com.apple.reminders/production/private", remindersZoneOwner: owner,
+    });
+    await assert.rejects(client.modifyScheduling(write, []), error => {
+      assert.ok(error instanceof WriteOutcomeUnknownError);
+      assert.equal(error.diagnostics?.phase, sample.phase); assert.equal(error.diagnostics?.upstreamStatus, sample.status);
+      assert.ok(error.diagnostics!.elapsedMs >= 0);
+      assert.doesNotMatch(JSON.stringify(error), /must never escape|private transport detail/);
+      return true;
+    });
+  }
+});
+
+test("an Apple request timeout returns bounded transport diagnostics without retrying", async t => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const current = currentRecord();
+  const write = buildUpdateReminder({ listId: baseInput.listId, reminderId: current.recordName,
+    recordChangeTag: current.recordChangeTag!, changes: { title: "Synthetic timeout" } }, current, owner);
+  let calls = 0;
+  let started!: () => void;
+  const requestStarted = new Promise<void>(resolve => { started = resolve; });
+  const http = new AppleHTTP(new CookieJar(), async (_, init) => {
+    calls++; started();
+    return await new Promise<Response>((_, reject) => init!.signal!.addEventListener("abort", () => reject(new DOMException("Aborted", "AbortError")), { once: true }));
+  });
+  const client = new CloudKitRemindersClient(http, {
+    dsid: "123456789", clientId: "synthetic-client", clientBuildNumber: "2534Project66", clientMasteringNumber: "2534B22",
+    cloudKitURL: "https://p01-ckdatabasews.icloud.com/database/1/com.apple.reminders/production/private", remindersZoneOwner: owner,
+  });
+  const result = assert.rejects(client.modifyScheduling(write, []), error => error instanceof WriteOutcomeUnknownError &&
+    error.diagnostics?.phase === "transport" && error.diagnostics?.cause === "UPSTREAM_UNAVAILABLE" && error.diagnostics?.upstreamStatus === null);
+  await requestStarted;
+  t.mock.timers.tick(8000);
+  await result;
+  assert.equal(calls, 1);
+});

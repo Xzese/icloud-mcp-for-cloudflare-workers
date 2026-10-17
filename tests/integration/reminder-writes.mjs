@@ -331,6 +331,7 @@ export async function verifyReminderWrites(options) {
           state.modifies.push({ recurringCompletion: true, inPlaceRecurring, operationCount: body.operations.length,
             historyId: body.operations.find(candidate => candidate.operationType === "create" && candidate.record.recordType === "Reminder")?.record.recordName });
           const action = state.nextModify; state.nextModify = null;
+          if (action === "recurring-uncommitted-500") return jsonResponse({ serverErrorCode: "SERVICE_UNAVAILABLE" }, 500);
           const raced = action === "recurring-rule-race" ? body.operations.find(candidate => candidate.record.recordType === "RecurrenceRule") :
             action === "recurring-list-race" ? body.operations.find(candidate => candidate.record.recordType === "List") :
               action === "recurring-alarm-race" ? body.operations.find(candidate => candidate.record.recordType === "Alarm") : null;
@@ -1560,12 +1561,68 @@ export async function verifyReminderWrites(options) {
       fixture.rule.fields.Frequency = field("INT64", 0); delete fixture.rule.fields.EndDate;
       return fixture;
     };
+    const recoveryOriginalIds = new Set(state.records.keys()), recoveryOriginalList = structuredClone(state.records.get(listId));
+    const retryDaily = seedTimedDaily("UNCHANGED-RETRY"), beforeRetry = state.modifies.length;
+    const prematureRetry = await mcp("tools/call", { name: "complete_reminder", arguments: { ...retryDaily.args, retryUnchangedOccurrence: true } });
+    assert.equal(prematureRetry.result.structuredContent.error.code, "CONFLICT");
+    assert.equal(state.modifies.length, beforeRetry);
+    state.nextModify = "recurring-uncommitted-500";
+    const failedRetryDaily = await mcp("tools/call", { name: "complete_reminder", arguments: retryDaily.args });
+    assert.equal(failedRetryDaily.result.structuredContent.error.code, "WRITE_OUTCOME_UNKNOWN");
+    assert.deepEqual(failedRetryDaily.result.structuredContent.error.originalRequest, retryDaily.args);
+    const failedDiagnostics = failedRetryDaily.result.structuredContent.error.writeDiagnostics;
+    assert.equal(failedDiagnostics.phase, "upstream_response"); assert.equal(failedDiagnostics.upstreamStatus, 500);
+    assert.equal(failedDiagnostics.dispatchAttempted, true);
+    const firstRetryWire = structuredClone(state.requests.filter(request => request.path.endsWith("/records/modify")).at(-1).body);
+    const noImplicitRetry = await mcp("tools/call", { name: "complete_reminder", arguments: { ...retryDaily.args, retryUnchangedOccurrence: false } });
+    assert.equal(noImplicitRetry.result.structuredContent.error.code, "WRITE_OUTCOME_UNKNOWN");
+    assert.equal(state.modifies.length, beforeRetry + 1, "An explicit read-only retry never dispatches.");
+    const pendingInspection = await mcp("tools/call", { name: "inspect_reminder", arguments: {
+      listId, reminderId: retryDaily.active.recordName, expectedGeneration: generation,
+    } });
+    assert.equal(pendingInspection.result.isError, undefined, JSON.stringify(pendingInspection.result));
+    const recovery = pendingInspection.result.structuredContent.recurringRecovery;
+    assert.equal(recovery.phase, "dispatched"); assert.equal(recovery.sourceUnchanged, true); assert.equal(recovery.outcome, "unresolved");
+    assert.deepEqual(recovery.originalRequest, retryDaily.args);
+    assert.equal(recovery.missingExpectedIds.length, 5); assert.equal(recovery.retiredIdsStillPresent.length, 2);
+    assert.equal(state.modifies.length, beforeRetry + 1, "Recovery inspection never writes to Apple.");
+    const recoveredDaily = await mcp("tools/call", { name: "complete_reminder", arguments: failedRetryDaily.result.structuredContent.error.originalRequest });
+    assert.equal(recoveredDaily.result.isError, undefined, JSON.stringify(recoveredDaily.result));
+    assert.equal(state.modifies.length, beforeRetry + 2);
+    const retriedWire = state.requests.filter(request => request.path.endsWith("/records/modify")).at(-1).body;
+    assert.deepEqual(retriedWire, firstRetryWire, "Recovery sends identical atomic operations, source versions, timestamp and create IDs.");
+    const verifiedDaily = await mcp("tools/call", { name: "complete_reminder", arguments: retryDaily.args });
+    assert.equal(verifiedDaily.result.isError, undefined, JSON.stringify(verifiedDaily.result));
+    assert.equal(verifiedDaily.result.structuredContent.replayed, true);
+    assert.equal(state.modifies.length, beforeRetry + 2, "Repeating the original request cannot advance the next occurrence.");
+
+    const driftRetry = seedTimedDaily("CHANGED-RETRY"), beforeDriftRetry = state.modifies.length;
+    state.nextModify = "recurring-uncommitted-500";
+    await mcp("tools/call", { name: "complete_reminder", arguments: driftRetry.args });
+    driftRetry.alarm.recordChangeTag += "-external-change";
+    const refusedDefaultRetry = await mcp("tools/call", { name: "complete_reminder", arguments: driftRetry.args });
+    assert.equal(refusedDefaultRetry.result.structuredContent.error.code, "WRITE_OUTCOME_UNKNOWN");
+    assert.deepEqual(refusedDefaultRetry.result.structuredContent.error.originalRequest, driftRetry.args);
+    assert.equal(state.modifies.length, beforeDriftRetry + 1);
+    const refusedRetry = await mcp("tools/call", { name: "complete_reminder", arguments: { ...driftRetry.args, retryUnchangedOccurrence: true } });
+    assert.equal(refusedRetry.result.structuredContent.error.code, "CONFLICT");
+    assert.equal(state.modifies.length, beforeDriftRetry + 1, "A changed dependency prevents retry even when the root version is unchanged.");
+    for (const id of state.records.keys()) if (!recoveryOriginalIds.has(id)) state.records.delete(id);
+    state.records.set(listId, recoveryOriginalList);
+
     const dailyJourney = seedTimedDaily("JOURNEY"), beforeTimedDaily = state.modifies.length;
     const dailyRuleBefore = structuredClone(dailyJourney.rule.fields), dailyPresentationBefore = structuredClone(dailyJourney.active.fields.UrgentPresentationAlarmsAsData);
     state.nextModify = "committed-500";
     const dailyLost = await mcp("tools/call", { name: "complete_reminder", arguments: dailyJourney.args });
     assert.equal(dailyLost.result.structuredContent.error.code, "WRITE_OUTCOME_UNKNOWN");
     assert.equal(state.modifies.length, beforeTimedDaily + 1);
+    const refreshedVersionRetry = await mcp("tools/call", { name: "complete_reminder", arguments: {
+      ...dailyJourney.args, recordChangeTag: state.records.get(dailyJourney.active.recordName).recordChangeTag,
+    } });
+    assert.equal(refreshedVersionRetry.result.structuredContent.error.code, "WRITE_OUTCOME_UNKNOWN");
+    assert.deepEqual(refreshedVersionRetry.result.structuredContent.error.originalRequest, dailyJourney.args);
+    assert.equal(refreshedVersionRetry.result.structuredContent.error.writeDiagnostics.dispatchAttempted, false);
+    assert.equal(state.modifies.length, beforeTimedDaily + 1, "A fresh version cannot complete the next occurrence while the original result is unresolved.");
     const dailyReconciled = await mcp("tools/call", { name: "complete_reminder", arguments: dailyJourney.args });
     assert.equal(dailyReconciled.result.isError, undefined, JSON.stringify(dailyReconciled.result));
     const dailyResult = dailyReconciled.result.structuredContent;
@@ -2023,7 +2080,9 @@ export async function verifyReminderWrites(options) {
     const calendarHistoryId = state.modifies.at(-1).historyId;
     for (const args of [calendarBaseArgs, { ...calendarArgs, recurrenceCalendarTimeZone: "UTC" }]) {
       const differentCalendar = await mcp("tools/call", { name: "complete_reminder", arguments: args });
-      assert.equal(differentCalendar.result.structuredContent.error.code, "CONFLICT"); assert.equal(state.modifies.length, beforeCalendar + 1);
+      assert.equal(differentCalendar.result.structuredContent.error.code, "WRITE_OUTCOME_UNKNOWN");
+      assert.deepEqual(differentCalendar.result.structuredContent.error.originalRequest, calendarArgs);
+      assert.equal(state.modifies.length, beforeCalendar + 1);
     }
     const calendarAdvanceResponse = await mcp("tools/call", { name: "complete_reminder", arguments: calendarArgs });
     assert.equal(calendarAdvanceResponse.result.isError, undefined, JSON.stringify(calendarAdvanceResponse.result));

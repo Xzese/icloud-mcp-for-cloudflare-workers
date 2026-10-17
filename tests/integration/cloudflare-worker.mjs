@@ -56,7 +56,7 @@ try {
   const home = await worker.dispatchFetch(origin + "/", { headers: signed });
   assert.equal(home.status, 200);
   const dashboard = await home.text();
-  assert.ok(dashboard.includes("Reminders connection"));
+  assert.ok(dashboard.includes("iCloud connection"));
   assert.ok(dashboard.includes('href="/cdn-cgi/access/logout"'));
   assert.ok(!dashboard.includes('href="/signout-with-chatgpt'));
   const mcp = await worker.dispatchFetch(origin + "/mcp", { method: "POST", headers: { ...signed, "content-type": "application/json", accept: "application/json, text/event-stream" }, body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "connection_status", arguments: {} } }) });

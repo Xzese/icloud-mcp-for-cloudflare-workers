@@ -106,6 +106,14 @@ function discardRetiredCatalogueState(value: unknown): unknown {
   }
   return current;
 }
+export const RecurringCompletionRequestSchema = z.object({
+  listId: z.string().min(6).max(255).startsWith("List/"),
+  reminderId: z.string().min(10).max(255).startsWith("Reminder/"),
+  recordChangeTag: z.string().min(1).max(512),
+  expectedGeneration: z.number().int().nonnegative().safe(),
+  recurrenceCalendarTimeZone: RecurrenceCalendarTimeZone.optional(),
+}).strict();
+export type RecurringCompletionRequest = z.infer<typeof RecurringCompletionRequestSchema>;
 export const RecurringIntentSchema = z.object({
   requestFingerprint: z.string().regex(/^[a-f0-9]{64}$/), sourceFingerprint: z.string().regex(/^[a-f0-9]{64}$/),
   timestamp: z.number().int().nonnegative().safe(), phase: z.enum(["prepared", "dispatched", "confirmed"]),
@@ -121,7 +129,13 @@ export const RecurringIntentSchema = z.object({
   recurringDeletionScope: z.enum(["occurrence", "all_future"]).optional(),
   recurringDeletionRecipe: z.enum(["all_day_daily", "all_day_daily_ended", "timed_weekly_ended", "all_day_last_day_monthly"]).optional(),
   recurringDeletionTerminal: z.literal(true).optional(),
+  completionRequest: RecurringCompletionRequestSchema.optional(),
 }).strict().superRefine((intent, context) => {
+  if (intent.completionRequest && (intent.operation || intent.mode === "reopen" ||
+    intent.completionRequest.recurrenceCalendarTimeZone !== intent.recurrenceCalendarTimeZone ||
+    intent.expected.find(record => record.type === "Reminder")?.id !== intent.completionRequest.reminderId ||
+    !intent.expected.some(record => record.type === "List" && record.id === intent.completionRequest!.listId)))
+    context.addIssue({ code: z.ZodIssueCode.custom, message: "A completion request must identify its retained root, List and calendar zone." });
   if (intent.operation === "delete") {
     const endedDaily = intent.recurringDeletionRecipe === "all_day_daily_ended";
     const ended = endedDaily || intent.recurringDeletionRecipe === "timed_weekly_ended";

@@ -327,7 +327,21 @@ version guards reject changes after inspection, including concurrent connector L
 
 `CONFLICT` requires a fresh read and review. `WRITE_OUTCOME_UNKNOWN` means Apple may have saved
 the change: read the indicated reminder before retrying, and never choose a new creation key
-for that attempt. No mutation tool automatically retries writes or bypasses version conflicts.
+for that attempt. Never refresh a version to bypass an uncertain write.
+For recurring completions, repeat the returned `originalRequest` unchanged (or the identical
+original arguments). This is the normal completion path; no special retry flag is required.
+The server first reconciles the retained outcome IDs. For an advancing occurrence only, when
+every source field and version still matches and every original creation ID is definitely
+absent, it can resend the same atomic operations, IDs and timestamp. A delayed original request
+races on those same versions and IDs, so only one can commit. Changed, partially applied or
+unresolved state is refused; a confirmed operation is reconciled without another write.
+A fresh-version completion is blocked while that reminder has an unresolved dispatched
+completion, preventing accidental advancement of its next occurrence. `inspect_reminder`
+returns the original request and exact missing/changed outcome IDs in `recurringRecovery`.
+`retryUnchangedOccurrence: false` opts into read-only reconciliation; `true` remains compatible
+with explicit recovery clients. Other mutation recipes retain their existing no-replay behavior.
+Errors expose safe `writeDiagnostics` (failure phase, error code, HTTP status, elapsed time and
+whether dispatch was attempted), without Apple response bodies or credentials.
 Use a dedicated test reminder for your first live test. The [local acceptance procedure](docs/write-access.md#local-live-acceptance)
 includes a command that creates, edits, completes, reopens and deletes only its own test item.
 

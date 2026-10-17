@@ -16,6 +16,7 @@ import { RecurrenceChanges, readRecurrence } from "../src/reminders/recurrence.t
 import { verifySchedulingWrite } from "../src/reminders/scheduling-plan.ts";
 import { nextRecurringDue, planRecurringCompletion, recurringIdentities, verifyRecurringExpected } from "../src/reminders/recurring-lifecycle.ts";
 import { RecurringIntentSchema } from "../src/persistence/apple-sessions.ts";
+import { inspectRecurringRecovery, requireUnchangedRecurringRetry } from "../src/reminders/recurring-recovery.ts";
 import { planRecurringDeletion } from "../src/reminders/recurring-deletion.ts";
 import { planDateAlarmLifecycle } from "../src/reminders/date-alarm-lifecycle.ts";
 import { RecurrenceCalendarTimeZone, recurrenceEndCalendarLabel } from "../src/reminders/recurrence-calendar.ts";
@@ -1178,6 +1179,41 @@ test("ordinary absolute-date lifecycle preserves its pair, guards every version 
   bad[0].fields.UnknownParentIDs = { type: "STRING_LIST", value: ["unknown"] };
   assert.throws(() => planDateAlarmLifecycle("complete", badInput, badGraph, list, owner), hasCode("UNSUPPORTED_FEATURE"));
   assert.equal(dispatches, 5);
+});
+
+test("unknown recurring completion retries require unchanged source versions and definite absence of every original create ID", async () => {
+  const values = records(), root = values[0];
+  const list: CloudKitRecord = { recordName: listId, recordType: "List", recordChangeTag: "list-before", zoneID, raw: {}, fields: {
+    Deleted: { type: "INT64", value: 0 }, IsGroup: { type: "INT64", value: 0 }, ReminderIDs: { type: "STRING", value: JSON.stringify([root.recordName.slice(9)]) },
+    ResolutionTokenMap: { type: "STRING", value: JSON.stringify({ map: {} }) },
+  } };
+  const graph = await loadSchedulingGraph(root, owner, lookup(values));
+  const plan = await planRecurringCompletion(graph, list, owner, recurringIdentities(), Date.parse("2027-01-11T00:00:00Z"));
+  const intent = RecurringIntentSchema.parse({ requestFingerprint: "a".repeat(64), sourceFingerprint: plan.sourceFingerprint, timestamp: plan.timestamp,
+    ids: plan.ids, expected: plan.expected, retired: plan.retired, phase: "dispatched" });
+  const read = async (ids: string[]): Promise<CloudKitLookupResult> => ({ requestedRecordNames: ids,
+    records: [...values, list].filter(record => ids.includes(record.recordName)),
+    recordErrors: ids.filter(id => ![...values, list].some(record => record.recordName === id)).map(recordName => ({ recordName, serverErrorCode: "NOT_FOUND", reason: null, raw: {} })),
+    unresolvedRecordNames: [], complete: ids.every(id => [...values, list].some(record => record.recordName === id)),
+  });
+  const client = { lookup: read, lookupSchedulingRecords: read };
+  await requireUnchangedRecurringRetry(client, intent, plan);
+  const diagnostic = await inspectRecurringRecovery(client, intent, root, list, owner);
+  assert.equal(diagnostic.sourceUnchanged, true); assert.equal(diagnostic.outcome, "unresolved");
+  assert.equal(diagnostic.missingExpectedIds.length, 5); assert.equal(diagnostic.retiredIdsStillPresent.length, 2);
+  for (const phase of ["prepared", "confirmed"] as const)
+    await assert.rejects(requireUnchangedRecurringRetry(client, { ...intent, phase }, plan), hasCode("CONFLICT"));
+  const changed = structuredClone(values); changed[1].recordChangeTag = "alarm-changed";
+  const changedPlan = await planRecurringCompletion(await loadSchedulingGraph(changed[0], owner, lookup(changed)), list, owner, intent.ids, intent.timestamp);
+  await assert.rejects(requireUnchangedRecurringRetry(client, intent, changedPlan), hasCode("CONFLICT"));
+  for (const faulty of [
+    async (ids: string[]) => ({ ...(await read(ids)), recordErrors: [], unresolvedRecordNames: ids }),
+    async (ids: string[]) => ({ ...(await read(ids)), recordErrors: ids.map(recordName => ({ recordName, serverErrorCode: "ACCESS_DENIED", reason: null, raw: {} })) }),
+    async (ids: string[]) => ({ ...(await read(ids)), records: [{ ...root, recordName: ids[0] }] }),
+    async (ids: string[]) => ({ ...(await read(ids)), recordErrors: ids.map(() => ({ recordName: ids[0], serverErrorCode: "NOT_FOUND", reason: null, raw: {} })) }),
+  ]) await assert.rejects(requireUnchangedRecurringRetry({ lookup: faulty, lookupSchedulingRecords: faulty }, intent, plan), hasCode("CONFLICT"));
+  const nextIds = await planRecurringCompletion(graph, list, owner, recurringIdentities(), intent.timestamp);
+  await assert.rejects(requireUnchangedRecurringRetry(client, intent, nextIds), hasCode("CONFLICT"));
 });
 
 test("recurring completion preserves encoded history, advances calendar dates and replaces only the exact date pair atomically", async () => {

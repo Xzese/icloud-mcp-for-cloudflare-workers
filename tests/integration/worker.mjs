@@ -132,7 +132,7 @@ try {
   assert.equal((await request("/mcp", { user: "wrong-owner", method: "POST", body: { jsonrpc: "2.0", id: 1, method: "tools/list" } })).status, 403);
   assert.equal((await request("/mcp", { user: "wrong-owner", method: "POST", body: { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "get_all_open_reminders", arguments: { expectedGeneration: 0 } } } })).status, 403);
   const page = await request("/"); assert.equal(page.status, 200); const html = await page.text();
-  assert.ok(html.includes("Reminders connection")); assert.ok(!html.includes("Run runtime checks")); assert.ok(!html.includes("Evidence so far")); assert.ok(!html.includes(secret));
+  assert.ok(html.includes("iCloud connection")); assert.ok(!html.includes("Run runtime checks")); assert.ok(!html.includes("Evidence so far")); assert.ok(!html.includes(secret));
   assert.ok(page.headers.get("content-security-policy")?.includes("strict-dynamic"));
   assert.ok(!/\<script\b(?![^>]*\bnonce=)/i.test(html));
   // Enable the transport only in this disposable Worker, with all network

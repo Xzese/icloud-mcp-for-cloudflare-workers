@@ -1,3 +1,5 @@
+import type { RecurringCompletionRequest } from "./persistence/apple-sessions.ts";
+
 export type ErrorCode =
   | "UNAUTHENTICATED" | "FORBIDDEN" | "OWNER_NOT_CONFIGURED"
   | "NOT_CONNECTED" | "UNSUPPORTED_AUTH" | "UNSUPPORTED_FEATURE"
@@ -53,14 +55,28 @@ export class WriteOutcomeUnknownError extends AppError {
   readonly reminderId: string;
   readonly listId?: string;
   readonly idempotencyKey?: string;
-  constructor(reminderId: string, idempotencyKey?: string) {
+  readonly diagnostics?: WriteDiagnostics;
+  readonly originalRequest?: RecurringCompletionRequest;
+  constructor(reminderId: string, idempotencyKey?: string, details?: { diagnostics?: WriteDiagnostics; originalRequest?: RecurringCompletionRequest }) {
     super("WRITE_OUTCOME_UNKNOWN", reminderId.startsWith("List/")
       ? "Apple may have saved the list change, but this request could not confirm the result. Use get_reminder_list with this exact listId before trying another change. For creation, retain the same idempotencyKey; never generate another ID for this attempt."
-      : "Apple may have saved the reminder, but this request could not confirm the result. Read the reminder before trying another change. For creation, reuse the same idempotencyKey; never generate another ID for this attempt.", 503, false);
+      : "Apple may have saved the reminder, but this request could not confirm the result. Read the reminder before trying another change. For creation, reuse the same idempotencyKey; never generate another ID for this attempt." +
+        (details?.originalRequest ? " For this recurring completion, repeat originalRequest unchanged. The server will reconcile the retained operation and may safely retry the same exact atomic write; never substitute a fresh version." : ""), 503, false);
     this.reminderId = reminderId;
     if (reminderId.startsWith("List/")) this.listId = reminderId;
     this.idempotencyKey = idempotencyKey;
+    this.diagnostics = details?.diagnostics;
+    this.originalRequest = details?.originalRequest;
   }
+}
+
+/** Only bounded phase, status and timing metadata; never Apple bodies, fields or credentials. */
+export interface WriteDiagnostics {
+  phase: "transport" | "upstream_response" | "confirmation" | "reconciliation";
+  cause: ErrorCode;
+  upstreamStatus: number | null;
+  elapsedMs: number;
+  dispatchAttempted?: boolean;
 }
 
 export function publicError(error: unknown, requestId: string) {
@@ -70,7 +86,8 @@ export function publicError(error: unknown, requestId: string) {
   return { code: e.code, message: e.message, retryable: e.retryable, requestId,
     ...(e instanceof ListMembershipError ? { membershipDiagnostics: e.membershipDiagnostics } : {}),
     ...(e instanceof InspectionReadError ? { inspectionDiagnostics: e.inspectionDiagnostics } : {}),
-    ...(e instanceof WriteOutcomeUnknownError ? { ...(e.listId ? { listId: e.listId } : { reminderId: e.reminderId }), ...(e.idempotencyKey ? { idempotencyKey: e.idempotencyKey } : {}) } : {}) };
+    ...(e instanceof WriteOutcomeUnknownError ? { ...(e.listId ? { listId: e.listId } : { reminderId: e.reminderId }), ...(e.idempotencyKey ? { idempotencyKey: e.idempotencyKey } : {}),
+      ...(e.diagnostics ? { writeDiagnostics: e.diagnostics } : {}), ...(e.originalRequest ? { originalRequest: e.originalRequest } : {}) } : {}) };
 }
 
 export function requireValue(condition: unknown, message: string): asserts condition {

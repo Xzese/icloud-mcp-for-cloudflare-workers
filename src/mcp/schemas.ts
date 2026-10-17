@@ -5,6 +5,7 @@ import { z } from "zod";
 import { RecurrenceSummary } from "../reminders/recurrence.ts";
 import { SavedListSchema } from "../persistence/apple-sessions.ts";
 import { ListBadgeAppearance, ListColorAppearance } from "../reminders/list-appearance.ts";
+import { RecurringRecoveryOutput } from "../reminders/recurring-recovery.ts";
 
 const counter = z.number().int().nonnegative().safe();
 const nullableTime = counter.nullable();
@@ -87,6 +88,7 @@ const actionCheck = z.object({
   affectedReminderIds: z.array(z.string()).max(31), requiredInputs: z.array(z.string()).max(8),
 }).strict();
 export const ReminderInspectionOutput = z.object({
+  recurringRecovery: RecurringRecoveryOutput.optional(),
   syntheticEarlyAlert: z.object({
     alertIdentity: z.string().regex(/^[a-f0-9]{64}$/), accountIdentity: z.string().regex(/^[a-f0-9]{64}$/),
     creationDate: z.number().finite(), acknowledgedDate: z.number().finite().nullable(),
