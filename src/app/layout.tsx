@@ -2,11 +2,8 @@ import type { Metadata } from "next";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "iCloud Reminders",
-  description: "Private workspace for your iCloud Reminders connection.",
-  other: {
-    "codex-preview": "development",
-  },
+  title: "iCloud",
+  description: "Private workspace for your iCloud connection.",
   icons: {
     icon: "/favicon.svg",
     shortcut: "/favicon.svg",

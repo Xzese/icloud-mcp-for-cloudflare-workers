@@ -569,6 +569,7 @@ export class CloudKitRemindersClient {
   private readonly params: URLSearchParams;
   private readonly http: AppleHTTP;
   private owner: string | undefined;
+  private lastWriteStatus: number | null = null;
   readonly readTrace: CloudKitReadTrace[] = [];
   get remindersZoneOwner() { return this.owner; }
   private get expectedOwner() { return this.owner ?? DEFAULT_OWNER; }
@@ -604,6 +605,7 @@ export class CloudKitRemindersClient {
     url.search = this.params.toString();
     const hasSessionCookie = this.http.jar.header(url).length > 0;
     const started = Date.now();
+    if (path === "/records/modify") this.lastWriteStatus = null;
     const response = await this.http.request(url.href, {
       method: "POST",
       headers: appleWebHeaders(),
@@ -611,6 +613,7 @@ export class CloudKitRemindersClient {
       discovered: true,
       followRedirects: path !== "/records/modify",
     });
+    if (path === "/records/modify") this.lastWriteStatus = response.status;
     if ([401, 421, 450].includes(response.status)) {
       console.warn({ event: "apple-reminders-auth-rejected", path, upstreamStatus: response.status, hasSessionCookie, reason: "http-auth-rejection" });
       throw new AppError("REAUTH_REQUIRED", "Apple did not accept Reminders authentication. A saved-token check or Apple sign-in may be required.", 409);
@@ -1243,7 +1246,9 @@ export class CloudKitRemindersClient {
       await verifyRecurringExpected(plan.expected, result, this.expectedOwner, plan.intrinsicParentGuards);
       for (const id of plan.retired) requireValue(result.some(record => record.recordName === id && record.deleted === true && !("recordType" in record)), "Apple did not confirm exact alarm retirement.");
       return result.filter((record): record is CloudKitRecord => "recordType" in record);
-    } catch { throw new WriteOutcomeUnknownError(plan.active.recordName); }
+    } catch (error) { throw new WriteOutcomeUnknownError(plan.active.recordName, undefined, { diagnostics: {
+      phase: "confirmation", cause: error instanceof AppError ? error.code : "PROTOCOL_CHANGED", upstreamStatus: 200, elapsedMs: 0,
+    } }); }
   }
 
   async modifyRecurringDeletion(plan: RecurringDeletionPlan, beforeDispatch: () => Promise<void>): Promise<CloudKitRecord[]> {
@@ -1579,6 +1584,7 @@ export class CloudKitRemindersClient {
     requireInput(new Set(group.map(operation => operation.record.recordName)).size === group.length, "An atomic write requires exactly one mutation or guard per record.");
     requireInput(withinCloudKitRequestBudget(payload), "The reminder write exceeded its byte budget.");
     await beforeDispatch?.();
+    const writeStarted = Date.now();
     try {
       const result = await this.post("/records/modify", payload);
       const page = pageRecords(result.records, group.length, 32, this.expectedOwner, true, false, [...RECORD_TYPES, ...additionalGuardTypes]);
@@ -1612,7 +1618,11 @@ export class CloudKitRemindersClient {
     } catch (error) {
       if (error instanceof AppError && ["REAUTH_REQUIRED", "FORBIDDEN", "RATE_LIMITED", "CONFLICT"].includes(error.code)) throw error;
       if (error instanceof AppError && error.code === "PROTOCOL_CHANGED" && error.message === "Apple rejected the reminder write fields. No automatic retry was attempted.") throw error;
-      throw new WriteOutcomeUnknownError(group[0].record.recordName);
+      throw new WriteOutcomeUnknownError(group[0].record.recordName, undefined, { diagnostics: {
+        phase: this.lastWriteStatus === null ? "transport" : this.lastWriteStatus === 200 ? "confirmation" : "upstream_response",
+        cause: error instanceof AppError && !(error instanceof WriteOutcomeUnknownError) ? error.code : "UPSTREAM_UNAVAILABLE", upstreamStatus: this.lastWriteStatus,
+        elapsedMs: Math.max(0, Date.now() - writeStarted),
+      } });
     }
   }
 

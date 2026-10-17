@@ -11,7 +11,7 @@ import { AppError, InspectionReadError, WriteOutcomeUnknownError } from "../erro
 import { omitField } from "../lib/omit-field.ts";
 import { stableNativePresentation } from "../lib/native-presentation.ts";
 import type { RuntimeEnv } from "../platform/sites.ts";
-import { AppleSessionRepository, mergeSavedLists, type AppleSession, type AllOpenScan, type SearchScan, type ResumeFence } from "../persistence/apple-sessions.ts";
+import { AppleSessionRepository, mergeSavedLists, type AppleSession, type AllOpenScan, type SearchScan, type ResumeFence, type RecurringCompletionRequest } from "../persistence/apple-sessions.ts";
 import { CloudKitRateLimitedError, CloudKitRemindersClient, intrinsicParentIdentity, isKnownEmptyDeletionCollection, stableDeletionFields, normalizeList, normalizeReminder, referenceField, type CloudKitPage, type CloudKitRecord, type CloudKitLookupResult } from "../icloud/cloudkit.ts";
 import { CreateReminderInput, UpdateReminderInput, ReminderTargetInput, assertOwnedReminder, buildCreateReminder, buildReminderFieldUpdate, buildLifecycleReminder, matchesCreatedReminder, type CloudKitWriteRecord } from "../reminders/writes.ts";
 import { decodeDocument } from "../reminders/crdt.ts";
@@ -32,7 +32,8 @@ import { EvidenceInput, AtomicProtectionInput, captureEvidenceGraph, sanitizeEvi
 import { verifySchedulingWrite, type SchedulingWrite } from "../reminders/scheduling-plan.ts";
 import { CreateSubtaskInput, HAS_SUBTASKS_MESSAGE, SetReminderParentInput, buildCreateSubtask, buildSetReminderParent, inspectListChildren, requireNoChildren, subtaskParents } from "../reminders/subtasks.ts";
 import { inspectLifecycleFamily, planLifecycle, type LifecyclePlan, type LifecycleFamily } from "../reminders/lifecycle.ts";
-import { planRecurringCompletion, verifyRecurringExpected } from "../reminders/recurring-lifecycle.ts";
+import { planRecurringCompletion, verifyRecurringExpected, type RecurringCompletionPlan } from "../reminders/recurring-lifecycle.ts";
+import { inspectRecurringRecovery, requireUnchangedRecurringRetry } from "../reminders/recurring-recovery.ts";
 import { RecurrenceCalendarTimeZone } from "../reminders/recurrence-calendar.ts";
 import { RecurringDeletionScope, planRecurringDeletion } from "../reminders/recurring-deletion.ts";
 import { loadScheduledFamilyPairs, planScheduledFamilyLifecycle } from "../reminders/scheduled-family-lifecycle.ts";
@@ -53,7 +54,7 @@ export const ResumeRequest = z.object({ expectedGeneration: z.number().int().non
 export const ReminderMutation = z.discriminatedUnion("action", [
   CreateReminderInput.extend({ action: z.literal("create"), expectedGeneration: ResumeRequest.shape.expectedGeneration }).strict(),
   PreparedUpdateInput.extend({ action: z.literal("update"), expectedGeneration: ResumeRequest.shape.expectedGeneration }).strict(),
-  ReminderTargetInput.extend({ action: z.literal("complete"), expectedGeneration: ResumeRequest.shape.expectedGeneration, recurrenceCalendarTimeZone: RecurrenceCalendarTimeZone.optional() }).strict(),
+  ReminderTargetInput.extend({ action: z.literal("complete"), expectedGeneration: ResumeRequest.shape.expectedGeneration, recurrenceCalendarTimeZone: RecurrenceCalendarTimeZone.optional(), retryUnchangedOccurrence: z.boolean().optional() }).strict(),
   ReminderTargetInput.extend({ action: z.literal("reopen"), expectedGeneration: ResumeRequest.shape.expectedGeneration, recurrenceCalendarTimeZone: RecurrenceCalendarTimeZone.optional() }).strict(),
   ReminderTargetInput.extend({ action: z.literal("delete"), expectedGeneration: ResumeRequest.shape.expectedGeneration, recurringDeletionScope: RecurringDeletionScope.optional(), recurrenceCalendarTimeZone: RecurrenceCalendarTimeZone.optional() }).strict(),
   CreateSubtaskInput.extend({ action: z.literal("create_subtask"), expectedGeneration: ResumeRequest.shape.expectedGeneration }).strict(),
@@ -69,7 +70,7 @@ const authenticationFailure = (error: unknown) => error instanceof AppError && [
 const EARLY_WITNESS_LIMITS = { pages: 5, records: 1_000, bytes: 1_044_480, durationMs: 10_000 } as const;
 const EARLY_PAYLOAD_FIELD = "DueDateDeltaAlertsData";
 type OperationMode = "read-only" | "mutation-preparation" | "cursor-progress" | "pcs" | "snapshot";
-interface OperationStage { phase: OperationMode | "mutation-dispatch" | "mutation-confirmation"; dispatch(): void; confirm(): void; }
+interface OperationStage { phase: OperationMode | "mutation-dispatch" | "mutation-confirmation"; transportDispatched: boolean; dispatch(): void; confirm(): void; }
 export const ControlledRead = z.discriminatedUnion("action", [
   z.object({ action: z.literal("discover"), expectedGeneration: common.expectedGeneration }).strict(),
   z.object({ action: z.literal("saved-lists"), expectedGeneration: common.expectedGeneration }).strict(),
@@ -527,7 +528,10 @@ export class AppleConnectionService {
       const started = Date.now();
       try {
         const details = await inspectReminder(client, current, list, client.remindersZoneOwner!, input);
-        const result = { generation: fence.generation, record, ...details };
+        const pending = saved.session.recurringIntents?.filter(intent => !intent.operation && intent.phase !== "confirmed" &&
+          intent.expected.some(expected => expected.id === current.recordName)).sort((a, b) => b.timestamp - a.timestamp)[0];
+        const recurringRecovery = pending ? await inspectRecurringRecovery(client, pending, current, list, client.remindersZoneOwner!) : undefined;
+        const result = { generation: fence.generation, record, ...details, ...(recurringRecovery ? { recurringRecovery } : {}) };
         if (jsonBytes(result) > 262_144) throw new AppError("UNSUPPORTED_FEATURE", "The expanded reminder exceeds the inspection response budget.");
         await repository.commitResume(fence, appleSuccess({ ...saved.session, connection: { ...saved.session.connection, remindersZoneOwner: client.remindersZoneOwner }, auth: http.snapshot() }), "READY");
         return result;
@@ -709,6 +713,7 @@ export class AppleConnectionService {
     }
     const targetId = input.action === "create" ? `Reminder/${input.idempotencyKey.toUpperCase()}` : input.reminderId;
     let applied = false;
+    let retainedCompletionRequest: RecurringCompletionRequest | undefined;
     try {
       return await this.operation(input.expectedGeneration, "mutation-preparation", async (http, saved, repository, fence, stage) => {
         if (hooks && await accountScope(this.owner, saved.session.connection.dsid) !== hooks.expectedAccount) throw new AppError("CONFLICT", "The job belongs to a different Apple account.", 409);
@@ -791,13 +796,26 @@ export class AppleConnectionService {
             listId: input.listId, reminderId: input.reminderId, recordChangeTag: input.recordChangeTag, action: input.action,
             ...(input.recurrenceCalendarTimeZone === undefined ? {} : { recurrenceCalendarTimeZone: input.recurrenceCalendarTimeZone }) });
           let intent = saved.session.recurringIntents?.find(item => item.requestFingerprint === requestFingerprint);
+          if (input.action === "complete" && !intent) {
+            const pending = saved.session.recurringIntents?.find(item => !item.operation && item.mode !== "reopen" && item.phase === "dispatched" &&
+              (item.completionRequest?.reminderId ?? item.expected.find(record => record.type === "Reminder")?.id) === targetId);
+            if (pending) throw new WriteOutcomeUnknownError(targetId, undefined, { originalRequest: pending.completionRequest,
+              diagnostics: { phase: "reconciliation", cause: "CONFLICT", upstreamStatus: null, elapsedMs: 0, dispatchAttempted: false } });
+          }
+          if (input.action === "complete" && input.retryUnchangedOccurrence && !intent)
+            throw new AppError("CONFLICT", "An unchanged-occurrence retry requires the original retained completion request, including its original version and session generation.", 409);
           if (intent && intent.recurrenceCalendarTimeZone !== input.recurrenceCalendarTimeZone) throw new AppError("CONFLICT", "The retained recurrence request has a different calendar zone.", 409);
           if (input.recurrenceCalendarTimeZone !== undefined && !intent && !(normalizeReminder(current!, owner, true).recurrenceRuleIds?.length))
             throw new AppError("UNSUPPORTED_FEATURE", "recurrenceCalendarTimeZone requires the supported ended all-day daily recurrence.");
           if (intent || normalizeReminder(current!, owner, true).recurrenceRuleIds?.length) {
             if (hooks) throw new AppError("UNSUPPORTED_FEATURE", "Recurring completion is not a bulk job action.");
-            let records: CloudKitRecord[], replayed = false;
+            if (input.action === "complete") retainedCompletionRequest = intent?.completionRequest ?? {
+              listId: input.listId, reminderId: input.reminderId, recordChangeTag: input.recordChangeTag, expectedGeneration: input.expectedGeneration,
+              ...(input.recurrenceCalendarTimeZone === undefined ? {} : { recurrenceCalendarTimeZone: input.recurrenceCalendarTimeZone }),
+            };
+            let records: CloudKitRecord[] = [], replayed = false, dispatchPlan: RecurringCompletionPlan | undefined;
             if (intent && intent.phase !== "prepared") {
+              const reconciliationStarted = Date.now();
               try {
                 const ordinaryIds = intent.expected.filter(item => ["Reminder", "List"].includes(item.type)).map(item => item.id);
                 const linkedIds = intent.expected.filter(item => !["Reminder", "List"].includes(item.type)).map(item => item.id);
@@ -811,9 +829,26 @@ export class AppleConnectionService {
                     retired.recordErrors.some(error => !error.recordName || !intent!.retired.includes(error.recordName) || !["UNKNOWN_ITEM", "NOT_FOUND"].includes(error.serverErrorCode))) throw new WriteOutcomeUnknownError(targetId);
                 }
                 records = [...ordinary.records, ...linked.records] as CloudKitRecord[]; replayed = true;
-              } catch {
+              } catch (error) {
                 if (intent.phase === "confirmed") throw new AppError("CONFLICT", "The previously completed occurrence has since changed; this request cannot be replayed.", 409);
-                throw new WriteOutcomeUnknownError(targetId);
+                const unknown = (cause: unknown) => new WriteOutcomeUnknownError(targetId, undefined, { originalRequest: retainedCompletionRequest,
+                  diagnostics: { phase: "reconciliation", cause: cause instanceof AppError ? cause.code : "UPSTREAM_UNAVAILABLE", upstreamStatus: null, elapsedMs: Math.max(0, Date.now() - reconciliationStarted), dispatchAttempted: false } });
+                const propagateGate = (cause: unknown) => {
+                  if (cause instanceof AppError && ["REAUTH_REQUIRED", "AUTH_EXPIRED", "FORBIDDEN", "RATE_LIMITED", "DEVICE_APPROVAL_PENDING", "TERMS_ACTION_REQUIRED", "VERIFICATION_REQUIRED"].includes(cause.code)) throw cause;
+                };
+                propagateGate(error);
+                if (input.action !== "complete" || input.retryUnchangedOccurrence === false || intent.mode !== undefined) throw unknown(error);
+                if (current!.recordChangeTag !== input.recordChangeTag) throw unknown(new AppError("CONFLICT", "The original occurrence version changed.", 409));
+                try {
+                  await requireNoChildren(client, owner, list, targetId);
+                  const graph = await loadSchedulingGraph({ ...current!, zoneID: current!.zoneID ?? { zoneName: "Reminders", ownerRecordName: owner } }, owner, ids => client.lookupSchedulingRecords(ids));
+                  dispatchPlan = await planRecurringCompletion(graph, list, owner, intent.ids, intent.timestamp, "complete", input.recurrenceCalendarTimeZone);
+                  await requireUnchangedRecurringRetry(client, intent, dispatchPlan);
+                } catch (cause) {
+                  propagateGate(cause);
+                  if (input.retryUnchangedOccurrence === true && cause instanceof AppError && cause.code === "CONFLICT") throw cause;
+                  throw unknown(cause);
+                }
               }
             } else {
               if (current!.recordChangeTag !== input.recordChangeTag) throw new AppError("CONFLICT", "The active occurrence changed before completion.", 409);
@@ -824,8 +859,16 @@ export class AppleConnectionService {
               intent = { requestFingerprint, sourceFingerprint: plan.sourceFingerprint, timestamp: plan.timestamp, ids: plan.ids, expected: plan.expected, retired: plan.retired, phase: "prepared",
                 ...(plan.mode === "advance" ? {} : { mode: plan.mode }),
                 ...(plan.recurrenceCalendarTimeZone === undefined ? {} : { recurrenceCalendarTimeZone: plan.recurrenceCalendarTimeZone }),
-                ...(plan.intrinsicParentGuards === undefined ? {} : { intrinsicParentGuards: plan.intrinsicParentGuards }) };
+                ...(plan.intrinsicParentGuards === undefined ? {} : { intrinsicParentGuards: plan.intrinsicParentGuards }),
+                ...(intent?.completionRequest ? { completionRequest: intent.completionRequest } : !intent && input.action === "complete" ? {
+                  completionRequest: { listId: input.listId, reminderId: input.reminderId, recordChangeTag: input.recordChangeTag, expectedGeneration: input.expectedGeneration,
+                    ...(input.recurrenceCalendarTimeZone === undefined ? {} : { recurrenceCalendarTimeZone: input.recurrenceCalendarTimeZone }) },
+                } : {}) };
               saved.session.recurringIntents = await repository.checkpointRecurringIntent(fence, intent);
+              dispatchPlan = plan;
+            }
+            if (dispatchPlan) {
+              const plan = dispatchPlan;
               records = await client.modifyRecurringCompletion(plan, async () => {
                 await this.assertRemindersWrite(repository, fence);
                 if (plan.mode === "advance" && Number(plan.active.fields.DueDate.value) <= Date.now()) throw new AppError("UNSUPPORTED_FEATURE", "The next recurring occurrence is now overdue; the retained request cannot skip it.");
@@ -1006,7 +1049,9 @@ export class AppleConnectionService {
           ...(input.action === "create" ? { idempotencyKey: input.idempotencyKey } : {}) };
       }, appleRequestBudget(input.action === "complete" && !hooks ? 60_000 : 40_000), input.action === "complete" && !hooks ? 60_000 : 30_000);
     } catch (error) {
-      if (applied || error instanceof WriteOutcomeUnknownError) throw new WriteOutcomeUnknownError(targetId, input.action === "create" ? input.idempotencyKey : undefined);
+      if (applied || error instanceof WriteOutcomeUnknownError) throw new WriteOutcomeUnknownError(targetId, input.action === "create" ? input.idempotencyKey : undefined,
+        { ...(error instanceof WriteOutcomeUnknownError ? { diagnostics: error.diagnostics } : {}),
+          originalRequest: error instanceof WriteOutcomeUnknownError ? error.originalRequest ?? retainedCompletionRequest : retainedCompletionRequest });
       throw error;
     }
   }
@@ -1587,12 +1632,14 @@ export class AppleConnectionService {
           // This combined query must remain the last asynchronous gate before
           // fetch, including after graph hooks and durable dispatch checkpoints.
           await repository.assertRemindersTransport(fence, preferences!, url.pathname.endsWith("/records/modify"));
+          if (url.pathname.endsWith("/records/modify")) stage.transportDispatched = true;
         }
         return fetch(input, init);
       };
       const http = AppleAuthHTTP.restore(saved.session.auth, send, AbortSignal.timeout(budget.deadline - Date.now()));
       const stage: OperationStage = {
         phase: mode,
+        transportDispatched: false,
         dispatch() {
           if (budget.deadline - Date.now() < 9000) throw new AppError("CONFLICT", "The complete request budget is too short for a write. No mutation was dispatched.", 409, true);
           this.phase = "mutation-dispatch";
@@ -1623,7 +1670,14 @@ export class AppleConnectionService {
             renewal: { ...metadata, failures, requiredAction: "retry", lastErrorCode: "UPSTREAM_UNAVAILABLE",
               nextRetryAt: Date.now() + Math.min(3_600_000, 30_000 * 2 ** (failures - 1)) } }, saved.state, saved.action ?? undefined);
         }
-        if (!recover) throw error;
+        if (!recover) {
+          if (mode === "mutation-preparation" && dispatched) console.warn({ event: "reminder-mutation-failed", phase: stage.phase,
+            dispatchAttempted: stage.transportDispatched, cause: error instanceof AppError ? error.code : "UPSTREAM_UNAVAILABLE",
+            ...(error instanceof WriteOutcomeUnknownError && error.diagnostics ? { writeDiagnostics: error.diagnostics } : {}) });
+          if (error instanceof WriteOutcomeUnknownError && error.diagnostics) throw new WriteOutcomeUnknownError(error.reminderId, error.idempotencyKey,
+            { diagnostics: { ...error.diagnostics, dispatchAttempted: stage.transportDispatched }, originalRequest: error.originalRequest });
+          throw error;
+        }
         await repository.releaseResume(fence);
         await renewal.ensure(expectedGeneration, budget, true);
         // Cursor callbacks may have acknowledged progress. Never replay them,
