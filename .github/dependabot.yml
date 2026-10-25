@@ -1,25 +1,30 @@
 version: 2
-multi-ecosystem-groups:
-  dependencies:
-    schedule:
-      interval: weekly
-    open-pull-requests-limit: 1
-
 updates:
   - package-ecosystem: npm
     directory: /
-    multi-ecosystem-group: dependencies
-    patterns: ["*"]
-    # Security fixes run when alerts arrive, separately from scheduled bumps.
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
     groups:
+      runtime:
+        dependency-type: production
+        update-types: [minor, patch]
+      build-tooling:
+        dependency-type: development
+        update-types: [minor, patch]
+      # Security fixes run when alerts arrive, separately from scheduled bumps.
       security-npm:
         applies-to: security-updates
         patterns: ["*"]
   - package-ecosystem: github-actions
     directory: /
-    multi-ecosystem-group: dependencies
-    patterns: ["*"]
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
     groups:
+      actions:
+        patterns: ["*"]
+        update-types: [minor, patch]
       security-actions:
         applies-to: security-updates
         patterns: ["*"]
