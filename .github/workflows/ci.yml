@@ -30,6 +30,8 @@ jobs:
       - run: npm run lint
       - run: npm run typecheck
       - run: npm test
+      - name: Check bounded dependency retry and stale reporting
+        run: python3 -m unittest discover -s .github/scripts -p 'test_dependency_health.py'
 
   sites-worker:
     name: Sites Worker
