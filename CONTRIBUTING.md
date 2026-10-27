@@ -105,6 +105,22 @@ third-party notices automatically from the lockfile and installed packages; incl
 snapshots in the dependency PR when updating packages. `npm run notices:generate` also refreshes
 them without building. Generated notices do not require a separate PR.
 
+Miniflare's temporary security overrides apply to dependency requirements that intersect
+the affected Sharp `<0.35.5` and Undici `>=7.0.0 <7.30.1` ranges. They allow patched releases
+within Sharp `0.35.x` and Undici `7.x`, with minimum versions `0.35.5` and `7.30.1`.
+When an updated Miniflare requests a patched-only range or a newer major, that requirement
+does not match the override and resolves normally. npm matches the original requirement's
+range, so a broad range that still includes vulnerable versions remains overridden.
+
+Dependabot continues to propose parent-package updates and security updates. It does not
+reliably rewrite these nested overrides: a future fix outside the allowed ranges needs a
+reviewed override change or a compatible parent update. Check failed Dependabot update jobs
+as well as open PRs when an alert remains unresolved. Remove each workaround once all
+Miniflare copies require safe versions without it. Regenerate the lockfile and verify every
+installed Sharp and Undici copy, including Wrangler and Vite's nested dependencies, before
+merging a dependency update. `npm ci` retains the reviewed lockfile versions until an update
+changes the lockfile.
+
 Preserve upstream attribution and license notices when changing protocol or vendored code.
 Fixture regeneration is optional: the checked-in vectors in `tests/fixtures/` are sufficient to run CI. To regenerate,
 install the pinned Python packages listed in provenance/sources.json, check out its pinned pyicloud
