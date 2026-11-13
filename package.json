@@ -65,7 +65,7 @@
   },
   "devDependencies": {
     "@cloudflare/vite-plugin": "1.68.0",
-    "@cloudflare/workers-types": "5.20261109.1",
+    "@cloudflare/workers-types": "5.20261110.1",
     "@next/eslint-plugin-next": "16.4.6",
     "@tailwindcss/postcss": "4.3.5",
     "@types/node": "26.6.6",
@@ -86,7 +86,7 @@
     "undici": "8.12.4",
     "vinext": "1.4.4",
     "vite": "8.3.7",
-    "wrangler": "4.159.0",
+    "wrangler": "4.160.0",
     "ws": "8.22.2"
   },
   "type": "module",
